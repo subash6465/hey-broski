@@ -1,0 +1,177 @@
+# Hey Broski Docker Compose Setup
+
+This docker-compose.yml provides the complete development environment for Hey Broski MVP.
+
+## Services
+
+### web (Next.js Frontend)
+- Built with ChatKit for chat interface
+- Connects to local backend at http://localhost:8000
+
+### api (FastAPI Backend)
+- Main application logic
+- LLM gateway through Ollama
+- MCP tool registry
+- Domain services (email, calendar, docs)
+- Database and vector storage
+- Scheduled jobs with APScheduler
+
+### ollama (Local LLM)
+- ollama/ollama:latest image
+- Persistent storage for models
+- Qwen3:8b and nomic-embed-text models
+
+### n8n (Automation Engine)
+- n8nio/n8n:latest image
+- Persistent workflow storage
+- Webhook triggers for automations
+
+## Usage
+
+```bash
+git clone <repo>
+cd hey-broski
+cp .env.example .env
+docker compose up -d
+```
+
+The application will be available at:
+- Frontend: http://localhost:3000
+- Backend API: http://localhost:8000
+- n8n UI: http://localhost:5678
+- Ollama API: http://localhost:11434
+
+## Development Notes
+
+- Use `docker compose up -d` to start in background
+- Use `docker compose logs -f <service>` to follow logs
+- Use `docker compose exec <service> bash` for shell access
+- Data persists in the heybroski_data volume
+- Models persist in ollama_data volume
+- Workflows persist in n8n_data volume
+
+## Model Setup
+
+If models are not found, they will be pulled automatically:
+- Qwen3:8b (main chat model)
+- nomic-embed-text (embedding model)
+
+## Environment Variables
+
+See .env.example for all available configuration options.
+
+## Health Checks
+
+After startup, verify all services:
+
+```bash
+# Check backend health
+curl http://localhost:8000/api/health
+
+# Check frontend
+curl http://localhost:3000
+
+# Check n8n
+curl http://localhost:5678
+
+# Check Ollama
+curl http://localhost:11434/api/tags
+```
+
+## Backup
+
+To backup data:
+
+```bash
+docker compose exec api ls -la /data/heybroski/
+docker compose exec api cp heybroski.db /path/to/backup/
+docker compose exec ollama cp -r /root/.ollama /path/to/ollama-backup/
+docker compose exec n8n cp -r /home/node/.n8n /path/to/n8n-backup/
+```
+
+## Development Workflow
+
+1. **Initial setup**: Run `docker compose up -d` and wait for models to download
+2. **Check status**: `docker compose ps`
+3. **View logs**: `docker compose logs -f`
+4. **Enter containers**: `docker compose exec <service> bash`
+5. **Restart**: `docker compose restart`
+6. **Stop**: `docker compose down`
+
+## File Permissions
+
+Ensure data directory is writable:
+
+```bashn8kdir -p ~/.hey-broski
+chmod 700 ~/.hey-broski
+```
+
+## Troubleshooting
+
+### "Port is already in use"
+Stop existing services: `docker compose down` then restart
+
+### "Model not found"
+Check Ollama status: `docker compose logs ollama`
+Ensure internet connection for model download
+
+### "Database connection failed"
+Check sqlite permissions in the data volume
+
+### "Frontend cannot connect to backend"
+Verify service status: `docker compose ps`
+Check docker network connectivity
+
+---
+
+## Additional Configuration
+
+### Custom Models
+Replace model names in .env:
+- HEYBROSKI_CHAT_MODEL=qwen3:8b
+- HEYBROSKI_EMBEDDING_MODEL=nomic-embed-text
+
+### Resource Limits
+For limited machines, consider modifying the docker-compose.yml:
+- Reduce API memory limits
+- Use smaller models (qwen3:4b, qwen3:1.7b)
+- Consider using qwen3:1.7b for embedding on very low-end machines
+
+### Local Development vs Production
+
+#### Local Development
+- Uses docker-compose.yml for all services
+- Ollama runs in container
+- SQLite in mounted volume
+- Easy local development and testing
+
+#### Production Considerations
+- Use proper reverse proxy (nginx)
+- Use managed Ollama (cloud or self-hosted)
+- Consider PostgreSQL instead of SQLite
+- Implement proper backups
+- Set up monitoring and logging
+
+## Advanced Features
+
+### Custom Extensions
+Add new tools by:
+1. Implementing in apps/api/app/mcp_tools/
+2. Adding to apps/api/app/mcp_tools/registry.py
+3. Updating the MCP server in mcp-servers/heybroski/server.py
+
+### Workflow Extensions
+Add n8n workflows:
+1. Create JSON in n8n/workflows/
+2. Import via n8n UI
+3. Reference from code using workflow IDs
+
+### Database Extensions
+Add new tables:
+1. Create migration in apps/api/alembic/versions/
+2. Use SQLAlchemy models in apps/api/app/db/models.py
+3. Ensure indexes for foreign keys and timestamps
+
+---
+
+Built with zero paid APIs, local LLMs, and complete data ownership.
