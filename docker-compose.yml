@@ -18,6 +18,8 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
     volumes:
       - heybroski_data:/data/heybroski
       - ./demo-data:/app/demo-data
