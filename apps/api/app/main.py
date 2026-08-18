@@ -44,7 +44,8 @@ class ChatResponse(BaseModel):
 async def health_check():
     ollama_status = "unavailable"
     try:
-        models = client.list()
+        health_client = ollama.Client(host=OLLAMA_HOST)
+        models = health_client.list()
         ollama_status = "available"
     except Exception:
         ollama_status = "unavailable"
