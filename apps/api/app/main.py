@@ -1,31 +1,63 @@
-# Basic FastAPI backend for Hey Broski MVP
+# Hey Broski API - Phase 1: Chat with Ollama LLM
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from datetime import datetime
+import os
+import ollama
 
 app = FastAPI(title="Hey Broski API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+OLLAMA_HOST = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+CHAT_MODEL = os.getenv("HEYBROSKI_CHAT_MODEL", "qwen3:8b")
+
+client = ollama.Client(host=OLLAMA_HOST)
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class ChatRequest(BaseModel):
+    message: str
+    session_id: Optional[str] = None
+    mode: Optional[str] = "daily_admin"
+    account_filter: Optional[List[str]] = None
+    include_sources: Optional[bool] = True
+
+class ChatResponse(BaseModel):
+    message_id: str
+    content: str
+    sources: List[Dict[str, Any]] = []
+    action_cards: List[Dict[str, Any]] = []
+
 @app.get("/api/health")
 async def health_check():
+    ollama_status = "unavailable"
+    try:
+        models = client.list()
+        ollama_status = "available"
+    except Exception:
+        ollama_status = "unavailable"
+    
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
         "services": {
             "database": "connected",
-            "ollama": "available",
+            "ollama": ollama_status,
             "n8n": "available"
-        }
+        },
+        "model": CHAT_MODEL
     }
 
 
@@ -41,63 +73,34 @@ async def list_sessions():
 
 
 @app.post("/api/chat/sessions/{session_id}/messages")
-async def send_message(session_id: str, message: Dict[str, Any]):
-    user_message = message.get("message", "")
+async def send_message(session_id: str, request: ChatRequest):
+    user_message = request.message
     
-    # Simple dummy responses based on user message
-    if "attention" in user_message.lower():
-        response_content = "You have 4 items needing attention:\n\n1. Gmail / Personal: Credit card bill due on 2026-08-18.\n2. Gmail / Personal: Canva trial renewal tomorrow.\n3. Gmail / Work: Manager asked for updated project report and no reply was found.\n4. Calendar / Personal: Bank appointment tomorrow at 10:00 AM."
-        action_cards = [
-            {
-                "id": "card-1",
-                "card_type": "renewal",
-                "title": "Canva trial renewal tomorrow",
-                "priority": "medium",
-                "source_refs": [
-                    {
-                        "source_type": "email",
-                        "source_id": "demo-2",
-                        "connected_account_id": "demo-account-1",
-                        "account_label": "Gmail / Personal",
-                        "title": "Canva trial renewal soon",
-                        "snippet": "Your Canva premium trial will renew tomorrow for $12.99",
-                        "timestamp": "2026-08-14T14:30:00Z"
-                    }
-                ],
-                "suggested_actions": ["create_reminder"],
-                "confidence": 0.9
-            }
-        ]
-    elif "waiting" in user_message.lower():
-        response_content = "Based on your emails, these people are waiting on you:\n\n1. Manager from work (manager@company.com) - Updated project report requested, no reply found.\n\n\nSuggested actions:\n- Draft a reply to the work email asking for clarification on report requirements.\n- Update the action card to track this follow-up.\n\nApproval required before sending any reply."
-        action_cards = [
-            {
-                "id": "card-2",
-                "card_type": "follow_up",
-                "title": "Reply to manager about project report",
-                "priority": "high",
-                "source_refs": [
-                    {
-                        "source_type": "email",
-                        "source_id": "demo-3",
-                        "connected_account_id": "demo-account-1",
-                        "account_label": "Gmail / Work",
-                        "title": "Updated project report",
-                        "snippet": "Please find the updated project report attached. The deadline is Friday and we need your input before the weekend.",
-                        "timestamp": "2026-08-12T16:45:00Z"
-                    }
-                ],
-                "suggested_actions": ["draft_email", "create_automation"],
-                "confidence": 0.8
-            }
-        ]
-    else:
-        response_content = "Hello! I'm Hey Broski. I can help you with your daily attention summary, find upcoming renewals, detect follow-ups, and manage your tasks. Try asking 'What needs my attention today?' or 'Who is waiting on me?' to get started."
-        action_cards = []
+    system_prompt = """You are Hey Broski, a local-first personal admin AI assistant. 
+You help users manage their emails, calendar, documents, and tasks.
+You have access to their connected accounts (Gmail, Outlook, Calendar, Documents).
+Always provide source references when answering from user data.
+Be concise, actionable, and helpful.
+If you don't have access to real data, use the demo data context provided."""
+
+    try:
+        response = client.chat(
+            model=CHAT_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
+            ],
+            options={"temperature": 0.2}
+        )
+        
+        content = response['message']['content']
+        
+    except Exception as e:
+        content = f"I'm having trouble connecting to the local LLM. Please ensure Ollama is running and the model '{CHAT_MODEL}' is installed. Error: {str(e)}"
     
     return {
         "message_id": f"msg_{datetime.now().timestamp()}",
-        "content": response_content,
+        "content": content,
         "sources": [
             {
                 "source_type": "email",
@@ -109,7 +112,7 @@ async def send_message(session_id: str, message: Dict[str, Any]):
                 "timestamp": "2026-08-13T10:00:00Z"
             }
         ],
-        "action_cards": action_cards
+        "action_cards": []
     }
 
 
