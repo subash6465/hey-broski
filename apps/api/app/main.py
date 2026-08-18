@@ -18,7 +18,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-OLLAMA_HOST = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_HOST = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 CHAT_MODEL = os.getenv("HEYBROSKI_CHAT_MODEL", "qwen3:8b")
 
 client = ollama.Client(host=OLLAMA_HOST)
