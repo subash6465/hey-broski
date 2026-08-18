@@ -21,7 +21,7 @@ export default function ChatPage() {
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [status, setStatus] = useState<'connecting' | 'connected' | 'error'>('connecting')
   const messagesEndRef = useRef<HTMLDivElement>(null)
-  const apiBase = 'http://localhost:8000'
+  const apiBase = ''  // Use relative paths for Next.js proxy
 
   useEffect(() => {
     const initSession = async () => {
