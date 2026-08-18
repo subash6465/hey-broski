@@ -7,6 +7,10 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime
 import os
 import ollama
+import logging
+import structlog
+
+logger = structlog.get_logger()
 
 app = FastAPI(title="Hey Broski API", version="0.1.0")
 
@@ -47,8 +51,10 @@ async def health_check():
         health_client = ollama.Client(host=OLLAMA_HOST)
         models = health_client.list()
         ollama_status = "available"
-    except Exception:
+        logger.info("ollama_health_check", status="available", models_count=len(models.get('models', [])))
+    except Exception as e:
         ollama_status = "unavailable"
+        logger.error("ollama_health_check_failed", error=str(e), host=OLLAMA_HOST)
     
     return {
         "status": "healthy",
@@ -85,7 +91,9 @@ Be concise, actionable, and helpful.
 If you don't have access to real data, use the demo data context provided."""
 
     try:
-        response = client.chat(
+        # Create fresh client for each request to avoid connection issues
+        chat_client = ollama.Client(host=OLLAMA_HOST)
+        response = chat_client.chat(
             model=CHAT_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -97,6 +105,7 @@ If you don't have access to real data, use the demo data context provided."""
         content = response['message']['content']
         
     except Exception as e:
+        logger.error("ollama_chat_failed", error=str(e), host=OLLAMA_HOST)
         content = f"I'm having trouble connecting to the local LLM. Please ensure Ollama is running and the model '{CHAT_MODEL}' is installed. Error: {str(e)}"
     
     return {
