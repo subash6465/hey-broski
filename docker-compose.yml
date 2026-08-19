@@ -37,7 +37,7 @@ services:
       /bin/sh -c "
         ollama serve &
         sleep 5 &&
-        ollama pull qwen3:8b &&
+        ollama pull qwen3:4b &&
         ollama pull nomic-embed-text &&
         wait
       "
