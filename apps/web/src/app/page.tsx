@@ -26,11 +26,22 @@ export default function ChatPage() {
   useEffect(() => {
     const initSession = async () => {
       try {
-        const res = await fetch(`${apiBase}/api/chat/sessions`, { method: 'POST' })
+        const controller = new AbortController()
+        const timeoutId = setTimeout(() => controller.abort(), 30000)
+        
+        const res = await fetch(`${apiBase}/api/chat/sessions`, { 
+          method: 'POST',
+          signal: controller.signal
+        })
+        clearTimeout(timeoutId)
+        
+        if (!res.ok) throw new Error(`Session creation failed: ${res.status}`)
         const data = await res.json()
+        console.log('Session created:', data.session_id)
         setSessionId(data.session_id)
         setStatus('connected')
-      } catch {
+      } catch (err) {
+        console.error('Session init error:', err)
         setStatus('error')
       }
     }
@@ -55,11 +66,18 @@ export default function ChatPage() {
     setLoading(true)
 
     try {
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 300000) // 5 min timeout
+      
       const res = await fetch(`${apiBase}/api/chat/sessions/${sessionId}/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: input })
+        body: JSON.stringify({ message: input }),
+        signal: controller.signal
       })
+      clearTimeout(timeoutId)
+      
+      if (!res.ok) throw new Error(`API error: ${res.status} ${res.statusText}`)
       const data = await res.json()
       
       const assistantMsg = {
@@ -71,10 +89,12 @@ export default function ChatPage() {
       }
       setMessages(prev => [...prev, assistantMsg])
     } catch (err) {
+      console.error('API Error:', err)
+      const errorMessage = err instanceof Error ? err.message : 'Unknown error'
       setMessages(prev => [...prev, { 
         id: `err-${Date.now()}`, 
         role: 'assistant' as const, 
-        content: 'Error: Could not reach API. Make sure backend is running.' 
+        content: `Error: ${errorMessage}. Check console for details.` 
       }])
     } finally {
       setLoading(false)
