@@ -22,15 +22,6 @@ const nextConfig = {
       },
     ]
   },
-  // Increase proxy timeout for long-running LLM requests
-  // Use server configuration for timeout
-  server: {
-    // Increase timeout for proxy requests
-    proxyTimeout: 300000, // 5 minutes
-  },
-  experimental: {
-    proxyTimeout: 300000, // 5 minutes
-  },
 }
 
 module.exports = nextConfig

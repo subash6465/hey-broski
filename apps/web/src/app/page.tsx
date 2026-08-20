@@ -2,6 +2,28 @@
 
 import { useState, useEffect, useRef } from 'react'
 
+// Detect API base URL - use Codespaces forwarded port if available, else Next.js proxy
+function getApiBase(): string {
+  if (typeof window !== 'undefined') {
+    // In Codespaces, ports are forwarded with predictable URLs
+    const codespaceName = process.env.NEXT_PUBLIC_CODESPACE_NAME
+    const forwardingDomain = process.env.NEXT_PUBLIC_GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN
+    
+    if (codespaceName && forwardingDomain) {
+      return `https://${codespaceName}-8000.${forwardingDomain}`
+    }
+    
+    // Check if we can determine from current URL
+    const hostname = window.location.hostname
+    if (hostname.includes('githubpreview.dev') || hostname.includes('github.dev')) {
+      // Replace port 3000 with 8000 in the forwarded URL
+      return window.location.origin.replace(':3000', ':8000').replace('-3000.', '-8000.')
+    }
+  }
+  // Fallback to Next.js proxy
+  return ''
+}
+
 export default function ChatPage() {
   const [messages, setMessages] = useState<Array<{
     id: string
@@ -21,7 +43,7 @@ export default function ChatPage() {
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [status, setStatus] = useState<'connecting' | 'connected' | 'error'>('connecting')
   const messagesEndRef = useRef<HTMLDivElement>(null)
-  const apiBase = ''  // Use relative paths for Next.js proxy
+  const apiBase = getApiBase()
 
   useEffect(() => {
     const initSession = async () => {
