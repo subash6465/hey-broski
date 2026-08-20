@@ -1,2 +1,16 @@
-node27
-pnpm15
+{
+  "name": "hey-broski",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@9.15.0",
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "scripts": {
+    "dev:web": "pnpm --dir apps/web dev",
+    "build:web": "pnpm --dir apps/web build",
+    "lint:web": "pnpm --dir apps/web lint",
+    "dev:api": "uvicorn apps.api.app.main:app --host 0.0.0.0 --port 8000 --reload"
+  }
+}

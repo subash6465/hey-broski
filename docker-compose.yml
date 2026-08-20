@@ -6,9 +6,11 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - NEXT_PUBLIC_API_BASE_URL=http://api:8000
+      # Browser should call Next.js through relative /api. The rewrite below uses this internal URL.
+      - API_INTERNAL_BASE_URL=http://api:8000
     depends_on:
-      - api
+      api:
+        condition: service_started
 
   api:
     build:
@@ -20,12 +22,16 @@ services:
       - .env
     environment:
       - OLLAMA_BASE_URL=http://ollama:11434
+      - HEYBROSKI_CHAT_MODEL=${HEYBROSKI_CHAT_MODEL:-qwen3:4b}
+      - HEYBROSKI_LLM_TEMPERATURE=${HEYBROSKI_LLM_TEMPERATURE:-0.2}
     volumes:
       - heybroski_data:/data/heybroski
-      - ./demo-data:/app/demo-data
+      - ./demo-data:/app/demo-data:ro
     depends_on:
-      - ollama
-      - n8n
+      ollama:
+        condition: service_started
+      n8n:
+        condition: service_started
 
   ollama:
     image: ollama/ollama:latest
@@ -33,12 +39,14 @@ services:
       - "11434:11434"
     volumes:
       - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
     entrypoint: >
       /bin/sh -c "
         ollama serve &
         sleep 5 &&
-        ollama pull qwen3:4b &&
-        ollama pull nomic-embed-text &&
+        ollama pull ${HEYBROSKI_CHAT_MODEL:-qwen3:4b} &&
+        ollama pull ${HEYBROSKI_EMBEDDING_MODEL:-nomic-embed-text} &&
         wait
       "
 
