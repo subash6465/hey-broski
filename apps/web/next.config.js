@@ -1,11 +1,18 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
-  // Disable rewrites - frontend calls API directly via env var
+  async rewrites() {
+    return [
+      {
+        source: '/api/:path*',
+        destination: 'http://api:8000/api/:path*',
+      },
+    ]
+  },
   async headers() {
     return [
       {
-        source: '/:path*',
+        source: '/api/:path*',
         headers: [
           { key: 'Access-Control-Allow-Credentials', value: 'true' },
           { key: 'Access-Control-Allow-Origin', value: '*' },
