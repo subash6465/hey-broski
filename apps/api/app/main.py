@@ -19,6 +19,7 @@ OLLAMA_HOST = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
 CHAT_MODEL = os.getenv("HEYBROSKI_CHAT_MODEL", "qwen3:4b")
 LLM_TEMPERATURE = float(os.getenv("HEYBROSKI_LLM_TEMPERATURE", "0.2"))
 OLLAMA_TIMEOUT_SECONDS = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "300"))
+OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "128"))
 
 app = FastAPI(title="Hey Broski API", version="0.1.0")
 
@@ -161,7 +162,10 @@ Be concise, actionable, and helpful. If you do not have real connected account d
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": request.message},
             ],
-            options={"temperature": LLM_TEMPERATURE},
+            options={
+                "temperature": LLM_TEMPERATURE,
+                "num_predict": OLLAMA_NUM_PREDICT,
+            },
         )
         message = getattr(response, "message", None) or response.get("message", {})
         content = getattr(message, "content", None) or message.get("content")

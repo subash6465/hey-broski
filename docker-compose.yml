@@ -24,6 +24,8 @@ services:
       - OLLAMA_BASE_URL=http://ollama:11434
       - HEYBROSKI_CHAT_MODEL=${HEYBROSKI_CHAT_MODEL:-qwen3:4b}
       - HEYBROSKI_LLM_TEMPERATURE=${HEYBROSKI_LLM_TEMPERATURE:-0.2}
+      - OLLAMA_TIMEOUT_SECONDS=${OLLAMA_TIMEOUT_SECONDS:-300}
+      - OLLAMA_NUM_PREDICT=${OLLAMA_NUM_PREDICT:-128}
     volumes:
       - heybroski_data:/data/heybroski
       - ./demo-data:/app/demo-data:ro

@@ -70,11 +70,35 @@ async function fetchJson<T>(url: string, init: RequestInit, timeoutMs: number): 
 
   try {
     const res = await fetch(url, { ...init, signal: controller.signal })
+    const rawText = await res.text()
+
+    console.log('API response status:', res.status)
+    console.log('API response body:', rawText)
+
     if (!res.ok) {
-      const text = await res.text()
-      throw new Error(`${res.status} ${res.statusText}${text ? ` - ${text}` : ''}`)
+      let message = rawText
+
+      try {
+        const parsed = JSON.parse(rawText)
+        message = parsed.detail || parsed.message || rawText
+      } catch {
+        // keep raw text
+      }
+
+      throw new Error(`${res.status} ${res.statusText}${message ? ` - ${message}` : ''}`)
     }
-    return (await res.json()) as T
+
+    if (!rawText) {
+      throw new Error('Backend returned an empty response')
+    }
+
+    return JSON.parse(rawText) as T
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)} seconds`)
+    }
+
+    throw err
   } finally {
     window.clearTimeout(timeoutId)
   }
