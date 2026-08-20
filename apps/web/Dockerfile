@@ -7,6 +7,9 @@ RUN npm install
 
 COPY apps/web/ ./
 
+# Create public directory for runtime config
+RUN mkdir -p /app/public
+
 # Create entrypoint script to inject Codespaces config at runtime
 RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/sh
