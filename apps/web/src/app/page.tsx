@@ -2,27 +2,8 @@
 
 import { useState, useEffect, useRef } from 'react'
 
-// Detect API base URL - use Codespaces forwarded port if available, else Next.js proxy
-function getApiBase(): string {
-  if (typeof window !== 'undefined') {
-    // In Codespaces, ports are forwarded with predictable URLs
-    const codespaceName = process.env.NEXT_PUBLIC_CODESPACE_NAME
-    const forwardingDomain = process.env.NEXT_PUBLIC_GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN
-    
-    if (codespaceName && forwardingDomain) {
-      return `https://${codespaceName}-8000.${forwardingDomain}`
-    }
-    
-    // Check if we can determine from current URL
-    const hostname = window.location.hostname
-    if (hostname.includes('githubpreview.dev') || hostname.includes('github.dev')) {
-      // Replace port 3000 with 8000 in the forwarded URL
-      return window.location.origin.replace(':3000', ':8000').replace('-3000.', '-8000.')
-    }
-  }
-  // Fallback to Next.js proxy
-  return ''
-}
+// Use relative paths - Next.js proxy handles forwarding to api:8000
+const API_BASE = ''
 
 export default function ChatPage() {
   const [messages, setMessages] = useState<Array<{
@@ -43,7 +24,6 @@ export default function ChatPage() {
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [status, setStatus] = useState<'connecting' | 'connected' | 'error'>('connecting')
   const messagesEndRef = useRef<HTMLDivElement>(null)
-  const apiBase = getApiBase()
 
   useEffect(() => {
     const initSession = async () => {
@@ -51,13 +31,16 @@ export default function ChatPage() {
         const controller = new AbortController()
         const timeoutId = setTimeout(() => controller.abort(), 30000)
         
-        const res = await fetch(`${apiBase}/api/chat/sessions`, { 
+        const res = await fetch(`${API_BASE}/api/chat/sessions`, { 
           method: 'POST',
           signal: controller.signal
         })
         clearTimeout(timeoutId)
         
-        if (!res.ok) throw new Error(`Session creation failed: ${res.status}`)
+        if (!res.ok) {
+          const text = await res.text()
+          throw new Error(`Session creation failed: ${res.status} - ${text}`)
+        }
         const data = await res.json()
         console.log('Session created:', data.session_id)
         setSessionId(data.session_id)
@@ -91,7 +74,7 @@ export default function ChatPage() {
       const controller = new AbortController()
       const timeoutId = setTimeout(() => controller.abort(), 300000) // 5 min timeout
       
-      const res = await fetch(`${apiBase}/api/chat/sessions/${sessionId}/messages`, {
+      const res = await fetch(`${API_BASE}/api/chat/sessions/${sessionId}/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: input }),
@@ -99,7 +82,10 @@ export default function ChatPage() {
       })
       clearTimeout(timeoutId)
       
-      if (!res.ok) throw new Error(`API error: ${res.status} ${res.statusText}`)
+      if (!res.ok) {
+        const text = await res.text()
+        throw new Error(`API error: ${res.status} ${res.statusText} - ${text}`)
+      }
       const data = await res.json()
       
       const assistantMsg = {
@@ -289,4 +275,17 @@ export default function ChatPage() {
       </main>
     </div>
   )
+}
+
+const suggestions = [
+  "What needs my attention today?",
+  "Who is waiting on me?",
+  "Find upcoming renewals and deadlines",
+  "Summarize important unread emails"
+]
+
+const statusColors = {
+  connecting: 'bg-yellow-500',
+  connected: 'bg-green-500',
+  error: 'bg-red-500'
 }
