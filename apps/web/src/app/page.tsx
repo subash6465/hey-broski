@@ -79,7 +79,11 @@ export default function Home() {
     void initialize()
   }, [])
 
-  useEffect(() => bottom.current?.scrollIntoView({ behavior: 'smooth' }), [messages, busy])
+  useEffect(() => {
+    // An effect may only return a cleanup function. Some embedded browsers
+    // return a value from scrollIntoView(), so do not return that expression.
+    bottom.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages, busy])
 
   async function sendMessage(event?: FormEvent, selectedPrompt?: string) {
     event?.preventDefault()
