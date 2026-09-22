@@ -1,2 +1,6 @@
-node27
-pnpm15
+{
+  "name": "hey-broski-api",
+  "version": "0.1.0",
+  "private": true,
+  "description": "FastAPI backend for Hey Broski. Python dependencies live in requirements.txt."
+}
