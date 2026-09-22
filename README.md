@@ -41,6 +41,10 @@ Demo mode works even while Ollama is unavailable. To enable local model answers:
 docker compose exec ollama ollama pull qwen3:8b
 ```
 
+Docker Compose routes internal HTTP calls through `host.docker.internal` and
+the published ports. This is intentional: some Codespaces Docker environments
+resolve sibling service names but filter direct bridge traffic between them.
+
 Then ask: `What needs my attention this week?`
 
 ## Local development

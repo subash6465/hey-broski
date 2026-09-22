@@ -6,8 +6,11 @@ services:
     ports:
       - "3000:3000"
     environment:
-      # Browser should call Next.js through relative /api. The rewrite below uses this internal URL.
-      - API_INTERNAL_BASE_URL=http://api:8000
+      # The host-gateway path works in Docker Desktop and in Codespaces where
+      # direct bridge traffic between sibling containers may be filtered.
+      - API_INTERNAL_BASE_URL=http://host.docker.internal:8000
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       api:
         condition: service_healthy
@@ -22,13 +25,16 @@ services:
     env_file:
       - .env
     environment:
-      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - N8N_BASE_URL=http://host.docker.internal:5678
       - HEYBROSKI_CHAT_MODEL=${HEYBROSKI_CHAT_MODEL:-qwen3:8b}
       - HEYBROSKI_LLM_TEMPERATURE=${HEYBROSKI_LLM_TEMPERATURE:-0.2}
       - OLLAMA_TIMEOUT_SECONDS=${OLLAMA_TIMEOUT_SECONDS:-45}
       - OLLAMA_NUM_PREDICT=${OLLAMA_NUM_PREDICT:-400}
       - HEYBROSKI_DATA_DIR=/data/heybroski
       - HEYBROSKI_DEMO_MODE=${HEYBROSKI_DEMO_MODE:-true}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - heybroski_data:/data/heybroski
       - ./demo-data:/app/demo-data:ro
