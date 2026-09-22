@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 import io
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
-import ollama
+import httpx
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -36,13 +35,24 @@ app.add_middleware(
 )
 
 
+@app.get("/api/live")
+async def liveness_check() -> dict[str, str]:
+    """Process-only probe used by Docker; never calls a dependency."""
+    return {"status": "ok"}
+
+
 @app.get("/api/health")
 async def health_check() -> dict[str, Any]:
     ollama_status, models = "unavailable", []
     try:
-        client = ollama.Client(host=settings.ollama_base_url, timeout=3)
-        response = await asyncio.wait_for(asyncio.to_thread(client.list), timeout=4)
-        models = [getattr(model, "model", "") for model in getattr(response, "models", [])]
+        timeout = httpx.Timeout(2.0, connect=0.5)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(f"{settings.ollama_base_url}/api/tags")
+            response.raise_for_status()
+        models = [
+            model.get("model") or model.get("name") or ""
+            for model in response.json().get("models", [])
+        ]
         ollama_status = (
             "available"
             if any(name.startswith(settings.chat_model) for name in models)

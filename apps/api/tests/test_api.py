@@ -18,6 +18,7 @@ def test_demo_chat_approval_and_audit(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(main.assistant, "answer", fallback)
 
     with TestClient(main.app) as client:
+        assert client.get("/api/live").json() == {"status": "ok"}
         session = client.post("/api/chat/sessions").json()
         response = client.post(
             f"/api/chat/sessions/{session['session_id']}/messages",

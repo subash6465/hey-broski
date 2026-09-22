@@ -41,7 +41,11 @@ async function proxy(request: NextRequest, context: { params: Promise<{ path: st
       headers: responseHeaders,
     })
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown proxy error'
+    const cause = error instanceof Error && error.cause instanceof Error
+      ? `: ${error.cause.message}`
+      : ''
+    const message = `${error instanceof Error ? error.message : 'Unknown proxy error'}${cause}`
+    console.error('api_proxy_failed', { method: request.method, target: target.toString(), message })
     return Response.json(
       { detail: `The Hey Broski API is unavailable: ${message}` },
       { status: 503 },

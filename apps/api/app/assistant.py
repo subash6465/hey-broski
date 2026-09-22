@@ -4,6 +4,7 @@ import asyncio
 import re
 
 import ollama
+import httpx
 import structlog
 
 from .config import Settings
@@ -66,9 +67,14 @@ class AssistantService:
         try:
             # Do a short availability/model check first. A missing Ollama model
             # must never hold the otherwise complete demo response for minutes.
-            probe = ollama.Client(host=self.settings.ollama_base_url, timeout=3)
-            model_list = await asyncio.wait_for(asyncio.to_thread(probe.list), timeout=4)
-            model_names = [getattr(model, "model", "") for model in getattr(model_list, "models", [])]
+            timeout = httpx.Timeout(2.0, connect=0.5)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                model_response = await client.get(f"{self.settings.ollama_base_url}/api/tags")
+                model_response.raise_for_status()
+            model_names = [
+                model.get("model") or model.get("name") or ""
+                for model in model_response.json().get("models", [])
+            ]
             if not any(name == self.settings.chat_model or name.startswith(f"{self.settings.chat_model}:") for name in model_names):
                 logger.info("ollama_model_missing_using_demo_answer", model=self.settings.chat_model)
                 return fallback, "demo"
