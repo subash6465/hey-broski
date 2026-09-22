@@ -18,6 +18,7 @@ class Settings:
     llm_temperature: float
     ollama_timeout_seconds: float
     demo_mode: bool
+    use_ollama: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -33,6 +34,7 @@ class Settings:
             # including when an older .env still contains the former 300 value.
             ollama_timeout_seconds=min(float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "45")), 45.0),
             demo_mode=_bool("HEYBROSKI_DEMO_MODE", True),
+            use_ollama=_bool("HEYBROSKI_USE_OLLAMA", False),
         )
 
 

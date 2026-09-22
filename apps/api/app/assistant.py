@@ -62,6 +62,11 @@ class AssistantService:
 
     async def answer(self, message: str, sources: list[Source]) -> tuple[str, str]:
         fallback = self.deterministic_answer(sources)
+        # Demo mode must remain fully usable on small Codespaces and machines
+        # without a pulled model. Local inference is an explicit opt-in.
+        if not self.settings.use_ollama:
+            return fallback, "demo"
+
         context = "\n".join(f"[Source {i}] {s.account_label} — {s.title}: {s.snippet}" for i, s in enumerate(sources, 1))
         prompt = f"Answer using only these sources. Cite every fact as [Source N]. Never claim an action occurred. End by saying approval is required for suggested actions.\n\nQuestion: {message}\n\n{context}"
         try:

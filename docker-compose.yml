@@ -33,6 +33,7 @@ services:
       - OLLAMA_NUM_PREDICT=${OLLAMA_NUM_PREDICT:-400}
       - HEYBROSKI_DATA_DIR=/data/heybroski
       - HEYBROSKI_DEMO_MODE=${HEYBROSKI_DEMO_MODE:-true}
+      - HEYBROSKI_USE_OLLAMA=${HEYBROSKI_USE_OLLAMA:-false}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
