@@ -1,45 +1,20 @@
-# Hey Broski - Project Setup Script
+#!/usr/bin/env sh
+set -eu
 
-This script automates the initial setup for Hey Broski development.
+if ! command -v docker >/dev/null 2>&1; then
+  echo "Docker is required. Install Docker and run this script again." >&2
+  exit 1
+fi
 
-## Usage
+if [ ! -f .env ]; then
+  cp .env.example .env
+  echo "Created .env from .env.example"
+fi
 
-```bash
-./scripts/bootstrap.sh
-```
-
-## Requirements
-
-- Docker with Compose v2+
-- Git
-- Linux/macOS (Windows WSL2)
-
-## Setup Steps
-
-1. **Check Docker**
-2. **Start Ollama** (if not running)
-3. **Pull default models**
-4. **Run database migrations**
-5. **Seed demo data**
-6. **Print local URLs**
-
-## Commands
-
-```bash
-# Pull models if not present
-ollama pull qwen3:8b
-ollama pull nomic-embed-text
-
-# Run migrations
-python apps/api/manage.py migrate
-
-# Seed demo data
-python apps/api/manage.py seed_demo
-
-# Manual Ollama setup
-ollama serve &
-sleep 2
-ollama pull qwen3:8b
-sleep 30
-ollama pull nomic-embed-text
-```
+docker compose up -d --build
+printf '%s\n' \
+  "Hey Broski is starting:" \
+  "  App:  http://localhost:3000" \
+  "  API:  http://localhost:8000/docs" \
+  "  n8n:  http://localhost:5678" \
+  "Demo mode works immediately. To enable local AI, run: docker compose exec ollama ollama pull qwen3:8b"

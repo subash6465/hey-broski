@@ -1,341 +1,135 @@
 # Hey Broski
 
-Local-first personal admin copilot with ChatKit, Ollama, MCP tools, and n8n workflows.
+Hey Broski is a local-first personal admin copilot. It turns email, calendar, and document context into a grounded daily brief and explicit action proposals. The MVP is intentionally useful in demo mode with no accounts, API keys, or local model required.
 
-## Quickstart (GitHub Codespaces - Recommended)
+## What works today
 
-The easiest way to run Hey Broski is using **GitHub Codespaces** - no local Docker setup required.
+- Grounded demo chat for attention summaries, follow-ups, renewals, and calendar conflicts
+- Optional answers from a local Ollama `qwen3:8b` model, with a deterministic fallback
+- Persistent SQLite conversations, action cards, documents, and audit events
+- Approval and dismissal workflow—no proposal executes silently
+- Local PDF, TXT, Markdown, and CSV upload and keyword retrieval
+- Responsive action inbox, document vault, source citations, and audit log
+- Production-style multi-stage frontend image and non-root API image
 
-### 1. Open in Codespaces
-- Go to the repository on GitHub
-- Click **Code** → **Codespaces** → **Create codespace on main**
-- Wait for the environment to load (2-3 minutes)
+The current UI is a local React chat shell rather than hosted ChatKit. The current ChatKit session API expects an OpenAI workflow and returns an OpenAI client secret, which conflicts with this project's zero-paid-API and local-inference rules. The backend contracts are kept separate so a future fully self-hosted ChatKit adapter can replace the shell without changing the domain services.
 
-### 2. Start all services
+Gmail, Outlook, calendar sync, semantic vector search, and live n8n workflow execution remain planned integrations. The UI does not pretend they are connected.
+
+## Quickstart
+
+Prerequisites: Docker Desktop (or Docker Engine with Compose v2) and at least 4 GB free memory. The local model benefits from 8 GB or more.
+
 ```bash
-docker compose up -d
-```
-
-### 3. Wait for models to download (first run only)
-```bash
-docker compose logs -f ollama
-# Wait for "success" messages for qwen3:8b and nomic-embed-text (~2-5 min)
-```
-
-### 4. Access the application
-- **Frontend (Chat UI)**: Click the forwarded port **3000** in the Ports tab (globe icon)
-- **Backend API**: Port **8000** → `/api/health`
-- **n8n**: Port **5678** → `/setup`
-- **Ollama**: Port **11434** → `/api/tags`
-
----
-
-## Local Development (Docker Desktop / Rancher Desktop / Podman)
-
-### Prerequisites
-- Docker Engine + Docker Compose v2
-- Or Podman with `podman compose`
-- 8GB+ RAM recommended
-
-### Start Services
-```bash
-# Clone and configure
 git clone <repo>
 cd hey-broski
 cp .env.example .env
-
-# Start all services in background
-docker compose up -d
-
-# Or with Podman
-podman compose up -d
+docker compose up --build
 ```
 
-### Stop Services
-```bash
-# Stop and remove containers (keeps volumes/data)
-docker compose down
+On PowerShell, use `Copy-Item .env.example .env`, or run `./scripts/bootstrap.ps1`.
 
-# Stop only (keeps containers for restart)
-docker compose stop
+Open:
 
-# Start previously stopped containers
-docker compose start
-```
+- App: http://localhost:3000
+- API docs: http://localhost:8000/docs
+- n8n: http://localhost:5678
 
-### Rebuild After Code Changes
-```bash
-# Rebuild specific service (e.g., after API changes)
-docker compose up -d --build --force-recreate api
-
-# Rebuild all services
-docker compose up -d --build
-
-# Rebuild without cache
-docker compose up -d --build --pull always
-```
-
-### View Logs
-```bash
-# All services
-docker compose logs -f
-
-# Specific service (last 50 lines)
-docker compose logs web --tail 50
-docker compose logs api --tail 50
-docker compose logs ollama --tail 50
-docker compose logs n8n --tail 50
-
-# Follow live logs
-docker compose logs -f web
-docker compose logs -f api
-```
-
-### Check Status
-```bash
-# List running containers
-docker ps
-
-# Detailed status with health checks
-docker compose ps
-
-# Resource usage
-docker stats
-```
-
-### Access Services Locally
-| Service | URL | Description |
-|---------|-----|-------------|
-| Frontend | http://localhost:3000 | Chat UI |
-| API Health | http://localhost:8000/api/health | Backend health |
-| n8n | http://localhost:5678 | Workflow editor |
-| Ollama | http://localhost:11434/api/tags | Model management |
-
----
-
-## First Run - Model Download
-
-On first startup, Ollama downloads models automatically:
-- **qwen3:8b** (~5.2 GB) - Main chat model
-- **nomic-embed-text** (~274 MB) - Embedding model
+Demo mode works even while Ollama is unavailable. To enable local model answers:
 
 ```bash
-# Monitor progress
-docker compose logs -f ollama
-
-# Verify models loaded
-docker compose exec api python -c "
-import ollama
-client = ollama.Client(host='http://ollama:11434')
-print([m['name'] for m in client.list()['models']])
-"
+docker compose exec ollama ollama pull qwen3:8b
 ```
 
-Expected output:
-```
-['nomic-embed-text:latest', 'qwen3:8b']
-```
+Then ask: `What needs my attention this week?`
 
----
+## Local development
 
-## Health Checks
+Backend (Python 3.11+):
 
 ```bash
-# Backend health (includes Ollama status)
-curl http://localhost:8000/api/health
-
-# Expected healthy response:
-{
-  "status": "healthy",
-  "services": {
-    "database": "connected",
-    "ollama": "available",
-    "n8n": "available"
-  },
-  "model": "qwen3:8b"
-}
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+# macOS/Linux: source .venv/bin/activate
+pip install -r apps/api/requirements-dev.txt
+uvicorn apps.api.app.main:app --reload
 ```
 
----
-
-## Testing the Chat
-
-1. Open http://localhost:3000 (or forwarded port 3000 in Codespaces)
-2. Wait for green "connected" status indicator
-3. Try these queries:
-   - "What needs my attention today?"
-   - "Who is waiting on me?"
-   - "Find upcoming renewals and deadlines"
-   - "Summarize important unread emails"
-
-The chat will respond with:
-- LLM-generated response
-- Source citations (demo data)
-- Action cards with approve/edit/dismiss buttons
-
----
-
-## Troubleshooting
-
-### Ollama shows "unavailable"
-```bash
-# Check Ollama logs
-docker compose logs ollama --tail 100
-
-# Test connectivity from API container
-docker compose exec api python -c "
-import ollama
-client = ollama.Client(host='http://ollama:11434')
-print(client.list())
-"
-
-# Restart Ollama if stuck
-docker compose restart ollama
-```
-
-### Frontend shows 404 / blank page
-```bash
-# Check web logs
-docker compose logs web --tail 50
-
-# Rebuild web
-docker compose up -d --build --force-recreate web
-```
-
-### API returns 404 for /api/*
-```bash
-# Check API logs
-docker compose logs api --tail 50
-
-# Verify proxy config
-cat apps/web/next.config.js
-# Should have: destination: 'http://api:8000/api/:path*'
-```
-
-### Port conflicts
-```bash
-# Check what's using ports
-docker compose ps
-netstat -tulpn | grep -E '3000|8000|5678|11434'
-
-# Stop conflicting services
-docker compose down
-```
-
----
-
-## Environment Configuration
+Frontend (Node 20+):
 
 ```bash
-# Copy and edit
-cp .env.example .env
-# Edit .env with your values
+cd apps/web
+npm install
+npm run dev
 ```
 
-Key variables:
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `HEYBROSKI_CHAT_MODEL` | LLM model | `qwen3:8b` |
-| `HEYBROSKI_EMBEDDING_MODEL` | Embedding model | `nomic-embed-text` |
-| `OLLAMA_BASE_URL` | Ollama URL (Docker) | `http://ollama:11434` |
-| `GOOGLE_CLIENT_ID` | Gmail OAuth | (empty) |
-| `MICROSOFT_CLIENT_ID` | Outlook OAuth | (empty) |
-
----
-
-## Data Persistence
-
-Data is stored in Docker volumes:
-- `heybroski_data` - SQLite database, file cache
-- `ollama_data` - Downloaded models
-- `n8n_data` - Workflows, credentials
+Run checks:
 
 ```bash
-# Backup volumes
-docker run --rm -v hey-broski_heybroski_data:/data -v $(pwd):/backup alpine tar czf /backup/backup.tar.gz /data
-
-# Restore
-docker run --rm -v hey-broski_heybroski_data:/data -v $(pwd):/backup alpine tar xzf /backup/backup.tar.gz -C /
+pytest apps/api/tests
+cd apps/web && npm run build
 ```
 
----
+## Architecture
 
-## Development Workflow
-
-```bash
-# 1. Make code changes
-# 2. Rebuild affected service
-docker compose up -d --build --force-recreate api
-
-# 3. Check logs
-docker compose logs -f api
-
-# 4. Test changes
-curl http://localhost:8000/api/health
+```text
+Browser / Next.js
+        │ relative /api proxy
+        ▼
+FastAPI routes ── Assistant service ── Ollama (optional)
+        │                 │
+        └──── SQLite repository ── local documents
+                    │
+              immutable audit events
 ```
 
----
+The API is separated into configuration, validation schemas, the assistant/domain service, and a SQLite repository. This keeps the MVP small while leaving clear boundaries for connector and vector-index implementations.
 
-## Commands Quick Reference
+Data defaults to `.hey-broski/` locally and `/data/heybroski` in Docker. The Docker named volume persists it across restarts.
 
-| Task | Command |
-|------|---------|
-| Start all | `docker compose up -d` |
-| Stop all | `docker compose down` |
-| Restart all | `docker compose restart` |
-| Rebuild API | `docker compose up -d --build --force-recreate api` |
-| Rebuild Web | `docker compose up -d --build --force-recreate web` |
-| View all logs | `docker compose logs -f` |
-| View API logs | `docker compose logs api --tail 50` |
-| View Web logs | `docker compose logs web --tail 50` |
-| View Ollama logs | `docker compose logs ollama --tail 50` |
-| Check status | `docker compose ps` |
-| List containers | `docker ps` |
-| Shell into API | `docker compose exec api bash` |
-| Shell into Web | `docker compose exec web sh` |
-| Test Ollama | `docker compose exec api python -c "import ollama; print(ollama.Client(host='http://ollama:11434').list())"` |
+## Safety model
 
----
+- Read-only retrieval is allowed immediately.
+- Suggested writes become pending action cards.
+- A user must approve or dismiss each card.
+- Decisions and uploads are recorded in the local audit log.
+- OAuth credentials are not implemented yet; no token is stored by this MVP.
+- Never commit `.env` or the `.hey-broski/` directory.
 
-## Codespaces-Specific Notes
+Approval currently creates a persisted local reminder and records its result before reporting completion. Live email/calendar/n8n adapters must keep the same policy boundary and mark an action complete only after a confirmed tool result.
 
-- **Port forwarding**: Codespaces auto-forwards ports 3000, 8000, 5678, 11434
-- **Access URLs**: Use the "Ports" tab → globe icon for public URLs
-- **Terminal**: Use the built-in terminal (Terminal → New Terminal)
-- **Docker socket**: Works out of the box in Codespaces
-- **Persistence**: Volumes persist across Codespace restarts
+## Configuration
 
----
+Important variables are documented in `.env.example`:
 
-## Architecture Overview
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `HEYBROSKI_DEMO_MODE` | `true` | Enables bundled evaluation data |
+| `HEYBROSKI_DATA_DIR` | `./.hey-broski` | Local SQLite/data directory |
+| `OLLAMA_BASE_URL` | Docker service URL | Local inference endpoint |
+| `HEYBROSKI_CHAT_MODEL` | `qwen3:8b` | Local chat model |
+| `OLLAMA_TIMEOUT_SECONDS` | `45` | Model request timeout |
 
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Browser   │────▶│  Next.js    │────▶│  FastAPI    │
-│  (Port 3000)│     │  (Web)      │     │  (Port 8000)│
-└─────────────┘     └─────────────┘     └──────┬──────┘
-                                                │
-                    ┌─────────────┐     ┌───────┴───────┐
-                    │   Ollama    │     │     n8n       │
-                    │  (Port 11434)│     │  (Port 5678)  │
-                    └─────────────┘     └───────────────┘
-                           │
-                    ┌──────┴──────┐
-                    │  Volumes    │
-                    │  (Data)     │
-                    └─────────────┘
-```
+## API surface
 
----
+- `GET /api/health`
+- `POST/GET /api/chat/sessions`
+- `POST /api/chat/sessions/{id}/messages`
+- `GET /api/actions`
+- `POST /api/actions/{id}/decision`
+- `GET /api/reminders`
+- `POST/GET /api/documents`
+- `GET /api/audit`
 
-## Next Steps
+Interactive request and response schemas are at `/docs`.
 
-1. **Enable Demo Mode** in the UI for instant testing
-2. **Configure OAuth** for Gmail/Outlook (optional)
-3. **Add documents** via the Vault page
-4. **Create n8n workflows** for automations
-4. **Explore the codebase** - see `plan.md` for implementation roadmap
+## Roadmap
 
----
+1. Encrypted OAuth token storage and Gmail/Outlook read sync
+2. Google and Microsoft calendar conflict detection
+3. Embeddings and LanceDB for semantic document retrieval
+4. Approved n8n workflow execution with idempotency keys
+5. Background synchronization and connector health reporting
+6. Playwright coverage for the full browser flow
 
-Built with zero paid APIs, local LLMs, and complete data ownership.
+See `plan.md` for the product vision and complete scope.

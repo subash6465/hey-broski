@@ -1,199 +1,207 @@
 from __future__ import annotations
 
 import asyncio
-import os
-import time
+import io
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional
-from uuid import uuid4
+from typing import Any
 
 import ollama
-import structlog
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator
 
-logger = structlog.get_logger()
+from .assistant import AssistantService
+from .config import settings
+from .repository import Repository
+from .schemas import ActionCard, ChatRequest, ChatResponse, DecisionRequest, DocumentRecord
 
-OLLAMA_HOST = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
-CHAT_MODEL = os.getenv("HEYBROSKI_CHAT_MODEL", "qwen3:4b")
-LLM_TEMPERATURE = float(os.getenv("HEYBROSKI_LLM_TEMPERATURE", "0.2"))
-OLLAMA_TIMEOUT_SECONDS = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "300"))
-OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "128"))
+repository = Repository(settings.database_path)
+assistant = AssistantService(repository, settings)
 
-app = FastAPI(title="Hey Broski API", version="0.1.0")
 
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    repository.initialize()
+    yield
+
+
+app = FastAPI(title="Hey Broski API", version="0.2.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
     allow_origin_regex=r"https://.*\.(app\.github\.dev|githubpreview\.dev)",
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-class ChatRequest(BaseModel):
-    message: str = Field(..., min_length=1, max_length=8000)
-    session_id: Optional[str] = None
-    mode: Optional[str] = "daily_admin"
-    account_filter: Optional[List[str]] = None
-    include_sources: bool = True
-
-    @field_validator("message")
-    @classmethod
-    def clean_message(cls, value: str) -> str:
-        cleaned = value.strip()
-        if not cleaned:
-            raise ValueError("message cannot be empty")
-        return cleaned
-
-
-class Source(BaseModel):
-    source_type: str
-    source_id: str
-    connected_account_id: str
-    account_label: str
-    title: str
-    snippet: str
-    timestamp: str
-
-
-class ChatResponse(BaseModel):
-    message_id: str
-    content: str
-    sources: List[Source] = Field(default_factory=list)
-    action_cards: List[Dict[str, Any]] = Field(default_factory=list)
-
-
-class HealthResponse(BaseModel):
-    status: Literal["healthy", "degraded"]
-    timestamp: str
-    services: Dict[str, str]
-    model: str
-    available_models: List[str] = Field(default_factory=list)
-
-
-def make_ollama_client() -> ollama.Client:
-    return ollama.Client(host=OLLAMA_HOST, timeout=OLLAMA_TIMEOUT_SECONDS)
-
-
-def extract_model_names(models_response: Any) -> List[str]:
-    models = []
-    raw_models = getattr(models_response, "models", None) or models_response.get("models", [])
-    for model in raw_models:
-        name = getattr(model, "model", None) or getattr(model, "name", None)
-        if isinstance(model, dict):
-            name = model.get("model") or model.get("name") or name
-        if name:
-            models.append(name)
-    return models
-
-
-async def list_ollama_models() -> List[str]:
-    client = make_ollama_client()
-    response = await asyncio.to_thread(client.list)
-    return extract_model_names(response)
-
-
-def demo_sources() -> List[Source]:
-    return [
-        Source(
-            source_type="email",
-            source_id="demo-1",
-            connected_account_id="demo-account-1",
-            account_label="Gmail / Personal",
-            title="Credit card bill due soon",
-            snippet="Credit card bill of $1,234.56 is due on August 18, 2026",
-            timestamp="2026-08-13T10:00:00Z",
-        )
-    ]
-
-
-@app.get("/api/health", response_model=HealthResponse)
-async def health_check() -> HealthResponse:
-    services = {"database": "not_configured", "ollama": "unavailable", "n8n": "not_checked"}
-    available_models: List[str] = []
-
+@app.get("/api/health")
+async def health_check() -> dict[str, Any]:
+    ollama_status, models = "unavailable", []
     try:
-        available_models = await list_ollama_models()
-        if CHAT_MODEL in available_models or f"{CHAT_MODEL}:latest" in available_models:
-            services["ollama"] = "available"
-        else:
-            services["ollama"] = f"model_missing:{CHAT_MODEL}"
-    except Exception as exc:
-        logger.error("ollama_health_check_failed", error=str(exc), host=OLLAMA_HOST)
+        client = ollama.Client(host=settings.ollama_base_url, timeout=3)
+        response = await asyncio.wait_for(asyncio.to_thread(client.list), timeout=4)
+        models = [getattr(model, "model", "") for model in getattr(response, "models", [])]
+        ollama_status = (
+            "available"
+            if any(name.startswith(settings.chat_model) for name in models)
+            else f"model_missing:{settings.chat_model}"
+        )
+    except Exception:
+        pass
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "mode": "demo" if settings.demo_mode else "connected",
+        "services": {"database": "connected", "ollama": ollama_status},
+        "model": settings.chat_model,
+        "available_models": models,
+    }
 
-    return HealthResponse(
-        status="healthy" if services["ollama"] == "available" else "degraded",
-        timestamp=datetime.now(timezone.utc).isoformat(),
-        services=services,
-        model=CHAT_MODEL,
-        available_models=available_models,
-    )
 
-
-@app.post("/api/chat/sessions")
-async def create_session() -> Dict[str, str]:
-    return {"session_id": f"session_{uuid4().hex}"}
+@app.post("/api/chat/sessions", status_code=201)
+async def create_session() -> dict[str, str]:
+    return repository.create_session()
 
 
 @app.get("/api/chat/sessions")
-async def list_sessions() -> Dict[str, List[Any]]:
-    return {"sessions": []}
+async def list_sessions() -> dict[str, Any]:
+    return {"sessions": repository.list_sessions()}
+
+
+@app.get("/api/chat/sessions/{session_id}/messages")
+async def list_messages(session_id: str) -> dict[str, Any]:
+    if not repository.session_exists(session_id):
+        raise HTTPException(404, "Conversation not found")
+    return {"messages": repository.list_messages(session_id)}
 
 
 @app.post("/api/chat/sessions/{session_id}/messages", response_model=ChatResponse)
 async def send_message(session_id: str, request: ChatRequest) -> ChatResponse:
-    system_prompt = """You are Hey Broski, a local-first personal admin AI assistant.
-You help users manage their emails, calendar, documents, and tasks.
-Be concise, actionable, and helpful. If you do not have real connected account data, say so clearly and use only the provided demo context."""
+    if not repository.session_exists(session_id):
+        raise HTTPException(404, "Conversation not found")
+    repository.add_message(session_id, "user", request.message)
+    sources, cards = assistant.context_for(request.message)
+    if not request.include_sources:
+        sources = []
+    persisted_cards = []
+    for card in cards:
+        repository.upsert_action(
+            {
+                **card.model_dump(),
+                "sources": [source.model_dump() for source in card.source_refs],
+                "session_id": session_id,
+            }
+        )
+        persisted = repository.get_action(card.id)
+        persisted_cards.append(ActionCard.model_validate(persisted) if persisted else card)
+    cards = persisted_cards
+    content, generated_by = await assistant.answer(request.message, sources)
+    message_id = repository.add_message(
+        session_id,
+        "assistant",
+        content,
+        {
+            "sources": [source.model_dump() for source in sources],
+            "action_cards": [card.model_dump() for card in cards],
+            "generated_by": generated_by,
+        },
+    )
+    repository.audit(
+        "chat.completed",
+        message_id,
+        {"session_id": session_id, "generated_by": generated_by, "source_count": len(sources)},
+    )
+    return ChatResponse(
+        message_id=message_id,
+        content=content,
+        sources=sources,
+        action_cards=cards,
+        generated_by=generated_by,
+    )
 
-    started = time.perf_counter()
+
+@app.get("/api/actions", response_model=list[ActionCard])
+async def list_actions(
+    action_status: str | None = Query(default=None, alias="status"),
+) -> list[dict[str, Any]]:
+    return repository.list_actions(action_status)
+
+
+@app.post("/api/actions/{action_id}/decision", response_model=ActionCard)
+async def decide_action(action_id: str, request: DecisionRequest) -> dict[str, Any]:
+    action = repository.get_action(action_id)
+    if not action:
+        raise HTTPException(404, "Action card not found")
+    if action["status"] != "pending":
+        raise HTTPException(409, f"Action has already been {action['status']}")
+    if request.decision == "approve":
+        # The MVP executes only a local reminder. External connectors must use
+        # the same approval boundary and persist their own confirmed result.
+        updated, tool_result = repository.execute_local_reminder(action_id)
+        next_status = "completed"
+    else:
+        updated = repository.decide_action(action_id, "dismissed")
+        tool_result = {"executed": False}
+        next_status = "dismissed"
+    repository.audit(
+        f"action.{next_status}",
+        action_id,
+        {
+            "decision": request.decision,
+            "tool": (action.get("proposed_action") or {}).get("tool"),
+            "tool_result": tool_result,
+        },
+    )
+    return updated
+
+
+@app.get("/api/reminders")
+async def list_reminders() -> dict[str, Any]:
+    return {"reminders": repository.list_reminders()}
+
+
+@app.get("/api/documents", response_model=list[DocumentRecord])
+async def list_documents() -> list[dict[str, Any]]:
+    return repository.list_documents()
+
+
+@app.post("/api/documents", response_model=DocumentRecord, status_code=201)
+async def upload_document(file: UploadFile = File(...)) -> dict[str, Any]:
+    payload = await file.read()
+    if not payload:
+        raise HTTPException(400, "The uploaded file is empty")
+    if len(payload) > 10 * 1024 * 1024:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Files are limited to 10 MB")
+    content_type = file.content_type or "application/octet-stream"
     try:
-        client = make_ollama_client()
-        response = await asyncio.to_thread(
-            client.chat,
-            model=CHAT_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": request.message},
-            ],
-            options={
-                "temperature": LLM_TEMPERATURE,
-                "num_predict": OLLAMA_NUM_PREDICT,
-            },
-        )
-        message = getattr(response, "message", None) or response.get("message", {})
-        content = getattr(message, "content", None) or message.get("content")
-        if not content:
-            raise RuntimeError("Ollama returned an empty response")
+        if content_type == "application/pdf" or (file.filename or "").lower().endswith(".pdf"):
+            from pypdf import PdfReader
 
-        logger.info(
-            "ollama_chat_succeeded",
-            host=OLLAMA_HOST,
-            model=CHAT_MODEL,
-            elapsed_ms=round((time.perf_counter() - started) * 1000),
-        )
-        return ChatResponse(
-            message_id=f"msg_{uuid4().hex}",
-            content=content,
-            sources=demo_sources() if request.include_sources else [],
-            action_cards=[],
-        )
+            text = "\n".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(payload)).pages)
+        elif content_type.startswith("text/") or (file.filename or "").lower().endswith((".md", ".txt", ".csv")):
+            text = payload.decode("utf-8", errors="replace")
+        else:
+            raise HTTPException(415, "Supported formats: PDF, TXT, Markdown, and CSV")
+    except HTTPException:
+        raise
     except Exception as exc:
-        logger.error("ollama_chat_failed", error=str(exc), host=OLLAMA_HOST, model=CHAT_MODEL)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=(
-                f"Unable to get a response from Ollama at {OLLAMA_HOST} using model '{CHAT_MODEL}'. "
-                "Confirm Ollama is running and the model is pulled. "
-                f"Original error: {exc}"
-            ),
-        ) from exc
+        raise HTTPException(422, f"Could not extract text: {exc}") from exc
+    if len(text.strip()) < 10:
+        raise HTTPException(422, "No usable text was found in this document")
+    document = repository.add_document(file.filename or "document", content_type, len(payload), text.strip())
+    repository.audit(
+        "document.uploaded",
+        document["id"],
+        {"filename": document["filename"], "size_bytes": len(payload)},
+    )
+    return document
+
+
+@app.get("/api/audit")
+async def list_audit() -> dict[str, Any]:
+    return {"events": repository.list_audit()}
 
 
 if __name__ == "__main__":

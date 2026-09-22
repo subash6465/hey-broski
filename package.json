@@ -2,15 +2,16 @@
   "name": "hey-broski",
   "version": "0.1.0",
   "private": true,
-  "packageManager": "pnpm@9.15.0",
+  "packageManager": "npm@11.6.2",
   "engines": {
-    "node": ">=20.0.0",
-    "pnpm": ">=9.0.0"
+    "node": ">=20.9.0",
+    "npm": ">=10.0.0"
   },
   "scripts": {
-    "dev:web": "pnpm --dir apps/web dev",
-    "build:web": "pnpm --dir apps/web build",
-    "lint:web": "pnpm --dir apps/web lint",
+    "dev:web": "npm --prefix apps/web run dev",
+    "build:web": "npm --prefix apps/web run build",
+    "lint:web": "npm --prefix apps/web run lint",
+    "test:api": "python -m pytest",
     "dev:api": "uvicorn apps.api.app.main:app --host 0.0.0.0 --port 8000 --reload"
   }
 }

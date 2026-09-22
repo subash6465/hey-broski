@@ -10,7 +10,8 @@ services:
       - API_INTERNAL_BASE_URL=http://api:8000
     depends_on:
       api:
-        condition: service_started
+        condition: service_healthy
+    restart: unless-stopped
 
   api:
     build:
@@ -22,18 +23,16 @@ services:
       - .env
     environment:
       - OLLAMA_BASE_URL=http://ollama:11434
-      - HEYBROSKI_CHAT_MODEL=${HEYBROSKI_CHAT_MODEL:-qwen3:4b}
+      - HEYBROSKI_CHAT_MODEL=${HEYBROSKI_CHAT_MODEL:-qwen3:8b}
       - HEYBROSKI_LLM_TEMPERATURE=${HEYBROSKI_LLM_TEMPERATURE:-0.2}
       - OLLAMA_TIMEOUT_SECONDS=${OLLAMA_TIMEOUT_SECONDS:-300}
       - OLLAMA_NUM_PREDICT=${OLLAMA_NUM_PREDICT:-128}
+      - HEYBROSKI_DATA_DIR=/data/heybroski
+      - HEYBROSKI_DEMO_MODE=${HEYBROSKI_DEMO_MODE:-true}
     volumes:
       - heybroski_data:/data/heybroski
       - ./demo-data:/app/demo-data:ro
-    depends_on:
-      ollama:
-        condition: service_started
-      n8n:
-        condition: service_started
+    restart: unless-stopped
 
   ollama:
     image: ollama/ollama:latest
@@ -43,14 +42,7 @@ services:
       - ollama_data:/root/.ollama
     environment:
       - OLLAMA_KEEP_ALIVE=24h
-    entrypoint: >
-      /bin/sh -c "
-        ollama serve &
-        sleep 5 &&
-        ollama pull ${HEYBROSKI_CHAT_MODEL:-qwen3:4b} &&
-        ollama pull ${HEYBROSKI_EMBEDDING_MODEL:-nomic-embed-text} &&
-        wait
-      "
+    restart: unless-stopped
 
   n8n:
     image: n8nio/n8n:latest
@@ -64,6 +56,7 @@ services:
       - N8N_PERSONALIZATION_ENABLED=false
     volumes:
       - n8n_data:/home/node/.n8n
+    restart: unless-stopped
 
 volumes:
   heybroski_data:
