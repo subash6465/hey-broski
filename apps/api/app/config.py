@@ -29,7 +29,9 @@ class Settings:
             ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/"),
             chat_model=os.getenv("HEYBROSKI_CHAT_MODEL", "qwen3:8b"),
             llm_temperature=float(os.getenv("HEYBROSKI_LLM_TEMPERATURE", "0.2")),
-            ollama_timeout_seconds=float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "45")),
+            # Keep the end-to-end request below the browser's 60-second limit,
+            # including when an older .env still contains the former 300 value.
+            ollama_timeout_seconds=min(float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "45")), 45.0),
             demo_mode=_bool("HEYBROSKI_DEMO_MODE", True),
         )
 

@@ -7,8 +7,7 @@ FROM node:20-alpine AS builder
 WORKDIR /app
 COPY --from=dependencies /app/node_modules ./node_modules
 COPY apps/web/ ./
-ARG API_INTERNAL_BASE_URL=http://api:8000
-ENV NEXT_TELEMETRY_DISABLED=1 API_INTERNAL_BASE_URL=${API_INTERNAL_BASE_URL}
+ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 
 FROM node:20-alpine AS runner

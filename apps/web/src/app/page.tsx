@@ -48,26 +48,33 @@ export default function Home() {
   const [health, setHealth] = useState<Health>()
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
+  const [uploading, setUploading] = useState(false)
   const [decisionBusy, setDecisionBusy] = useState<string>()
   const [error, setError] = useState<string>()
+  const [notice, setNotice] = useState<string>()
   const bottom = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     async function initialize() {
       try {
-        const [session, status, currentActions, docs] = await Promise.all([
-          request<{ session_id: string }>('/api/chat/sessions', { method: 'POST' }),
+        const session = await request<{ session_id: string }>(
+          '/api/chat/sessions',
+          { method: 'POST' },
+          15_000,
+        )
+        setSessionId(session.session_id)
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : 'Could not start a conversation')
+      }
+
+      const [status, currentActions, docs] = await Promise.allSettled([
           request<Health>('/api/health'),
           request<ActionCard[]>('/api/actions'),
           request<DocumentRecord[]>('/api/documents'),
-        ])
-        setSessionId(session.session_id)
-        setHealth(status)
-        setActions(currentActions)
-        setDocuments(docs)
-      } catch (caught) {
-        setError(caught instanceof Error ? caught.message : 'Could not connect to the API')
-      }
+      ])
+      if (status.status === 'fulfilled') setHealth(status.value)
+      if (currentActions.status === 'fulfilled') setActions(currentActions.value)
+      if (docs.status === 'fulfilled') setDocuments(docs.value)
     }
     void initialize()
   }, [])
@@ -77,19 +84,30 @@ export default function Home() {
   async function sendMessage(event?: FormEvent, selectedPrompt?: string) {
     event?.preventDefault()
     const text = (selectedPrompt ?? input).trim()
-    if (!text || !sessionId || busy) return
-    setInput('')
+    if (!text || busy) return
     setError(undefined)
+    setNotice(undefined)
     setBusy(true)
-    setMessages((current) => [...current, { id: crypto.randomUUID(), role: 'user', content: text }])
     try {
+      let activeSession = sessionId
+      if (!activeSession) {
+        const session = await request<{ session_id: string }>(
+          '/api/chat/sessions',
+          { method: 'POST' },
+          15_000,
+        )
+        activeSession = session.session_id
+        setSessionId(activeSession)
+      }
+      setInput('')
+      setMessages((current) => [...current, { id: crypto.randomUUID(), role: 'user', content: text }])
       const response = await request<{
         message_id: string
         content: string
         sources: Source[]
         action_cards: ActionCard[]
         generated_by: 'demo' | 'ollama'
-      }>(`/api/chat/sessions/${sessionId}/messages`, {
+      }>(`/api/chat/sessions/${activeSession}/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: text }),
@@ -130,27 +148,33 @@ export default function Home() {
   }
 
   async function upload(file?: File) {
-    if (!file) return
-    setBusy(true)
+    if (!file || uploading) return
+    setUploading(true)
     setError(undefined)
+    setNotice(undefined)
     try {
       const form = new FormData()
       form.append('file', file)
       const document = await request<DocumentRecord>('/api/documents', { method: 'POST', body: form })
       setDocuments((current) => [document, ...current])
+      setNotice(`${document.filename} was added to your local document vault.`)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'Upload failed')
     } finally {
-      setBusy(false)
+      setUploading(false)
     }
   }
 
   async function switchView(next: View) {
     setView(next)
     setMobileNav(false)
-    if (next === 'actions') setActions(await request<ActionCard[]>('/api/actions'))
-    if (next === 'vault') setDocuments(await request<DocumentRecord[]>('/api/documents'))
-    if (next === 'audit') setAudit((await request<{ events: AuditEvent[] }>('/api/audit')).events)
+    try {
+      if (next === 'actions') setActions(await request<ActionCard[]>('/api/actions'))
+      if (next === 'vault') setDocuments(await request<DocumentRecord[]>('/api/documents'))
+      if (next === 'audit') setAudit((await request<{ events: AuditEvent[] }>('/api/audit')).events)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Could not load this view')
+    }
   }
 
   const pendingCount = actions.filter((action) => action.status === 'pending').length
@@ -179,11 +203,12 @@ export default function Home() {
         <header className="topbar">
           <div><p className="eyebrow">PERSONAL ADMIN COPILOT</p><h1>{viewTitles[view]}</h1></div>
           <div className="status-cluster">
-            <span className="mode-badge"><span className="status-dot" /> {health?.mode === 'demo' ? 'Demo mode' : 'Connected'}</span>
-            <span className="model-label">{health?.services.ollama === 'available' ? health.model : 'Reliable fallback'}</span>
+            <span className="mode-badge"><span className="status-dot" /> {!health ? 'Connecting…' : health.mode === 'demo' ? 'Demo mode' : 'Connected'}</span>
+            <span className="model-label">{!health ? 'Checking services' : health.services.ollama === 'available' ? health.model : 'Reliable fallback'}</span>
           </div>
         </header>
         {error && <div className="error-banner" role="alert"><span>{error}</span><button onClick={() => setError(undefined)}><X size={16} /></button></div>}
+        {notice && <div className="notice-banner" role="status"><span>{notice}</span><button onClick={() => setNotice(undefined)}><X size={16} /></button></div>}
 
         {view === 'chat' && (
           <section className="chat-layout">
@@ -199,21 +224,21 @@ export default function Home() {
                   </div>
                 </div>
               ))}
-              {messages.length === 1 && <div className="prompt-grid">{prompts.map((prompt) => <button key={prompt.label} onClick={() => void sendMessage(undefined, prompt.text)}><span>{prompt.label}</span><p>{prompt.text}</p><ChevronRight size={16} /></button>)}</div>}
+              {messages.length === 1 && <div className="prompt-grid">{prompts.map((prompt) => <button type="button" disabled={busy} key={prompt.label} onClick={() => void sendMessage(undefined, prompt.text)}><span>{prompt.label}</span><p>{prompt.text}</p><ChevronRight size={16} /></button>)}</div>}
               {busy && <div className="message-row assistant"><div className="bot-avatar"><Bot size={17} /></div><div className="typing"><i /><i /><i /></div></div>}
               <div ref={bottom} />
             </div>
-            <form className="composer" onSubmit={sendMessage}>
-              <textarea value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendMessage() } }} placeholder="Ask what needs your attention…" rows={1} disabled={!sessionId || busy} />
-              <label className="attach" title="Upload a document"><Paperclip size={19} /><input type="file" accept=".pdf,.txt,.md,.csv" onChange={(event) => void upload(event.target.files?.[0])} /></label>
-              <button className="send-button" disabled={!input.trim() || !sessionId || busy}><Send size={18} /></button>
+            <form className="composer" onSubmit={sendMessage} aria-busy={busy}>
+              <textarea value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendMessage() } }} placeholder="Ask what needs your attention…" rows={1} disabled={busy} />
+              <label className="attach" title="Upload a document"><Paperclip size={19} /><input type="file" disabled={uploading} accept=".pdf,.txt,.md,.csv" onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ''; void upload(file) }} /></label>
+              <button className="send-button" disabled={!input.trim() || busy}><Send size={18} /></button>
               <span className="composer-note">Sources are cited. Actions always require approval.</span>
             </form>
           </section>
         )}
 
         {view === 'actions' && <Collection title={`${pendingCount} items need a decision`} subtitle="Review every proposed action before anything changes.">{actions.length ? actions.map((card) => <ActionCardView key={card.id} card={card} busy={decisionBusy === card.id} onDecision={decide} />) : <Empty text="Ask for your daily brief to generate action cards." />}</Collection>}
-        {view === 'vault' && <Collection title="Your local documents" subtitle="PDF, text, Markdown, and CSV files are searchable from chat."><label className="upload-card"><Upload size={22} /><strong>Upload a document</strong><span>Maximum 10 MB</span><input type="file" accept=".pdf,.txt,.md,.csv" onChange={(event) => void upload(event.target.files?.[0])} /></label>{documents.map((doc) => <article className="document-card" key={doc.id}><FileText /><div><strong>{doc.filename}</strong><span>{Math.ceil(doc.size_bytes / 1024)} KB · {new Date(doc.created_at).toLocaleDateString()}</span><p>{doc.preview}</p></div></article>)}</Collection>}
+        {view === 'vault' && <Collection title="Your local documents" subtitle="PDF, text, Markdown, and CSV files are searchable from chat."><label className="upload-card"><Upload size={22} /><strong>{uploading ? 'Uploading…' : 'Upload a document'}</strong><span>Maximum 10 MB</span><input type="file" disabled={uploading} accept=".pdf,.txt,.md,.csv" onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ''; void upload(file) }} /></label>{documents.map((doc) => <article className="document-card" key={doc.id}><FileText /><div><strong>{doc.filename}</strong><span>{Math.ceil(doc.size_bytes / 1024)} KB · {new Date(doc.created_at).toLocaleDateString()}</span><p>{doc.preview}</p></div></article>)}</Collection>}
         {view === 'audit' && <Collection title="Transparent by design" subtitle="Chat, upload, and approval decisions are recorded locally.">{audit.length ? audit.map((event) => <article className="audit-row" key={event.id}><div className="audit-icon"><ShieldCheck size={16} /></div><div><strong>{event.event_type.replaceAll('.', ' ')}</strong><span>{new Date(event.created_at).toLocaleString()}</span></div></article>) : <Empty text="No recorded activity yet." />}</Collection>}
       </main>
     </div>

@@ -1,5 +1,9 @@
 const configuredBase = process.env.NEXT_PUBLIC_API_BASE_URL?.trim().replace(/\/$/, '')
-export const apiBase = configuredBase && !configuredBase.includes('://api:') ? configuredBase : ''
+// `/api` is the same-origin proxy path, not a host prefix. Treating it as a
+// prefix would produce broken URLs such as `/api/api/health`.
+export const apiBase = configuredBase && configuredBase !== '/api' && !configuredBase.includes('://api:')
+  ? configuredBase
+  : ''
 
 export async function request<T>(path: string, init: RequestInit = {}, timeoutMs = 60_000): Promise<T> {
   const controller = new AbortController()
@@ -20,7 +24,7 @@ export async function request<T>(path: string, init: RequestInit = {}, timeoutMs
     return body as T
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') {
-      throw new Error('The request timed out. Check that the API is running.')
+      throw new Error('The request timed out. The local model may be busy; you can retry safely.')
     }
     throw error
   } finally {

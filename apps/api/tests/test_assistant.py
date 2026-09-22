@@ -1,4 +1,5 @@
 from pathlib import Path
+import asyncio
 
 from app.assistant import AssistantService
 from app.config import Settings
@@ -29,3 +30,13 @@ def test_fallback_answer_cites_each_source(tmp_path: Path) -> None:
 
     assert "[Source 1]" in answer
     assert "Nothing will be executed without your approval" in answer
+
+
+def test_missing_ollama_uses_fallback(tmp_path: Path) -> None:
+    assistant = service(tmp_path)
+    sources, _ = assistant.context_for("Who is waiting on me?")
+
+    answer, generated_by = asyncio.run(assistant.answer("Who is waiting on me?", sources))
+
+    assert generated_by == "demo"
+    assert "[Source 1]" in answer

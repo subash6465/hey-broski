@@ -64,7 +64,19 @@ class AssistantService:
         context = "\n".join(f"[Source {i}] {s.account_label} — {s.title}: {s.snippet}" for i, s in enumerate(sources, 1))
         prompt = f"Answer using only these sources. Cite every fact as [Source N]. Never claim an action occurred. End by saying approval is required for suggested actions.\n\nQuestion: {message}\n\n{context}"
         try:
-            client = ollama.Client(host=self.settings.ollama_base_url, timeout=self.settings.ollama_timeout_seconds)
+            # Do a short availability/model check first. A missing Ollama model
+            # must never hold the otherwise complete demo response for minutes.
+            probe = ollama.Client(host=self.settings.ollama_base_url, timeout=3)
+            model_list = await asyncio.wait_for(asyncio.to_thread(probe.list), timeout=4)
+            model_names = [getattr(model, "model", "") for model in getattr(model_list, "models", [])]
+            if not any(name == self.settings.chat_model or name.startswith(f"{self.settings.chat_model}:") for name in model_names):
+                logger.info("ollama_model_missing_using_demo_answer", model=self.settings.chat_model)
+                return fallback, "demo"
+
+            client = ollama.Client(
+                host=self.settings.ollama_base_url,
+                timeout=self.settings.ollama_timeout_seconds,
+            )
             response = await asyncio.to_thread(client.chat, model=self.settings.chat_model, messages=[{"role": "system", "content": "You are Hey Broski, a concise local-first personal admin assistant."}, {"role": "user", "content": prompt}], options={"temperature": self.settings.llm_temperature, "num_predict": 400})
             content = getattr(getattr(response, "message", None), "content", None)
             if content:
