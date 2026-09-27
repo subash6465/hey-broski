@@ -1,6 +1,6 @@
 # Hey Broski - Build Plan
 
-Last updated: 2026-08-13
+Last updated: 2026-09-27
 Owner intent: Build a finished, production-style, zero-paid-API personal admin AI product with a polished chat interface, local LLMs, MCP tools, n8n automations, multi-account email/calendar/document connectivity, action cards, and human approval before real-world actions.
 
 Product name: **Hey Broski**. The repo, UI, docs, package names, Docker services, and user-facing copy must use this name. Do not use the previous working name except in migration notes if absolutely required.
@@ -24,6 +24,7 @@ Non-negotiable rules:
 9. Build demo mode first so the product can be evaluated without real Gmail/Outlook accounts.
 10. The MVP must be usable from `docker compose up`.
 11. Favor a working product over over-engineering. Build stable foundations, then expand.
+12. Each local installation's Gmail owner supplies an OAuth Desktop client from a Google Cloud project they control. Do not ship or require a shared Hey Broski Google OAuth client.
 
 Primary MVP product:
 
@@ -147,7 +148,7 @@ User asks:
 Draft a reply to the work email asking for the project update.
 ```
 
-System drafts the email but does not send it until the user approves.
+System prepares a reply locally for review. The first Gmail release does not write a draft to Gmail or send mail. A later Gmail draft feature requires a separate permission request and explicit user approval before creating the remote draft.
 
 ---
 
@@ -163,7 +164,7 @@ Build the following in the first complete version:
 6. LanceDB local vector index.
 7. Demo data mode for email, calendar, and documents.
 8. Local document upload and folder indexing.
-9. Basic Gmail developer-mode connector.
+9. Gmail read-only connector using the local user's own Google Cloud project and OAuth Desktop client.
 10. Basic Outlook/Microsoft Graph developer-mode connector.
 11. Action card generation.
 12. Human approval system.
@@ -184,11 +185,12 @@ Out of scope for MVP:
 5. WhatsApp or SMS integration.
 6. Payment integration.
 7. Enterprise admin console.
-8. Full Google OAuth public verification.
-9. Full Outlook tenant-admin support.
-10. Full background cloud infrastructure.
-11. Automatic subscription cancellation.
-12. Unrestricted filesystem access.
+8. A shared, publicly distributed Google OAuth app and its public verification.
+9. Gmail draft creation and sending (later permission and release).
+10. Full Outlook tenant-admin support.
+11. Full background cloud infrastructure.
+12. Automatic subscription cancellation.
+13. Unrestricted filesystem access.
 
 ---
 
@@ -761,12 +763,11 @@ HEYBROSKI_LLM_TEMPERATURE=0.2
 
 # Security
 HEYBROSKI_TOKEN_STORAGE=keyring
-HEYBROSKI_FALLBACK_TOKEN_ENCRYPTION_KEY=change-me-only-for-local-dev
+# If keyring is unavailable, generate and protect a unique local fallback key.
+# Never use a shared example encryption key for real account tokens.
 
-# Gmail developer mode
-GOOGLE_CLIENT_ID=
-GOOGLE_CLIENT_SECRET=
-GOOGLE_REDIRECT_URI=http://localhost:8000/api/accounts/gmail/callback
+# Gmail: no shared OAuth credentials in .env. Each installation imports its
+# owner's Desktop OAuth client JSON through the local Accounts setup flow.
 
 # Microsoft developer mode
 MICROSOFT_CLIENT_ID=
@@ -903,7 +904,7 @@ updated_at
  -Primary Key: False
 
 ### table_name: connected_accounts
-Description: Stores connected external accounts such as Gmail personal, Outlook work, Google Calendar, Microsoft Calendar, Google Drive, and OneDrive. Raw tokens must not be stored here.
+Description: Stores connected external accounts such as Gmail personal, Outlook work, Google Calendar, Microsoft Calendar, Google Drive, and OneDrive. Raw tokens and the user's Google OAuth client JSON must not be stored here; keep only local credential references.
 Columns:
 id
  -Description: Unique internal connected account identifier.
@@ -945,6 +946,11 @@ token_ref
  -Usage: text nullable
  -Values: ["keyring:heybroski:gmail:abc123"]
  -Primary Key: False
+oauth_client_ref
+ -Description: Reference to this installation's user-imported Google OAuth Desktop client configuration when applicable; never a shared application client.
+ -Usage: text nullable
+ -Values: ["local-credential:google:owner-client"]
+ -Primary Key: False
 sync_status
  -Description: Current sync state.
  -Usage: text enum
@@ -960,6 +966,16 @@ sync_cursor
  -Usage: text nullable
  -Values: []
  -Primary Key: False
+daily_sync_time_local
+ -Description: User-selected local time for the account's daily sync.
+ -Usage: text nullable
+ -Values: ["08:00"]
+ -Primary Key: False
+sync_timezone
+ -Description: IANA time zone used for the daily schedule and daylight-saving changes.
+ -Usage: text nullable
+ -Values: ["Asia/Kolkata"]
+ -Primary Key: False
 created_at
  -Description: Record creation timestamp in UTC.
  -Usage: datetime
@@ -972,7 +988,7 @@ updated_at
  -Primary Key: False
 
 ### table_name: email_threads
-Description: Stores normalized email thread metadata across Gmail, Outlook, and demo inboxes.
+Description: Stores normalized email thread metadata across Gmail, Outlook, and demo inboxes. For Gmail, never persist the full thread body.
 Columns:
 id
  -Description: Unique internal thread ID.
@@ -1026,7 +1042,7 @@ updated_at
  -Primary Key: False
 
 ### table_name: emails
-Description: Stores normalized email message metadata and extracted plain text. Use this table for search, summaries, and commitment detection.
+Description: Stores provider message IDs and minimal source metadata for deduplication and citations. Gmail message bodies are processed transiently during import/sync and are not retained in this table. Persist extracted knowledge separately.
 Columns:
 id
  -Description: Unique internal email ID.
@@ -1069,12 +1085,12 @@ subject
  -Values: []
  -Primary Key: False
 body_text
- -Description: Cleaned plain text body used for extraction and retrieval.
- -Usage: text
+ -Description: Legacy/demo or other-provider body text. Always null for Gmail; Gmail body text exists only in transient processing memory.
+ -Usage: text nullable
  -Values: []
  -Primary Key: False
 body_snippet
- -Description: Short preview for UI.
+ -Description: Optional short preview for providers/modes that retain previews; always null for Gmail unless the user explicitly enables preview retention later.
  -Usage: text nullable
  -Values: []
  -Primary Key: False
@@ -1113,6 +1129,29 @@ updated_at
  -Usage: datetime
  -Values: []
  -Primary Key: False
+
+### table_name: email_facts
+Description: Stores only durable, structured knowledge extracted from mail, such as a subscription, renewal date, amount, cancellation, deadline, or promised follow-up. Keep multiple source-message references and update or supersede facts when later mail changes them. Do not store full Gmail bodies or threads.
+Columns:
+- `id`: internal fact ID.
+- `connected_account_id`: source account.
+- `fact_type`: subscription, renewal, bill, commitment, appointment, cancellation, or other supported type.
+- `entity_key`: normalized vendor/person/item key used to merge related messages.
+- `structured_value_json`: validated values, dates, currency, and status; no raw body dump.
+- `confidence` and `review_status`: extraction certainty and user confirmation/correction.
+- `source_refs_json`: Gmail message ID, thread ID, account ID, and minimal sender/subject/date evidence for each supporting or contradicting message.
+- `first_seen_at`, `last_seen_at`, `updated_at`: lifecycle timestamps.
+
+### table_name: gmail_sync_jobs
+Description: Durable per-account initial-import and scheduled-sync state; supports progress, pause/resume, errors, and restart recovery without retaining email content.
+Columns:
+- `id`, `connected_account_id`, `job_type`: import or incremental sync.
+- `status`, `stage`: queued, running, paused, failed, completed; discovery, fetching, processing, catch-up.
+- `window_start_at`, `started_at`, `updated_at`, `completed_at`: fixed import cutoff and job timestamps.
+- `start_history_id`: mailbox history position captured before initial discovery.
+- `messages_discovered`, `messages_processed`, `facts_created`, `items_needing_review`: progress counters; discovered total is an estimate until listing finishes.
+- `checkpoint_json`: durable date-range/page progress; processed Gmail message IDs in the `emails` table make retries idempotent. A page token alone is not the only recovery checkpoint.
+- `last_error_code`, `last_error_summary`: redacted recoverable errors.
 
 ### table_name: calendar_events
 Description: Stores normalized calendar events from Google Calendar, Outlook Calendar, demo data, or locally created reminders.
@@ -1489,7 +1528,7 @@ action_card_id
 tool_name
  -Description: Tool that will execute after approval.
  -Usage: text
- -Values: ["email.create_draft", "calendar.create_reminder", "n8n.trigger_workflow"]
+ -Values: ["calendar.create_reminder", "n8n.trigger_workflow"]
  -Primary Key: False
 tool_args_json
  -Description: JSON arguments prepared for the tool.
@@ -1747,7 +1786,7 @@ vector: float[]
 Use cases:
 
 - Semantic search over documents.
-- Semantic search over important emails.
+- Semantic search over extracted email facts, with source-message IDs. Fetch original Gmail content on demand for explicit source inspection rather than indexing full Gmail bodies.
 - RAG for chat answers.
 - Source-grounded citations.
 
@@ -1857,8 +1896,13 @@ POST /api/approvals/{id}/edit
 ```text
 GET /api/accounts
 POST /api/accounts/demo/enable
+POST /api/accounts/gmail/client-config
 POST /api/accounts/gmail/start
 GET /api/accounts/gmail/callback
+GET /api/accounts/{id}/sync-jobs/current
+POST /api/accounts/{id}/sync-jobs/{job_id}/pause
+POST /api/accounts/{id}/sync-jobs/{job_id}/resume
+PUT /api/accounts/{id}/sync-schedule
 POST /api/accounts/outlook/start
 GET /api/accounts/outlook/callback
 POST /api/accounts/{id}/sync
@@ -2010,7 +2054,10 @@ Route:
 Features:
 
 - Enable demo data.
-- Connect Gmail.
+- Guide the local user through creating their own Google Cloud project and Desktop OAuth client, then import its JSON and connect Gmail.
+- Validate the imported client locally and show actionable setup/consent errors; do not automate Google Cloud Console or collect Google passwords.
+- Start the one-year Gmail import in a local background job after connection. Show its stage, processed/estimated total, errors, and Pause/Resume; keep navigation and chat available.
+- Let the user choose a daily Gmail sync time and time zone; show the next scheduled run and last successful run.
 - Connect Outlook.
 - Add local folder.
 - Show sync status.
@@ -2023,9 +2070,11 @@ For each account card show:
 Provider: Gmail
 Label: Personal Gmail
 Email: personal@gmail.com
-Scopes: readonly, compose
+Scopes: gmail.readonly
 Last sync: 2026-08-13 22:15
 Status: connected
+Import: processing 2,400 / about 8,100 messages (estimate)
+Daily sync: 08:00 Asia/Kolkata
 ```
 
 ### 14.6 Automations
@@ -2109,44 +2158,45 @@ UI must always display the source account for emails, calendar events, and cloud
 
 ### 15.2 Gmail connector
 
-Modes:
+The supported distribution model is a self-contained local installation. Each installation's owner creates and controls their own Google Cloud project, enables Gmail API, configures Google Auth Platform, and creates a **Desktop app** OAuth client. They import that client's downloaded JSON into Hey Broski on their own machine. A single user-owned client can authorize that owner's Gmail accounts as permitted by the project's audience settings. Do not embed a developer-owned client ID in the package, place Gmail client credentials in a shared `.env`, or route Gmail data through a Hey Broski-operated server. Gmail API project quota belongs to the project that owns the OAuth client; Gmail accounts also have per-user limits. Normal personal usage should stay below Google's current free usage threshold, but the UI and documentation must not promise permanently free or unlimited API access.
 
-1. Demo mode.
-2. Developer OAuth mode.
-3. Production OAuth verification later.
+First-run connection flow:
 
-Required MVP Gmail capabilities:
+1. Demo mode remains available with no Google account or Cloud setup.
+2. The Accounts page offers a guided, manual setup with direct links and current instructions for project creation, Gmail API enablement, OAuth audience/consent configuration, and Desktop OAuth client creation. Hey Broski does not automate Google Cloud Console setup.
+3. Explain that an External project left in **Testing** issues Gmail-scope refresh tokens that expire after seven days. For an eligible ongoing personal-use project, guide the owner through the appropriate **In production** setting and explain that an unverified-app warning and Google user cap can still apply. Do not describe user-owned projects as a blanket exemption for public app distribution or verification.
+4. The owner imports the downloaded Desktop OAuth client JSON. Validate client type, required fields, and configuration locally; show clear errors. Keep the imported configuration in a local protected credential store, never in source control, logs, or the browser's persistent storage. Store only its reference in SQLite. Support replacing or removing it.
+5. On Connect Gmail, start Google's authorization-code flow with PKCE in the system browser and a loopback callback bound to the local machine. Request offline access and only the scope needed for the current feature. Verify OAuth state, exchange the code locally, identify the connected account, and store refresh/access tokens in the OS keychain or protected local fallback. Never request the person's Google password.
+6. Confirm the connection with a small Gmail API read, then enqueue the one-year import as a local background job. Show the account email, granted scope, import progress, last sync, and recoverable errors. Reconnect if the token is revoked or expires. Allow disconnect and deletion of local Gmail data and credentials.
+7. Keep the API and OAuth callback on loopback; in Docker mode, publish the callback port only to the host loopback interface. Do not expose the OAuth callback, imported client, or token store to the LAN.
 
-- OAuth sign-in.
-- List messages from inbox and important folders.
-- Fetch message bodies.
-- Normalize plain text.
-- Store messages and threads.
-- Incremental sync using Gmail history ID when available.
-- Create draft after approval.
+Required first-release Gmail capabilities:
 
-Do not implement send email in MVP unless it is behind explicit approval and disabled by default.
+- OAuth sign-in using the user's imported client.
+- Import and analyze the previous one year of non-spam, non-trash messages across Inbox, Sent, and archived mail under `https://www.googleapis.com/auth/gmail.readonly`.
+- Normalize bodies transiently, retain only minimal processed-message/source metadata plus extracted structured facts and action cards locally; never persist full Gmail messages, threads, or body text.
+- Run a user-scheduled daily incremental sync using Gmail history ID, plus manual sync and useful connection status.
+- Prepare reply text locally for review; do not create a Gmail draft or send mail.
 
-Minimum scopes for MVP:
+Initial one-year import:
 
-```text
-gmail.readonly
-gmail.compose
-```
+1. Fix the cutoff at exactly one year before connection in the user's time zone. Use Gmail date filtering with an epoch-second cutoff to avoid Gmail's PST interpretation of date strings. Scan all matching Inbox, Sent, and archived messages; omit Spam, Trash, and Drafts by default. Explain that deleted mail and mail older than the cutoff cannot be discovered from this import.
+2. Capture the mailbox `historyId` before discovery. Page through message IDs (up to 500 per list page) and persist progress. Fetch message details in small batches of 20-50; Gmail recommends no more than 50 calls per batch, and each call still consumes quota. Rate-limit and retry individual failed messages with backoff. Bound concurrent Gmail requests.
+3. Process each fetched message locally. Use inexpensive rules to identify obvious noise and likely useful mail, then local-model extraction on candidates. Extract structured facts for subscriptions, payments, renewals, deadlines, appointments, commitments, and cancellations. Mark low-confidence or conflicting items for review. Keep processing workers bounded and give interactive chat/model requests priority so the user can keep using the app.
+4. Save structured facts, action cards, source account plus Gmail message/thread IDs, and minimal citation metadata. Do not save full Gmail bodies or threads. Save processed message IDs so restarting or retrying a batch cannot duplicate facts. Re-fetch an original message from Gmail on demand when the user opens its source; show a clear unavailable-source state if it was deleted or access was revoked.
+5. Run as a durable local background job. The Accounts UI shows stages and processed/discovered counts; label the total and percent as estimates until discovery completes. Support pause/resume and continue after app restart. Mark the import complete only after every discovered message is processed or reported as a specific failure and the final catch-up step succeeds.
+6. Replay changes since the starting `historyId` so mail arriving during the long import is not missed. If that history position expired, search the gap since import start, deduplicate by message ID, and then establish a fresh cursor.
 
-If label/archive support is added later:
+Daily sync:
 
-```text
-gmail.modify
-```
+1. Let the user choose a local time and time zone per Gmail account. The local background service runs the sync at that time while the computer and service are running; the chat UI need not be open. When the computer or service was off, catch up on the next launch and show that the scheduled run was missed. No cloud service can run the job while the user's computer is off.
+2. Use `history.list` from the last successful cursor to identify new, changed, and deleted messages. Fetch and process needed content, merge facts with existing entities, supersede outdated facts, and create/update action cards without duplicates.
+3. If Gmail history has expired, search from the last successful sync time with an overlap, deduplicate, and process the gap. Record a new cursor only after successful processing. Apply rate limiting, backoff, and a visible error/reconnect state.
+4. Daily sync and manual sync share the same pipeline; prevent overlapping jobs for one account. Track quota/error state and avoid needless refetches.
 
-Gmail sync approach:
+The first release does not process attachment contents; flag attachment-bearing messages whose facts may be incomplete. Add attachment extraction only as a separately scoped, size-limited local processing feature.
 
-1. First sync fetches recent messages from last 30 days or configurable limit.
-2. Store latest history ID.
-3. Next sync uses incremental history listing.
-4. If history ID is invalid, perform a limited resync.
-5. Never scan entire mailbox by default.
+Later Gmail write features require a separate, in-context consent step. Add `gmail.compose` only when approved Gmail draft creation is implemented; that scope also permits sending, so the app must enforce the existing approval boundary and keep send disabled by default. Add `gmail.modify` only if label/archive actions are actually implemented. Never request `https://mail.google.com/` for this connector.
 
 ### 15.3 Outlook connector
 
@@ -2283,6 +2333,8 @@ class ToolSpec(BaseModel):
 
 Read-only tools can execute without approval but must be audited.
 
+For Gmail, `email.search_messages` can query Gmail live and `email.get_thread` can fetch a source on demand. Persist only minimal message metadata and extracted facts; do not treat the local store as a full Gmail body index. During the initial import, chat remains available and answers based on Gmail must say that the account's knowledge is still incomplete until the import finishes.
+
 Tools:
 
 ```text
@@ -2319,13 +2371,12 @@ n8n.create_workflow
 For MVP, implement:
 
 ```text
-email.create_draft
 calendar.create_reminder
 automations.create_rule
 n8n.trigger_workflow
 ```
 
-Disable email sending until a later feature flag is explicitly enabled.
+The MVP may prepare reply text locally; `email.create_draft` is reserved for a later Gmail write-permission release. Disable email sending until a later feature flag is explicitly enabled and an approval flow is implemented.
 
 ### 16.4 Tool response format
 
@@ -2401,7 +2452,7 @@ Responsibilities:
 - Detect unanswered requests.
 - Detect commitments.
 - Detect people waiting on user.
-- Draft replies.
+- Prepare reply text locally for review.
 
 Signals:
 
@@ -2477,7 +2528,7 @@ Policy examples:
 ```text
 Read local indexed metadata: allowed, audited.
 Search email: allowed, audited.
-Create draft: approval required.
+Create Gmail draft: later release only, approval required.
 Send email: high risk, disabled by default.
 Delete file: blocked in MVP.
 Move file: blocked in MVP.
@@ -2595,6 +2646,8 @@ dismiss
 create_automation
 trigger_n8n_workflow
 ```
+
+In the first release, `draft_email` means generating local reply text for review. It does not invoke `email.create_draft` or write to Gmail.
 
 Card priority rules:
 
@@ -2790,6 +2843,7 @@ Calendar source reference:
 Default data stays local.
 
 Do not send user emails, documents, calendar data, or embeddings to a third-party AI API.
+For Gmail, connect directly from the local installation to Google's OAuth and Gmail endpoints. No Hey Broski-operated cloud relay receives mail, OAuth tokens, or imported client configuration.
 
 ### 23.2 OAuth tokens
 
@@ -2799,15 +2853,17 @@ Token storage order:
 2. Encrypted local fallback using `cryptography` if keychain is unavailable.
 3. Never plaintext SQLite.
 
+Store the user-imported Google OAuth client configuration in protected local storage as well. A Docker container may not have access to the host OS keychain, so the fallback must use a locally generated, protected encryption key; never ship a common default key. Redact client configuration, authorization codes, and tokens from logs and exports.
+
 ### 23.3 Permissions
 
 Use minimum scopes.
 
 Gmail:
 
-- Start with read-only and compose.
-- Add modify only when needed.
-- Sending disabled by default.
+- Request only `gmail.readonly` in the first release.
+- Add `gmail.compose` through a separate, in-context consent flow only when remote Gmail draft creation is implemented; it also authorizes sending, which remains disabled by default and requires explicit approval if enabled later.
+- Add `gmail.modify` only when label/archive actions are implemented.
 
 Microsoft:
 
@@ -2838,7 +2894,7 @@ Never log:
 Read indexed data: no approval
 Search email: no approval, audited
 Fetch full email body: no approval, audited
-Create email draft: approval required
+Create Gmail draft: not in first release; approval required when implemented later
 Send email: disabled by default, high-risk approval if enabled later
 Create calendar reminder: approval required
 Create automation rule: approval required
@@ -2995,22 +3051,31 @@ User can ask questions about the document with source references.
 
 Deliverables:
 
-- OAuth start/callback.
-- Token storage.
-- Message sync.
-- Thread normalization.
-- Incremental sync cursor.
+- Accounts setup guide for a user-owned Google Cloud project, enabled Gmail API, and Desktop OAuth client; manual JSON import and local validation.
+- Local OAuth start/callback with system-browser consent, PKCE, offline access, and `gmail.readonly` only.
+- Protected storage for the imported client and OAuth tokens, with disconnect/removal.
+- Resumable background import of all non-spam, non-trash Inbox, Sent, and archived mail from the preceding year; 20-50 message fetches per batch with bounded Gmail and local-model concurrency.
+- Transient message processing, durable extracted facts with Gmail source references, processed-ID deduplication, and no retained full Gmail bodies or threads.
+- Progress stages/counts, Pause/Resume, responsive chat with partial-knowledge labeling, and import catch-up for messages arriving while the job runs.
+- User-selected daily sync time/time zone, incremental cursor, missed-run catch-up, expired-history recovery, and manual sync.
 - Gmail source labels.
-- Draft creation after approval.
+- Local reply preview; remote Gmail draft creation deferred to a later permission step.
 
 Acceptance criteria:
 
 ```text
-Developer-mode Gmail account can connect.
-Recent Gmail messages sync locally.
+Fresh local installation guides the owner to create and import their own Desktop OAuth client; no shared Hey Broski Google client is needed.
+Owner can connect Gmail using their own project and `gmail.readonly` permission, with no Google password entered into Hey Broski.
+The setup explains the Testing refresh-token lifetime and the personal-use In production/unverified warning and cap.
+The one-year import continues in the background while the user chats or uses other features; the UI shows estimated progress and does not claim complete Gmail knowledge early.
+The import can pause, resume, and survive a local-service restart without duplicate facts or action cards.
+Only structured knowledge and minimal Gmail source/processed IDs persist; full Gmail bodies and threads are not retained.
+Messages arriving during import are included by a final catch-up before completion.
+Daily sync runs at the user-selected local time while the computer and local service are running, and catches up on the next launch after a missed run.
 Messages appear with Gmail / Personal label.
 System can identify reply-needed emails.
-System can create a Gmail draft only after approval.
+System can prepare a reply locally without requesting Gmail write access.
+Disconnect removes local Gmail tokens and supports deletion of the account's cached mail.
 ```
 
 ### Phase 6 - Outlook connector
@@ -3096,7 +3161,7 @@ Deliverables:
 - README.
 - Demo script.
 - Architecture docs.
-- OAuth setup docs.
+- OAuth setup docs for user-owned Google Cloud projects, Gmail API enablement, Desktop client import, Testing versus In production, and troubleshooting.
 - Security docs.
 - Unit tests.
 - Integration tests.
@@ -3135,6 +3200,9 @@ Test:
 - SQLite migrations.
 - LanceDB indexing/search.
 - Gmail mapper using fixture API responses.
+- Imported Desktop client validation and local OAuth state/callback handling without real credentials.
+- One-year backfill window, resumable batches, progress state, partial-failure retry, import-time catch-up, and no Gmail body retention using mocked responses.
+- Scheduled daily Gmail sync, missed-run recovery, expired history ID recovery, idempotent fact updates, and token revocation handling using mocked Google responses.
 - Outlook mapper using fixture API responses.
 - Approval execution flow.
 - n8n webhook flow with mocked n8n.
@@ -3260,7 +3328,7 @@ README must include:
 6. Quickstart.
 7. Model setup.
 8. Demo mode instructions.
-9. Gmail developer OAuth setup.
+9. User-owned Google Cloud and Gmail OAuth setup, with guided import and no shared client credentials.
 10. Outlook developer OAuth setup.
 11. n8n workflow import instructions.
 12. Security principles.
@@ -3304,7 +3372,7 @@ The project is considered complete for MVP when all of the following are true:
 5. User can upload documents and ask questions about them.
 6. The system creates action cards from demo emails, calendar events, and documents.
 7. Source references are shown for answers and cards.
-8. Gmail developer-mode connection works.
+8. Gmail connection works with a user-owned Google Cloud project and imported Desktop OAuth client; the one-year background import and scheduled daily sync retain facts and source IDs without full Gmail bodies.
 9. Outlook developer-mode connection works.
 10. Multiple accounts are labeled and filterable.
 11. Risky actions require approval.
