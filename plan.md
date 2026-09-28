@@ -476,23 +476,23 @@ Do not build Tauri before the web MVP works.
 Default local LLM:
 
 ```bash
-ollama pull qwen3:8b
+ollama pull qwen3:4b
 ```
 
-Use Qwen3 8B as the default because it balances quality, local usability, tool-following ability, open-weight availability, and laptop feasibility.
+Use Qwen3 4B as the default for the containerized MVP so a CPU-only Codespace can run the web app, API, and local model together. Allow users with more RAM or a GPU to select Qwen3 8B.
 
 ### 7.2 Fallback models
 
 For lower-end machines:
 
 ```bash
-ollama pull qwen3:4b
 ollama pull qwen3:1.7b
 ```
 
 For stronger machines:
 
 ```bash
+ollama pull qwen3:8b
 ollama pull qwen3:14b
 ollama pull qwen3:30b
 ```
@@ -757,7 +757,7 @@ LANCEDB_PATH=./.hey-broski/lancedb
 
 # LLM
 OLLAMA_BASE_URL=http://localhost:11434
-HEYBROSKI_CHAT_MODEL=qwen3:8b
+HEYBROSKI_CHAT_MODEL=qwen3:4b
 HEYBROSKI_EMBEDDING_MODEL=nomic-embed-text
 HEYBROSKI_LLM_TEMPERATURE=0.2
 
@@ -1685,7 +1685,7 @@ sources_json
 model_name
  -Description: Model used for assistant output.
  -Usage: text nullable
- -Values: ["qwen3:8b"]
+ -Values: ["qwen3:4b"]
  -Primary Key: False
 latency_ms
  -Description: LLM or full response latency.
@@ -2966,7 +2966,7 @@ Deliverables:
 Acceptance criteria:
 
 ```text
-docker compose up starts web, api, ollama, and n8n.
+docker compose up starts web, api, ollama, the local-model pull job, and n8n.
 http://localhost:3000 loads UI.
 http://localhost:8000/api/health returns healthy or actionable model-missing status.
 ```
@@ -3274,7 +3274,7 @@ Common errors and UX messages:
 ### Missing Ollama model
 
 ```text
-Qwen3 model is not installed locally. Run: ollama pull qwen3:8b
+Qwen3 model is not installed locally. Run: ollama pull qwen3:4b
 ```
 
 ### Gmail auth expired
@@ -3347,7 +3347,7 @@ docker compose up
 Model setup:
 
 ```bash
-ollama pull qwen3:8b
+ollama pull qwen3:4b
 ollama pull nomic-embed-text
 ```
 

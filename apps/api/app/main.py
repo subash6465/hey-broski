@@ -43,27 +43,29 @@ async def liveness_check() -> dict[str, str]:
 
 @app.get("/api/health")
 async def health_check() -> dict[str, Any]:
-    ollama_status, models = "unavailable", []
-    try:
-        timeout = httpx.Timeout(2.0, connect=0.5)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.get(f"{settings.ollama_base_url}/api/tags")
-            response.raise_for_status()
-        models = [
-            model.get("model") or model.get("name") or ""
-            for model in response.json().get("models", [])
-        ]
-        ollama_status = (
-            "available"
-            if any(name.startswith(settings.chat_model) for name in models)
-            else f"model_missing:{settings.chat_model}"
-        )
-    except Exception:
-        pass
+    ollama_status, models = "disabled" if not settings.use_ollama else "unavailable", []
+    if settings.use_ollama:
+        try:
+            timeout = httpx.Timeout(2.0, connect=0.5)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.get(f"{settings.ollama_base_url}/api/tags")
+                response.raise_for_status()
+            models = [
+                model.get("model") or model.get("name") or ""
+                for model in response.json().get("models", [])
+            ]
+            ollama_status = (
+                "available"
+                if settings.chat_model in models
+                else f"model_missing:{settings.chat_model}"
+            )
+        except (httpx.HTTPError, ValueError, TypeError, AttributeError):
+            pass
     return {
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "mode": "demo" if settings.demo_mode else "connected",
+        "inference_enabled": settings.use_ollama,
         "services": {"database": "connected", "ollama": ollama_status},
         "model": settings.chat_model,
         "available_models": models,

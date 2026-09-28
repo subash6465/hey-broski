@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import asyncio
 import re
 
-import ollama
 import httpx
 import structlog
 
@@ -62,36 +60,39 @@ class AssistantService:
 
     async def answer(self, message: str, sources: list[Source]) -> tuple[str, str]:
         fallback = self.deterministic_answer(sources)
-        # Demo mode must remain fully usable on small Codespaces and machines
-        # without a pulled model. Local inference is an explicit opt-in.
         if not self.settings.use_ollama:
+            return fallback, "demo"
+        if not sources:
             return fallback, "demo"
 
         context = "\n".join(f"[Source {i}] {s.account_label} — {s.title}: {s.snippet}" for i, s in enumerate(sources, 1))
         prompt = f"Answer using only these sources. Cite every fact as [Source N]. Never claim an action occurred. End by saying approval is required for suggested actions.\n\nQuestion: {message}\n\n{context}"
         try:
-            # Do a short availability/model check first. A missing Ollama model
-            # must never hold the otherwise complete demo response for minutes.
-            timeout = httpx.Timeout(2.0, connect=0.5)
+            timeout = httpx.Timeout(self.settings.ollama_timeout_seconds, connect=2.0)
             async with httpx.AsyncClient(timeout=timeout) as client:
-                model_response = await client.get(f"{self.settings.ollama_base_url}/api/tags")
-                model_response.raise_for_status()
-            model_names = [
-                model.get("model") or model.get("name") or ""
-                for model in model_response.json().get("models", [])
-            ]
-            if not any(name == self.settings.chat_model or name.startswith(f"{self.settings.chat_model}:") for name in model_names):
-                logger.info("ollama_model_missing_using_demo_answer", model=self.settings.chat_model)
-                return fallback, "demo"
-
-            client = ollama.Client(
-                host=self.settings.ollama_base_url,
-                timeout=self.settings.ollama_timeout_seconds,
-            )
-            response = await asyncio.to_thread(client.chat, model=self.settings.chat_model, messages=[{"role": "system", "content": "You are Hey Broski, a concise local-first personal admin assistant."}, {"role": "user", "content": prompt}], options={"temperature": self.settings.llm_temperature, "num_predict": 400})
-            content = getattr(getattr(response, "message", None), "content", None)
-            if content:
-                return content.strip(), "ollama"
-        except Exception as exc:
-            logger.warning("ollama_unavailable_using_demo_answer", error=str(exc))
+                response = await client.post(
+                    f"{self.settings.ollama_base_url}/api/chat",
+                    json={
+                        "model": self.settings.chat_model,
+                        "messages": [
+                            {"role": "system", "content": "You are Hey Broski, a concise local-first personal admin assistant."},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "stream": False,
+                        "think": False,
+                        "keep_alive": "5m",
+                        "options": {
+                            "temperature": self.settings.llm_temperature,
+                            "num_ctx": 4096,
+                            "num_predict": self.settings.ollama_num_predict,
+                        },
+                    },
+                )
+                response.raise_for_status()
+            content = response.json().get("message", {}).get("content", "").strip()
+            if content and any(f"[Source {i}]" in content for i in range(1, len(sources) + 1)):
+                return content, "ollama"
+            logger.warning("ollama_invalid_answer_using_demo", model=self.settings.chat_model)
+        except (httpx.HTTPError, ValueError, TypeError, AttributeError) as exc:
+            logger.warning("ollama_unavailable_using_demo_answer", model=self.settings.chat_model, error=str(exc))
         return fallback, "demo"

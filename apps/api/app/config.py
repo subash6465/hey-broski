@@ -18,7 +18,8 @@ class Settings:
     llm_temperature: float
     ollama_timeout_seconds: float
     demo_mode: bool
-    use_ollama: bool = False
+    use_ollama: bool = True
+    ollama_num_predict: int = 160
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -28,13 +29,14 @@ class Settings:
             data_dir=data_dir,
             database_path=database_path,
             ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/"),
-            chat_model=os.getenv("HEYBROSKI_CHAT_MODEL", "qwen3:8b"),
+            chat_model=os.getenv("HEYBROSKI_CHAT_MODEL", "qwen3:4b"),
             llm_temperature=float(os.getenv("HEYBROSKI_LLM_TEMPERATURE", "0.2")),
             # Keep the end-to-end request below the browser's 60-second limit,
             # including when an older .env still contains the former 300 value.
             ollama_timeout_seconds=min(float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "45")), 45.0),
             demo_mode=_bool("HEYBROSKI_DEMO_MODE", True),
-            use_ollama=_bool("HEYBROSKI_USE_OLLAMA", False),
+            use_ollama=_bool("HEYBROSKI_USE_OLLAMA", True),
+            ollama_num_predict=max(1, min(int(os.getenv("OLLAMA_NUM_PREDICT", "160")), 400)),
         )
 
 

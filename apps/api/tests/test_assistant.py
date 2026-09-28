@@ -9,7 +9,7 @@ from app.repository import Repository
 def service(tmp_path: Path) -> AssistantService:
     repository = Repository(tmp_path / "test.db")
     repository.initialize()
-    settings = Settings(tmp_path, tmp_path / "test.db", "http://127.0.0.1:1", "qwen3:8b", 0.2, 0.01, True)
+    settings = Settings(tmp_path, tmp_path / "test.db", "http://127.0.0.1:1", "qwen3:4b", 0.2, 0.01, True)
     return AssistantService(repository, settings)
 
 
