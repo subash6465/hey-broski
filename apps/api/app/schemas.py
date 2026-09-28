@@ -45,7 +45,7 @@ class ChatResponse(BaseModel):
     content: str
     sources: list[Source] = Field(default_factory=list)
     action_cards: list[ActionCard] = Field(default_factory=list)
-    generated_by: Literal["demo", "ollama"]
+    generated_by: Literal["ollama"]
 
 
 class DecisionRequest(BaseModel):

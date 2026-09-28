@@ -3,7 +3,7 @@
 FastAPI backend for the local MVP. It uses a deliberately small layered structure:
 
 - `main.py`: HTTP boundary and validation
-- `assistant.py`: retrieval, action proposals, and optional Ollama generation
+- `assistant.py`: retrieval, action proposals, and required local Ollama generation
 - `repository.py`: SQLite persistence and audit records
 - `schemas.py`: API contracts
 - `config.py`: environment configuration
@@ -16,4 +16,4 @@ uvicorn apps.api.app.main:app --reload
 pytest apps/api/tests
 ```
 
-The API works in demo mode without Ollama. OpenAPI documentation is served at http://localhost:8000/docs.
+Local inference is required for chat; when running the API outside Docker, start Ollama and pull `qwen3:4b` first. If the model is unavailable, chat returns an error without saving a partial turn. OpenAPI documentation is served at http://localhost:8000/docs.

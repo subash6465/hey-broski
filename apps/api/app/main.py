@@ -9,7 +9,7 @@ import httpx
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 
-from .assistant import AssistantService
+from .assistant import AssistantService, ModelResponseError
 from .config import settings
 from .repository import Repository
 from .schemas import ActionCard, ChatRequest, ChatResponse, DecisionRequest, DocumentRecord
@@ -43,27 +43,29 @@ async def liveness_check() -> dict[str, str]:
 
 @app.get("/api/health")
 async def health_check() -> dict[str, Any]:
-    ollama_status, models = "unavailable", []
-    try:
-        timeout = httpx.Timeout(2.0, connect=0.5)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.get(f"{settings.ollama_base_url}/api/tags")
-            response.raise_for_status()
-        models = [
-            model.get("model") or model.get("name") or ""
-            for model in response.json().get("models", [])
-        ]
-        ollama_status = (
-            "available"
-            if any(name.startswith(settings.chat_model) for name in models)
-            else f"model_missing:{settings.chat_model}"
-        )
-    except Exception:
-        pass
+    ollama_status, models = "disabled" if not settings.use_ollama else "unavailable", []
+    if settings.use_ollama:
+        try:
+            timeout = httpx.Timeout(2.0, connect=0.5)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.get(f"{settings.ollama_base_url}/api/tags")
+                response.raise_for_status()
+            models = [
+                model.get("model") or model.get("name") or ""
+                for model in response.json().get("models", [])
+            ]
+            ollama_status = (
+                "available"
+                if settings.chat_model in models
+                else f"model_missing:{settings.chat_model}"
+            )
+        except (httpx.HTTPError, ValueError, TypeError, AttributeError):
+            pass
     return {
-        "status": "healthy",
+        "status": "healthy" if ollama_status == "available" else "degraded",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "mode": "demo" if settings.demo_mode else "connected",
+        "inference_enabled": settings.use_ollama,
         "services": {"database": "connected", "ollama": ollama_status},
         "model": settings.chat_model,
         "available_models": models,
@@ -91,10 +93,14 @@ async def list_messages(session_id: str) -> dict[str, Any]:
 async def send_message(session_id: str, request: ChatRequest) -> ChatResponse:
     if not repository.session_exists(session_id):
         raise HTTPException(404, "Conversation not found")
-    repository.add_message(session_id, "user", request.message)
     sources, cards = assistant.context_for(request.message)
     if not request.include_sources:
         sources = []
+    try:
+        content, generated_by = await assistant.answer(request.message, sources)
+    except ModelResponseError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
+    repository.add_message(session_id, "user", request.message)
     persisted_cards = []
     for card in cards:
         repository.upsert_action(
@@ -107,7 +113,6 @@ async def send_message(session_id: str, request: ChatRequest) -> ChatResponse:
         persisted = repository.get_action(card.id)
         persisted_cards.append(ActionCard.model_validate(persisted) if persisted else card)
     cards = persisted_cards
-    content, generated_by = await assistant.answer(request.message, sources)
     message_id = repository.add_message(
         session_id,
         "assistant",

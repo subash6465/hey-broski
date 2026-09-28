@@ -1,0 +1,11 @@
+.git
+.env
+.env.*
+!.env.example
+.venv
+.hey-broski
+**/node_modules
+**/.next
+**/__pycache__
+**/.pytest_cache
+*.log

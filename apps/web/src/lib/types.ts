@@ -25,7 +25,7 @@ export type ChatMessage = {
   content: string
   sources?: Source[]
   actionCards?: ActionCard[]
-  generatedBy?: 'demo' | 'ollama'
+  generatedBy?: 'ollama'
 }
 
 export type DocumentRecord = {

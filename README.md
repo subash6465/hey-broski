@@ -1,11 +1,11 @@
 # Hey Broski
 
-Hey Broski is a local-first personal admin copilot. It turns email, calendar, and document context into a grounded daily brief and explicit action proposals. The MVP is intentionally useful in demo mode with no accounts, API keys, or local model required.
+Hey Broski is a local-first personal admin copilot. It turns email, calendar, and document context into a grounded daily brief and explicit action proposals. Demo mode supplies sample data without connected accounts; chat answers still require a local model.
 
 ## What works today
 
-- Grounded demo chat for attention summaries, follow-ups, renewals, and calendar conflicts
-- Optional answers from a local Ollama `qwen3:8b` model, with a deterministic fallback
+- Grounded chat over demo or uploaded data for attention summaries, follow-ups, renewals, and calendar conflicts
+- Answers generated only by a local Ollama `qwen3:4b` model; inference errors are reported rather than replaced with canned text
 - Persistent SQLite conversations, action cards, documents, and audit events
 - Approval and dismissal workflow—no proposal executes silently
 - Local PDF, TXT, Markdown, and CSV upload and keyword retrieval
@@ -16,66 +16,82 @@ The current UI is a local React chat shell rather than hosted ChatKit. The curre
 
 Gmail, Outlook, calendar sync, semantic vector search, and live n8n workflow execution remain planned integrations. The UI does not pretend they are connected.
 
-## Quickstart
+## Run locally on Windows (no Docker)
 
-Prerequisites: Docker Desktop (or Docker Engine with Compose v2) and at least 4 GB free memory. The local model benefits from 8 GB or more.
+Install [Python 3.11+](https://www.python.org/downloads/), [Node.js 20.9+](https://nodejs.org/en/download), and [Ollama for Windows](https://ollama.com/download/windows). Open PowerShell in the repository root. Ollama must be running in the background; its Windows app normally starts the server. The first model download and first response can take longer than later responses.
+
+1. Create your private environment file once. If `.env` already exists, keep it and check the values below instead of overwriting it.
+
+   ```powershell
+   Copy-Item .env.example .env
+   ```
+
+   For this native setup, `.env` should contain `OLLAMA_BASE_URL=http://127.0.0.1:11434`, `API_BASE_URL=http://127.0.0.1:8000`, `HEYBROSKI_USE_OLLAMA=true`, and `HEYBROSKI_CHAT_MODEL=qwen3:4b`. Both the Python API and the web development command read the root `.env` automatically; no `$env:...` commands or activation are needed. Restart both servers after editing `.env`.
+
+2. Download the model once and confirm Ollama is responding:
+
+   ```powershell
+   ollama pull qwen3:4b
+   ollama list
+   ```
+
+3. Install the API and web dependencies once:
+
+   ```powershell
+   py -3.11 -m venv .venv
+   .\.venv\Scripts\python.exe -m pip install -r apps/api/requirements-dev.txt
+   npm --prefix apps/web ci
+   ```
+
+4. Start the API in one PowerShell window, from the repository root:
+
+   ```powershell
+   .\.venv\Scripts\python.exe -m uvicorn apps.api.app.main:app --reload --host 127.0.0.1 --port 8000
+   ```
+
+5. Start the web app in a second PowerShell window, also from the repository root:
+
+   ```powershell
+   npm --prefix apps/web run dev
+   ```
+
+Open http://localhost:3000. Check http://localhost:8000/api/health: `services.ollama` should be `available`. On later runs, keep Ollama running and repeat only steps 4 and 5. Stop each foreground server with Ctrl+C. n8n is not needed for the current demo chat, upload, and action inbox; the Compose setup below includes it.
+
+If `py -3.11` is unavailable but `python --version` reports 3.11 or newer, use `python -m venv .venv` instead. If port 11434 does not answer, start the Ollama Windows app before starting the API. Chat requires the model; it does not fall back to canned replies.
+
+## Run in GitHub Codespaces (Docker Compose)
+
+Use a Codespace with Docker Compose available and enough memory for the CPU model (at least 8 GB available is recommended). In its Bash terminal, from the repository root:
 
 ```bash
-git clone <repo>
-cd hey-broski
 cp .env.example .env
-docker compose up --build
+docker compose up -d --build
+docker compose logs -f ollama-model
 ```
 
-On PowerShell, use `Copy-Item .env.example .env`, or run `./scripts/bootstrap.ps1`.
+If you already have `.env`, do not copy over it; use `docker compose up -d --build` directly. The `ollama-model` service downloads `qwen3:4b` on the first start. Exit the log view with Ctrl+C; the containers keep running. Forward port 3000 in Codespaces and open the forwarded web URL. Port 8000 serves the API and port 5678 serves n8n.
 
-Open:
+Compose overrides the native URLs in `.env` inside its containers: web reaches the API through `host.docker.internal:8000`, and the API reaches Ollama through `host.docker.internal:11434`. Do not change `.env` back and forth between local Windows and Codespaces. This host-gateway routing also handles Codespaces environments where sibling-container bridge traffic is filtered.
 
-- App: http://localhost:3000
-- API docs: http://localhost:8000/docs
-- n8n: http://localhost:5678
-
-Demo mode works even while Ollama is unavailable. To enable local model answers:
+Check readiness and verify an actual model-generated answer:
 
 ```bash
-docker compose exec ollama ollama pull qwen3:8b
+docker compose ps
+curl -s http://localhost:8000/api/health
+bash scripts/verify-local-chat.sh
 ```
 
-Then set `HEYBROSKI_USE_OLLAMA=true` in `.env` and recreate the API container.
-Leave it `false` for Codespaces or lower-memory machines; grounded demo chat
-does not require model inference.
+If chat fails, inspect `docker compose logs --tail=100 ollama-model ollama api web` and `docker compose exec ollama ollama list`. After changing an existing `.env`, recreate the services with `docker compose up -d --build --force-recreate`. Stop the stack with `docker compose down`; named volumes retain your data and model downloads.
 
-Docker Compose routes internal HTTP calls through `host.docker.internal` and
-the published ports. This is intentional: some Codespaces Docker environments
-resolve sibling service names but filter direct bridge traffic between them.
+For either setup, ask `What needs my attention this week?` after the model is ready.
 
-Then ask: `What needs my attention this week?`
+## Development checks
 
-## Local development
+From PowerShell at the repository root:
 
-Backend (Python 3.11+):
-
-```bash
-python -m venv .venv
-# Windows: .venv\Scripts\activate
-# macOS/Linux: source .venv/bin/activate
-pip install -r apps/api/requirements-dev.txt
-uvicorn apps.api.app.main:app --reload
-```
-
-Frontend (Node 20+):
-
-```bash
-cd apps/web
-npm install
-npm run dev
-```
-
-Run checks:
-
-```bash
-pytest apps/api/tests
-cd apps/web && npm run build
+```powershell
+.\.venv\Scripts\python.exe -m pytest apps/api/tests
+npm --prefix apps/web run build
 ```
 
 ## Architecture
@@ -84,7 +100,7 @@ cd apps/web && npm run build
 Browser / Next.js
         │ relative /api proxy
         ▼
-FastAPI routes ── Assistant service ── Ollama (optional)
+FastAPI routes ── Assistant service ── Ollama (required for chat)
         │                 │
         └──── SQLite repository ── local documents
                     │
@@ -114,9 +130,10 @@ Important variables are documented in `.env.example`:
 | --- | --- | --- |
 | `HEYBROSKI_DEMO_MODE` | `true` | Enables bundled evaluation data |
 | `HEYBROSKI_DATA_DIR` | `./.hey-broski` | Local SQLite/data directory |
-| `OLLAMA_BASE_URL` | Docker service URL | Local inference endpoint |
-| `HEYBROSKI_CHAT_MODEL` | `qwen3:8b` | Local chat model |
+| `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Native Ollama endpoint; Compose overrides it in the API container |
+| `HEYBROSKI_CHAT_MODEL` | `qwen3:4b` | Local chat model |
 | `OLLAMA_TIMEOUT_SECONDS` | `45` | Model request timeout |
+| `API_BASE_URL` | `http://127.0.0.1:8000` | Native web proxy target; Compose overrides it in the web container |
 
 ## API surface
 

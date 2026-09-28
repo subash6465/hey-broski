@@ -22,7 +22,7 @@ import { request } from '@/lib/api'
 import type { ActionCard, ChatMessage, DocumentRecord, Source } from '@/lib/types'
 
 type View = 'chat' | 'actions' | 'vault' | 'audit'
-type Health = { status: string; mode: string; services: { database: string; ollama: string }; model: string }
+type Health = { status: string; mode: string; inference_enabled: boolean; services: { database: string; ollama: string }; model: string }
 type AuditEvent = { id: string; event_type: string; entity_id?: string; details: Record<string, unknown>; created_at: string }
 
 const prompts = [
@@ -85,6 +85,13 @@ export default function Home() {
     bottom.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, busy])
 
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      void request<Health>('/api/health').then(setHealth).catch(() => setHealth(undefined))
+    }, 12_000)
+    return () => window.clearInterval(interval)
+  }, [])
+
   async function sendMessage(event?: FormEvent, selectedPrompt?: string) {
     event?.preventDefault()
     const text = (selectedPrompt ?? input).trim()
@@ -92,6 +99,7 @@ export default function Home() {
     setError(undefined)
     setNotice(undefined)
     setBusy(true)
+    const pendingId = crypto.randomUUID()
     try {
       let activeSession = sessionId
       if (!activeSession) {
@@ -104,13 +112,13 @@ export default function Home() {
         setSessionId(activeSession)
       }
       setInput('')
-      setMessages((current) => [...current, { id: crypto.randomUUID(), role: 'user', content: text }])
+      setMessages((current) => [...current, { id: pendingId, role: 'user', content: text }])
       const response = await request<{
         message_id: string
         content: string
         sources: Source[]
         action_cards: ActionCard[]
-        generated_by: 'demo' | 'ollama'
+        generated_by: 'ollama'
       }>(`/api/chat/sessions/${activeSession}/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -126,6 +134,8 @@ export default function Home() {
       }])
       setActions((current) => mergeActions(current, response.action_cards))
     } catch (caught) {
+      setMessages((current) => current.filter((message) => message.id !== pendingId))
+      setInput(text)
       setError(caught instanceof Error ? caught.message : 'Message failed')
     } finally {
       setBusy(false)
@@ -207,8 +217,8 @@ export default function Home() {
         <header className="topbar">
           <div><p className="eyebrow">PERSONAL ADMIN COPILOT</p><h1>{viewTitles[view]}</h1></div>
           <div className="status-cluster">
-            <span className="mode-badge"><span className="status-dot" /> {!health ? 'Connecting…' : health.mode === 'demo' ? 'Demo mode' : 'Connected'}</span>
-            <span className="model-label">{!health ? 'Checking services' : health.services.ollama === 'available' ? health.model : 'Reliable fallback'}</span>
+            <span className="mode-badge"><span className="status-dot" /> {!health ? 'Connecting…' : health.mode === 'demo' ? 'Demo data' : 'Connected data'}</span>
+            <span className="model-label">{!health ? 'Checking local model' : !health.inference_enabled ? 'Local model disabled' : health.services.ollama === 'available' ? `Local model: ${health.model}` : health.services.ollama.startsWith('model_missing:') ? `Model not ready: ${health.model}` : 'Local model offline'}</span>
           </div>
         </header>
         {error && <div className="error-banner" role="alert"><span>{error}</span><button onClick={() => setError(undefined)}><X size={16} /></button></div>}
@@ -222,14 +232,14 @@ export default function Home() {
                   {message.role === 'assistant' && <div className="bot-avatar"><Bot size={17} /></div>}
                   <div className="message-wrap">
                     <div className="message-bubble"><p>{message.content}</p></div>
-                    {message.generatedBy && <span className="generated-by">Answered by {message.generatedBy === 'ollama' ? health?.model : 'grounded demo engine'}</span>}
+                    {message.generatedBy && <span className="generated-by">Answered by local model ({health?.model ?? 'Ollama'})</span>}
                     {!!message.sources?.length && <SourceList sources={message.sources} />}
                     {!!message.actionCards?.length && <div className="inline-actions">{message.actionCards.map((card) => <ActionCardView key={card.id} card={card} busy={decisionBusy === card.id} onDecision={decide} />)}</div>}
                   </div>
                 </div>
               ))}
               {messages.length === 1 && <div className="prompt-grid">{prompts.map((prompt) => <button type="button" disabled={busy} key={prompt.label} onClick={() => void sendMessage(undefined, prompt.text)}><span>{prompt.label}</span><p>{prompt.text}</p><ChevronRight size={16} /></button>)}</div>}
-              {busy && <div className="message-row assistant"><div className="bot-avatar"><Bot size={17} /></div><div className="typing"><i /><i /><i /></div></div>}
+              {busy && <div className="message-row assistant"><div className="bot-avatar"><Bot size={17} /></div><div className="typing" role="status" aria-label="Generating an answer"><i /><i /><i /></div></div>}
               <div ref={bottom} />
             </div>
             <form className="composer" onSubmit={sendMessage} aria-busy={busy}>

@@ -7,15 +7,15 @@ from app.assistant import AssistantService
 from app.repository import Repository
 
 
-def test_demo_chat_approval_and_audit(tmp_path: Path, monkeypatch) -> None:
+def test_model_chat_approval_and_audit(tmp_path: Path, monkeypatch) -> None:
     repository = Repository(tmp_path / "api.db")
     main.repository = repository
     main.assistant = AssistantService(repository, main.settings)
 
-    async def fallback(message, sources):
-        return main.assistant.deterministic_answer(sources), "demo"
+    async def model_answer(message, sources):
+        return "Your manager needs a reply. [Source 1] Approval is required before acting.", "ollama"
 
-    monkeypatch.setattr(main.assistant, "answer", fallback)
+    monkeypatch.setattr(main.assistant, "answer", model_answer)
 
     with TestClient(main.app) as client:
         assert client.get("/api/live").json() == {"status": "ok"}
@@ -26,6 +26,7 @@ def test_demo_chat_approval_and_audit(tmp_path: Path, monkeypatch) -> None:
         )
         assert response.status_code == 200
         body = response.json()
+        assert body["generated_by"] == "ollama"
         assert body["sources"][0]["source_id"] == "email-manager-report"
         action = body["action_cards"][0]
 
