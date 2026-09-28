@@ -4,6 +4,13 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+
+# Native runs use the repository-root .env; Compose supplies the same values
+# through env_file and explicit container overrides. Never override real env vars.
+load_dotenv(Path(__file__).resolve().parents[3] / ".env", override=False)
+
 
 def _bool(name: str, default: bool) -> bool:
     return os.getenv(name, str(default)).lower() in {"1", "true", "yes", "on"}
