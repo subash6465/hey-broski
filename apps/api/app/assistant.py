@@ -13,6 +13,13 @@ from .schemas import ActionCard, Source
 logger = structlog.get_logger()
 
 
+class ModelResponseError(Exception):
+    def __init__(self, detail: str, status_code: int = 503) -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.status_code = status_code
+
+
 class AssistantService:
     def __init__(self, repository: Repository, settings: Settings) -> None:
         self.repository = repository
@@ -49,24 +56,17 @@ class AssistantService:
         title, description, priority, due_at = definitions[source.source_id]
         return ActionCard(id=f"action_{source.source_id}", card_type="reminder" if source.source_type != "calendar" else "calendar_conflict", title=title, description=description, priority=priority, status="pending", due_at=due_at, confidence=0.94, source_refs=[source], proposed_action={"tool": "reminders.create", "requires_approval": True, "input": {"title": title, "due_at": due_at}})
 
-    @staticmethod
-    def deterministic_answer(sources: list[Source]) -> str:
-        if not sources:
-            return "I couldn't find a matching item in your local data. Upload a document or try a broader question."
-        lines = [f"I found {len(sources)} item{'s' if len(sources) != 1 else ''} needing your attention:", ""]
-        lines.extend(f"{index}. {source.account_label}: {source.snippet} [Source {index}]" for index, source in enumerate(sources, 1))
-        lines += ["", "Suggested actions are shown below. Nothing will be executed without your approval."]
-        return "\n".join(lines)
-
     async def answer(self, message: str, sources: list[Source]) -> tuple[str, str]:
-        fallback = self.deterministic_answer(sources)
         if not self.settings.use_ollama:
-            return fallback, "demo"
-        if not sources:
-            return fallback, "demo"
+            raise ModelResponseError("Local model inference is disabled. Set HEYBROSKI_USE_OLLAMA=true and restart the API.")
 
         context = "\n".join(f"[Source {i}] {s.account_label} — {s.title}: {s.snippet}" for i, s in enumerate(sources, 1))
-        prompt = f"Answer using only these sources. Cite every fact as [Source N]. Never claim an action occurred. End by saying approval is required for suggested actions.\n\nQuestion: {message}\n\n{context}"
+        prompt = (
+            "Answer using only the provided sources. Cite every source-based fact as [Source N]. "
+            "If no sources are provided, say you could not find supporting information; do not invent facts. "
+            "Never claim an action occurred. End by saying approval is required for suggested actions."
+            f"\n\nQuestion: {message}\n\nSources:\n{context or '(none)'}"
+        )
         try:
             timeout = httpx.Timeout(self.settings.ollama_timeout_seconds, connect=2.0)
             async with httpx.AsyncClient(timeout=timeout) as client:
@@ -90,9 +90,18 @@ class AssistantService:
                 )
                 response.raise_for_status()
             content = response.json().get("message", {}).get("content", "").strip()
-            if content and any(f"[Source {i}]" in content for i in range(1, len(sources) + 1)):
+            if content:
                 return content, "ollama"
-            logger.warning("ollama_invalid_answer_using_demo", model=self.settings.chat_model)
-        except (httpx.HTTPError, ValueError, TypeError, AttributeError) as exc:
-            logger.warning("ollama_unavailable_using_demo_answer", model=self.settings.chat_model, error=str(exc))
-        return fallback, "demo"
+            logger.warning("ollama_empty_answer", model=self.settings.chat_model)
+            raise ModelResponseError("The local model returned an empty answer. Please retry.", 502)
+        except httpx.TimeoutException as exc:
+            logger.warning("ollama_timeout", model=self.settings.chat_model, error=str(exc))
+            raise ModelResponseError("The local model timed out. Please retry or use a smaller model.", 504) from exc
+        except httpx.HTTPStatusError as exc:
+            logger.warning("ollama_http_error", model=self.settings.chat_model, status=exc.response.status_code)
+            if exc.response.status_code == 404:
+                raise ModelResponseError(f"Local model {self.settings.chat_model} is not installed. Check the ollama-model pull job.") from exc
+            raise ModelResponseError("The local model could not generate an answer. Check the Ollama logs.", 502) from exc
+        except (httpx.RequestError, ValueError, TypeError, AttributeError) as exc:
+            logger.warning("ollama_unavailable", model=self.settings.chat_model, error=str(exc))
+            raise ModelResponseError("Cannot reach the local model or read its response. Check that Ollama is running.") from exc

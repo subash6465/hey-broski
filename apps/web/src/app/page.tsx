@@ -99,6 +99,7 @@ export default function Home() {
     setError(undefined)
     setNotice(undefined)
     setBusy(true)
+    const pendingId = crypto.randomUUID()
     try {
       let activeSession = sessionId
       if (!activeSession) {
@@ -111,13 +112,13 @@ export default function Home() {
         setSessionId(activeSession)
       }
       setInput('')
-      setMessages((current) => [...current, { id: crypto.randomUUID(), role: 'user', content: text }])
+      setMessages((current) => [...current, { id: pendingId, role: 'user', content: text }])
       const response = await request<{
         message_id: string
         content: string
         sources: Source[]
         action_cards: ActionCard[]
-        generated_by: 'demo' | 'ollama'
+        generated_by: 'ollama'
       }>(`/api/chat/sessions/${activeSession}/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -133,6 +134,8 @@ export default function Home() {
       }])
       setActions((current) => mergeActions(current, response.action_cards))
     } catch (caught) {
+      setMessages((current) => current.filter((message) => message.id !== pendingId))
+      setInput(text)
       setError(caught instanceof Error ? caught.message : 'Message failed')
     } finally {
       setBusy(false)
@@ -229,7 +232,7 @@ export default function Home() {
                   {message.role === 'assistant' && <div className="bot-avatar"><Bot size={17} /></div>}
                   <div className="message-wrap">
                     <div className="message-bubble"><p>{message.content}</p></div>
-                    {message.generatedBy && <span className="generated-by">{message.generatedBy === 'ollama' ? `Answered by local model (${health?.model ?? 'Ollama'})` : 'Grounded fallback answer (no model inference)'}</span>}
+                    {message.generatedBy && <span className="generated-by">Answered by local model ({health?.model ?? 'Ollama'})</span>}
                     {!!message.sources?.length && <SourceList sources={message.sources} />}
                     {!!message.actionCards?.length && <div className="inline-actions">{message.actionCards.map((card) => <ActionCardView key={card.id} card={card} busy={decisionBusy === card.id} onDecision={decide} />)}</div>}
                   </div>

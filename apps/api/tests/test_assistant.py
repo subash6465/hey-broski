@@ -1,5 +1,4 @@
 from pathlib import Path
-import asyncio
 
 from app.assistant import AssistantService
 from app.config import Settings
@@ -21,22 +20,3 @@ def test_renewal_query_is_grounded_and_actionable(tmp_path: Path) -> None:
     }
     assert all(action.status == "pending" for action in actions)
     assert all(action.proposed_action["requires_approval"] for action in actions if action.proposed_action)
-
-
-def test_fallback_answer_cites_each_source(tmp_path: Path) -> None:
-    assistant = service(tmp_path)
-    sources, _ = assistant.context_for("Who is waiting on me?")
-    answer = assistant.deterministic_answer(sources)
-
-    assert "[Source 1]" in answer
-    assert "Nothing will be executed without your approval" in answer
-
-
-def test_missing_ollama_uses_fallback(tmp_path: Path) -> None:
-    assistant = service(tmp_path)
-    sources, _ = assistant.context_for("Who is waiting on me?")
-
-    answer, generated_by = asyncio.run(assistant.answer("Who is waiting on me?", sources))
-
-    assert generated_by == "demo"
-    assert "[Source 1]" in answer

@@ -1,11 +1,11 @@
 # Hey Broski
 
-Hey Broski is a local-first personal admin copilot. It turns email, calendar, and document context into a grounded daily brief and explicit action proposals. The MVP is intentionally useful in demo mode with no accounts, API keys, or local model required.
+Hey Broski is a local-first personal admin copilot. It turns email, calendar, and document context into a grounded daily brief and explicit action proposals. Demo mode supplies sample data without connected accounts; chat answers still require a local model.
 
 ## What works today
 
-- Grounded demo chat for attention summaries, follow-ups, renewals, and calendar conflicts
-- Answers from a local Ollama `qwen3:4b` model, with a clearly labeled deterministic fallback when inference is unavailable
+- Grounded chat over demo or uploaded data for attention summaries, follow-ups, renewals, and calendar conflicts
+- Answers generated only by a local Ollama `qwen3:4b` model; inference errors are reported rather than replaced with canned text
 - Persistent SQLite conversations, action cards, documents, and audit events
 - Approval and dismissal workflow—no proposal executes silently
 - Local PDF, TXT, Markdown, and CSV upload and keyword retrieval
@@ -18,7 +18,7 @@ Gmail, Outlook, calendar sync, semantic vector search, and live n8n workflow exe
 
 ## Quickstart
 
-Prerequisites: Docker Desktop (or Docker Engine with Compose v2). The CPU-only local model works best with at least 8 GB of memory available to Docker; smaller machines can still use the deterministic fallback.
+Prerequisites: Docker Desktop (or Docker Engine with Compose v2). The CPU-only local model works best with at least 8 GB of memory available to Docker.
 
 ```bash
 git clone <repo>
@@ -41,9 +41,9 @@ The `ollama-model` service downloads `qwen3:4b` on the first Compose start. This
 docker compose logs -f ollama-model
 ```
 
-If you already have an `.env` from an earlier version, change `HEYBROSKI_USE_OLLAMA=false` to `true` and `HEYBROSKI_CHAT_MODEL=qwen3:8b` to `qwen3:4b`, then run `docker compose up --build --force-recreate`. Existing environment files are never overwritten automatically. Set `HEYBROSKI_USE_OLLAMA=false` only when you explicitly want fallback-only chat.
+If you already have an `.env` from an earlier version, set `HEYBROSKI_USE_OLLAMA=true`, `HEYBROSKI_CHAT_MODEL=qwen3:4b`, and `OLLAMA_TIMEOUT_SECONDS=45`, then run `docker compose up --build --force-recreate`. Existing environment files are never overwritten automatically. If inference is disabled or unavailable, chat returns an actionable error and does not save a partial turn.
 
-To verify that a real local model answered, run `bash scripts/verify-local-chat.sh` from the Codespaces terminal. It exits nonzero if the response came from the fallback. In the UI, real answers say **Answered by local model**. If the check fails, inspect `docker compose logs --tail=100 ollama-model ollama api` and `docker compose exec ollama ollama list`.
+To verify that a real local model answered, run `bash scripts/verify-local-chat.sh` from the Codespaces terminal. It exits nonzero unless Ollama generated the response. In the UI, successful answers say **Answered by local model**. If the check fails, inspect `docker compose logs --tail=100 ollama-model ollama api` and `docker compose exec ollama ollama list`.
 
 Docker Compose routes internal HTTP calls through `host.docker.internal` and
 the published ports. This is intentional: some Codespaces Docker environments
