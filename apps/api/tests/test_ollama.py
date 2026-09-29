@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import main
-from app.assistant import AssistantService, ModelResponseError
+from app.assistant import AssistantService, ModelResponseError, final_answer
 from app.config import Settings
 from app.repository import Repository
 
@@ -20,7 +20,7 @@ def assistant(tmp_path: Path) -> AssistantService:
         data_dir=tmp_path,
         database_path=tmp_path / "ollama.db",
         ollama_base_url="http://ollama.test:11434",
-        chat_model="qwen3:4b",
+        chat_model="qwen3:4b-instruct",
         llm_temperature=0.2,
         ollama_timeout_seconds=10,
         demo_mode=True,
@@ -36,7 +36,19 @@ def test_local_model_is_enabled_by_default(monkeypatch) -> None:
     settings = Settings.from_env()
 
     assert settings.use_ollama is True
-    assert settings.chat_model == "qwen3:4b"
+    assert settings.chat_model == "qwen3:4b-instruct"
+
+
+def test_old_output_limit_is_raised_to_avoid_truncated_answers(monkeypatch) -> None:
+    monkeypatch.setenv("OLLAMA_NUM_PREDICT", "128")
+    assert Settings.from_env().ollama_num_predict == 512
+
+
+def test_final_answer_removes_model_analysis_preamble() -> None:
+    assert final_answer("Analysis: I should inspect the source.\n\nFinal answer: ORCHID-42 [Source 1]") == "ORCHID-42 [Source 1]"
+    assert final_answer("<think>private reasoning</think>Final answer: The date is 15 October.") == "The date is 15 October."
+    with pytest.raises(ModelResponseError, match="reasoning"):
+        final_answer("Analysis: I have not answered yet.")
 
 
 def mock_ollama(monkeypatch, handler) -> None:
@@ -49,14 +61,14 @@ def mock_ollama(monkeypatch, handler) -> None:
     )
 
 
-def test_local_model_answer_uses_bounded_non_thinking_request(tmp_path: Path, monkeypatch) -> None:
+def test_local_model_requests_direct_answer(tmp_path: Path, monkeypatch) -> None:
     service = assistant(tmp_path)
     sources, _ = service.context_for("Who is waiting on me?")
 
     def respond(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         assert request.url.path == "/api/chat"
-        assert body["model"] == "qwen3:4b"
+        assert body["model"] == "qwen3:4b-instruct"
         assert body["stream"] is False
         assert body["think"] is False
         assert body["options"]["num_predict"] == 160
@@ -68,6 +80,47 @@ def test_local_model_answer_uses_bounded_non_thinking_request(tmp_path: Path, mo
 
     assert generated_by == "ollama"
     assert "manager is waiting" in content
+
+
+def test_stream_hides_model_thinking_and_returns_completed_answer(tmp_path: Path, monkeypatch) -> None:
+    service = assistant(tmp_path)
+    service.settings = replace(service.settings, ollama_num_predict=768)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert body["stream"] is True
+        assert body["think"] is False
+        assert body["options"]["num_predict"] == 768
+        chunks = [
+            {"message": {"thinking": "Checking the source...", "content": ""}, "done": False},
+            {"message": {"thinking": "", "content": "The renewal is due on 15 October. [Source 1]"}, "done": False},
+            {"message": {"thinking": "", "content": ""}, "done": True, "done_reason": "stop"},
+        ]
+        return httpx.Response(200, content="\n".join(json.dumps(chunk) for chunk in chunks) + "\n")
+
+    mock_ollama(monkeypatch, respond)
+
+    async def collect():
+        return [event async for event in service.stream_answer("When is the renewal?", [])]
+
+    events = asyncio.run(collect())
+    assert [event["type"] for event in events] == ["status", "content", "complete"]
+    assert "Checking the source" not in str(events)
+    assert events[-1]["content"] == "The renewal is due on 15 October. [Source 1]"
+    assert "Checking" not in events[-1]["content"]
+
+
+def test_stream_rejects_truncated_answer(tmp_path: Path, monkeypatch) -> None:
+    service = assistant(tmp_path)
+    mock_ollama(monkeypatch, lambda request: httpx.Response(200, content=json.dumps({
+        "message": {"content": "The renewal is"}, "done": True, "done_reason": "length",
+    }) + "\n"))
+
+    async def collect():
+        return [event async for event in service.stream_answer("When?", [])]
+
+    with pytest.raises(ModelResponseError, match="answer limit"):
+        asyncio.run(collect())
 
 
 def test_unavailable_model_raises_clear_error(tmp_path: Path, monkeypatch) -> None:
@@ -125,6 +178,14 @@ def test_disabled_model_fails_instead_of_answering(tmp_path: Path, monkeypatch) 
         asyncio.run(service.answer("Who is waiting on me?", sources))
 
 
+def test_legacy_thinking_model_has_actionable_error(tmp_path: Path) -> None:
+    service = assistant(tmp_path)
+    service.settings = replace(service.settings, chat_model="qwen3:4b")
+
+    with pytest.raises(ModelResponseError, match="qwen3:4b-instruct"):
+        asyncio.run(service.answer("What is due?", []))
+
+
 def test_model_timeout_is_reported(tmp_path: Path, monkeypatch) -> None:
     service = assistant(tmp_path)
     sources, _ = service.context_for("Who is waiting on me?")
@@ -146,7 +207,7 @@ def test_chat_endpoint_reports_actual_local_generation(tmp_path: Path, monkeypat
 
     def respond(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/tags":
-            return httpx.Response(200, json={"models": [{"name": "qwen3:4b"}]})
+            return httpx.Response(200, json={"models": [{"name": "qwen3:4b-instruct"}]})
         return httpx.Response(200, json={"message": {"content": "A reply is due. [Source 1] Approval is required before acting."}})
 
     mock_ollama(monkeypatch, respond)

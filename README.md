@@ -5,11 +5,11 @@ Hey Broski is a local-first personal admin copilot. It turns email, calendar, an
 ## What works today
 
 - Grounded chat over demo or uploaded data for attention summaries, follow-ups, renewals, and calendar conflicts
-- Answers generated only by a local Ollama `qwen3:4b` model; inference errors are reported rather than replaced with canned text
-- Persistent SQLite conversations, action cards, documents, and audit events
+- Answers generated only by a local Ollama `qwen3:4b-instruct` model; inference errors are reported rather than replaced with canned text
+- Persistent SQLite conversations, action cards, documents, and internal safety events
 - Approval and dismissal workflow—no proposal executes silently
 - Local PDF, TXT, Markdown, and CSV upload and keyword retrieval
-- Responsive action inbox, document vault, source citations, and audit log
+- Responsive action inbox, document vault, source citations, and conversation history
 - Production-style multi-stage frontend image and non-root API image
 
 The current UI is a local React chat shell rather than hosted ChatKit. The current ChatKit session API expects an OpenAI workflow and returns an OpenAI client secret, which conflicts with this project's zero-paid-API and local-inference rules. The backend contracts are kept separate so a future fully self-hosted ChatKit adapter can replace the shell without changing the domain services.
@@ -26,12 +26,12 @@ Install [Python 3.11+](https://www.python.org/downloads/), [Node.js 20.9+](https
    Copy-Item .env.example .env
    ```
 
-   For this native setup, `.env` should contain `OLLAMA_BASE_URL=http://127.0.0.1:11434`, `API_BASE_URL=http://127.0.0.1:8000`, `HEYBROSKI_USE_OLLAMA=true`, and `HEYBROSKI_CHAT_MODEL=qwen3:4b`. Both the Python API and the web development command read the root `.env` automatically; no `$env:...` commands or activation are needed. Restart both servers after editing `.env`.
+   For this native setup, `.env` should contain `OLLAMA_BASE_URL=http://127.0.0.1:11434`, `API_BASE_URL=http://127.0.0.1:8000`, `HEYBROSKI_USE_OLLAMA=true`, and `HEYBROSKI_CHAT_MODEL=qwen3:4b-instruct`. If upgrading an existing `.env`, change any old `qwen3:4b` setting to `qwen3:4b-instruct` and set `OLLAMA_NUM_PREDICT=768`. Both the Python API and the web development command read the root `.env` automatically; no `$env:...` commands or activation are needed. Restart both servers after editing `.env`.
 
 2. Download the model once and confirm Ollama is responding:
 
    ```powershell
-   ollama pull qwen3:4b
+   ollama pull qwen3:4b-instruct
    ollama list
    ```
 
@@ -57,6 +57,12 @@ Install [Python 3.11+](https://www.python.org/downloads/), [Node.js 20.9+](https
 
 Open http://localhost:3000. Check http://localhost:8000/api/health: `services.ollama` should be `available`. On later runs, keep Ollama running and repeat only steps 4 and 5. Stop each foreground server with Ctrl+C. n8n is not needed for the current demo chat, upload, and action inbox; the Compose setup below includes it.
 
+Chat displays a short source-checking status while the local model prepares an answer; it never displays the model's private reasoning. Completed turns are stored in SQLite with a conversation ID, a shared turn ID, separate user/assistant message IDs, source metadata, timestamps, and response time. Use **Conversation history** or the recent-chat list to reopen them; **New conversation** no longer discards past chats.
+
+Conversation history and document cards each have a Delete control with confirmation. Deleting a conversation removes its messages and related actions/reminders. Deleting a document removes its vault record and search chunks, so new chats cannot retrieve it; existing conversations, answers, and saved source excerpts remain unchanged. Follow-ups in an existing conversation can still refer to information already written in its chat history. These deletions cannot be undone.
+
+Uploaded files are text-extracted and split into overlapping excerpts. Chat searches those excerpts and sends the most relevant ones to Ollama as cited sources. Existing uploads are indexed automatically when the API starts. Ask about a file by name for the clearest results, for example, `When does policy.txt renew?`. This MVP uses keyword retrieval, not semantic search; very long documents are represented by selected excerpts rather than the full text.
+
 If `py -3.11` is unavailable but `python --version` reports 3.11 or newer, use `python -m venv .venv` instead. If port 11434 does not answer, start the Ollama Windows app before starting the API. Chat requires the model; it does not fall back to canned replies.
 
 ## Run in GitHub Codespaces (Docker Compose)
@@ -69,7 +75,7 @@ docker compose up -d --build
 docker compose logs -f ollama-model
 ```
 
-If you already have `.env`, do not copy over it; use `docker compose up -d --build` directly. The `ollama-model` service downloads `qwen3:4b` on the first start. Exit the log view with Ctrl+C; the containers keep running. Forward port 3000 in Codespaces and open the forwarded web URL. Port 8000 serves the API and port 5678 serves n8n.
+If you already have `.env`, do not copy over it; update `HEYBROSKI_CHAT_MODEL=qwen3:4b-instruct` and `OLLAMA_NUM_PREDICT=768`, then use `docker compose up -d --build`. The `ollama-model` service downloads the configured model on its first start. Exit the log view with Ctrl+C; the containers keep running. Forward port 3000 in Codespaces and open the forwarded web URL. Port 8000 serves the API and port 5678 serves n8n.
 
 Compose overrides the native URLs in `.env` inside its containers: web reaches the API through `host.docker.internal:8000`, and the API reaches Ollama through `host.docker.internal:11434`. Do not change `.env` back and forth between local Windows and Codespaces. This host-gateway routing also handles Codespaces environments where sibling-container bridge traffic is filtered.
 
@@ -116,7 +122,7 @@ Data defaults to `.hey-broski/` locally and `/data/heybroski` in Docker. The Doc
 - Read-only retrieval is allowed immediately.
 - Suggested writes become pending action cards.
 - A user must approve or dismiss each card.
-- Decisions and uploads are recorded in the local audit log.
+- Decisions and uploads retain internal safety records; the UI shows conversation history instead of an audit-log page.
 - OAuth credentials are not implemented yet; no token is stored by this MVP.
 - Never commit `.env` or the `.hey-broski/` directory.
 
@@ -131,8 +137,9 @@ Important variables are documented in `.env.example`:
 | `HEYBROSKI_DEMO_MODE` | `true` | Enables bundled evaluation data |
 | `HEYBROSKI_DATA_DIR` | `./.hey-broski` | Local SQLite/data directory |
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Native Ollama endpoint; Compose overrides it in the API container |
-| `HEYBROSKI_CHAT_MODEL` | `qwen3:4b` | Local chat model |
-| `OLLAMA_TIMEOUT_SECONDS` | `45` | Model request timeout |
+| `HEYBROSKI_CHAT_MODEL` | `qwen3:4b-instruct` | Local direct-answer chat model |
+| `OLLAMA_TIMEOUT_SECONDS` | `120` | Model idle read timeout for streaming chat |
+| `OLLAMA_NUM_PREDICT` | `768` | Maximum generated tokens per answer |
 | `API_BASE_URL` | `http://127.0.0.1:8000` | Native web proxy target; Compose overrides it in the web container |
 
 ## API surface
@@ -140,10 +147,14 @@ Important variables are documented in `.env.example`:
 - `GET /api/health`
 - `POST/GET /api/chat/sessions`
 - `POST /api/chat/sessions/{id}/messages`
+- `GET /api/chat/sessions/{id}/messages` (saved conversation)
+- `DELETE /api/chat/sessions/{id}` (permanently delete a conversation)
+- `POST /api/chat/sessions/{id}/messages/stream` (NDJSON status, content, completion events)
 - `GET /api/actions`
 - `POST /api/actions/{id}/decision`
 - `GET /api/reminders`
 - `POST/GET /api/documents`
+- `DELETE /api/documents/{id}` (permanently delete a document and its search index)
 - `GET /api/audit`
 
 Interactive request and response schemas are at `/docs`.

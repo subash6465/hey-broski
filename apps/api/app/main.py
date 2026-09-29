@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import json
+from time import perf_counter
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
@@ -8,6 +10,7 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response, StreamingResponse
 
 from .assistant import AssistantService, ModelResponseError
 from .config import settings
@@ -82,6 +85,13 @@ async def list_sessions() -> dict[str, Any]:
     return {"sessions": repository.list_sessions()}
 
 
+@app.delete("/api/chat/sessions/{session_id}", status_code=204, response_class=Response)
+async def delete_session(session_id: str) -> Response:
+    if not repository.delete_session(session_id):
+        raise HTTPException(404, "Conversation not found")
+    return Response(status_code=204)
+
+
 @app.get("/api/chat/sessions/{session_id}/messages")
 async def list_messages(session_id: str) -> dict[str, Any]:
     if not repository.session_exists(session_id):
@@ -93,14 +103,20 @@ async def list_messages(session_id: str) -> dict[str, Any]:
 async def send_message(session_id: str, request: ChatRequest) -> ChatResponse:
     if not repository.session_exists(session_id):
         raise HTTPException(404, "Conversation not found")
-    sources, cards = assistant.context_for(request.message)
+    history = repository.list_messages(session_id)[-6:]
+    previous_question = next((item["content"] for item in reversed(history) if item["role"] == "user"), "")
+    sources, cards = assistant.context_for(request.message, previous_question)
     if not request.include_sources:
         sources = []
+    started = perf_counter()
     try:
-        content, generated_by = await assistant.answer(request.message, sources)
+        content, generated_by = await assistant.answer(request.message, sources, history)
     except ModelResponseError as exc:
         raise HTTPException(exc.status_code, exc.detail) from exc
-    repository.add_message(session_id, "user", request.message)
+    return save_chat_turn(session_id, request.message, content, sources, cards, generated_by, round((perf_counter() - started) * 1000))
+
+
+def save_chat_turn(session_id: str, question: str, content: str, sources: list, cards: list[ActionCard], generated_by: str, response_time_ms: int) -> ChatResponse:
     persisted_cards = []
     for card in cards:
         repository.upsert_action(
@@ -113,15 +129,15 @@ async def send_message(session_id: str, request: ChatRequest) -> ChatResponse:
         persisted = repository.get_action(card.id)
         persisted_cards.append(ActionCard.model_validate(persisted) if persisted else card)
     cards = persisted_cards
-    message_id = repository.add_message(
-        session_id,
-        "assistant",
-        content,
+    turn_id, user_message_id, message_id = repository.add_turn(
+        session_id, question, content,
         {
             "sources": [source.model_dump() for source in sources],
             "action_cards": [card.model_dump() for card in cards],
             "generated_by": generated_by,
+            "model": assistant.settings.chat_model,
         },
+        response_time_ms,
     )
     repository.audit(
         "chat.completed",
@@ -130,11 +146,37 @@ async def send_message(session_id: str, request: ChatRequest) -> ChatResponse:
     )
     return ChatResponse(
         message_id=message_id,
+        turn_id=turn_id,
+        user_message_id=user_message_id,
         content=content,
         sources=sources,
         action_cards=cards,
         generated_by=generated_by,
     )
+
+
+@app.post("/api/chat/sessions/{session_id}/messages/stream")
+async def stream_message(session_id: str, request: ChatRequest) -> StreamingResponse:
+    if not repository.session_exists(session_id):
+        raise HTTPException(404, "Conversation not found")
+    history = repository.list_messages(session_id)[-6:]
+    previous_question = next((item["content"] for item in reversed(history) if item["role"] == "user"), "")
+    sources, cards = assistant.context_for(request.message, previous_question)
+    if not request.include_sources:
+        sources = []
+
+    async def events():
+        started = perf_counter()
+        try:
+            async for event in assistant.stream_answer(request.message, sources, history):
+                if event["type"] == "complete":
+                    result = save_chat_turn(session_id, request.message, event["content"], sources, cards, "ollama", round((perf_counter() - started) * 1000))
+                    event = {"type": "complete", **result.model_dump(mode="json")}
+                yield json.dumps(event) + "\n"
+        except ModelResponseError as exc:
+            yield json.dumps({"type": "error", "detail": exc.detail}) + "\n"
+
+    return StreamingResponse(events(), media_type="application/x-ndjson", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.get("/api/actions", response_model=list[ActionCard])
@@ -180,6 +222,13 @@ async def list_reminders() -> dict[str, Any]:
 @app.get("/api/documents", response_model=list[DocumentRecord])
 async def list_documents() -> list[dict[str, Any]]:
     return repository.list_documents()
+
+
+@app.delete("/api/documents/{document_id}", status_code=204, response_class=Response)
+async def delete_document(document_id: str) -> Response:
+    if not repository.delete_document(document_id):
+        raise HTTPException(404, "Document not found")
+    return Response(status_code=204)
 
 
 @app.post("/api/documents", response_model=DocumentRecord, status_code=201)

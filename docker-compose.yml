@@ -27,10 +27,10 @@ services:
     environment:
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
       - N8N_BASE_URL=http://host.docker.internal:5678
-      - HEYBROSKI_CHAT_MODEL=${HEYBROSKI_CHAT_MODEL:-qwen3:4b}
+      - HEYBROSKI_CHAT_MODEL=${HEYBROSKI_CHAT_MODEL:-qwen3:4b-instruct}
       - HEYBROSKI_LLM_TEMPERATURE=${HEYBROSKI_LLM_TEMPERATURE:-0.2}
       - OLLAMA_TIMEOUT_SECONDS=${OLLAMA_TIMEOUT_SECONDS:-45}
-      - OLLAMA_NUM_PREDICT=${OLLAMA_NUM_PREDICT:-160}
+      - OLLAMA_NUM_PREDICT=${OLLAMA_NUM_PREDICT:-768}
       - HEYBROSKI_DATA_DIR=/data/heybroski
       - HEYBROSKI_DEMO_MODE=${HEYBROSKI_DEMO_MODE:-true}
       - HEYBROSKI_USE_OLLAMA=${HEYBROSKI_USE_OLLAMA:-true}
@@ -56,7 +56,7 @@ services:
 
   ollama-model:
     image: ollama/ollama:latest
-    command: ["pull", "${HEYBROSKI_CHAT_MODEL:-qwen3:4b}"]
+    command: ["pull", "${HEYBROSKI_CHAT_MODEL:-qwen3:4b-instruct}"]
     environment:
       - OLLAMA_HOST=http://host.docker.internal:11434
     extra_hosts:

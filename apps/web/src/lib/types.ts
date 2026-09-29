@@ -26,6 +26,27 @@ export type ChatMessage = {
   sources?: Source[]
   actionCards?: ActionCard[]
   generatedBy?: 'ollama'
+  turnId?: string
+  createdAt?: string
+  responseTimeMs?: number | null
+}
+
+export type ChatSession = {
+  session_id: string
+  title: string
+  created_at: string
+  updated_at: string
+}
+
+export type StoredMessage = {
+  id: string
+  role: 'user' | 'assistant'
+  content: string
+  metadata: { sources?: Source[]; action_cards?: ActionCard[]; generated_by?: 'ollama' }
+  turn_id: string
+  created_at: string
+  updated_at: string
+  response_time_ms: number | null
 }
 
 export type DocumentRecord = {
