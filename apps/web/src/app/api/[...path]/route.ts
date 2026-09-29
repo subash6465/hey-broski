@@ -29,7 +29,8 @@ async function proxy(request: NextRequest, context: { params: Promise<{ path: st
       body: hasBody ? await request.arrayBuffer() : undefined,
       cache: 'no-store',
       redirect: 'manual',
-      signal: AbortSignal.timeout(70_000),
+      // Chat streams may last longer than a non-streaming request on a CPU model.
+      signal: path.at(-1) === 'stream' ? request.signal : AbortSignal.timeout(70_000),
     })
     const responseHeaders = new Headers()
     upstream.headers.forEach((value, key) => {

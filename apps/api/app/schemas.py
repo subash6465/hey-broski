@@ -42,6 +42,8 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     message_id: str
+    turn_id: str
+    user_message_id: str
     content: str
     sources: list[Source] = Field(default_factory=list)
     action_cards: list[ActionCard] = Field(default_factory=list)
