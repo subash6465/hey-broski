@@ -41,6 +41,7 @@ export function Onboarding({ initial, onComplete, initialStep }: { initial: Onbo
   const [error, setError] = useState('')
   const connectionResult = typeof window === 'undefined' ? null : new URLSearchParams(window.location.search).get('connection')
   const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+  const currentStepIndex = (['profile', 'connections', 'sync'] as const).indexOf(step)
 
   useEffect(() => {
     if (step !== 'sync' || !waitingForImport) return
@@ -121,14 +122,18 @@ export function Onboarding({ initial, onComplete, initialStep }: { initial: Onbo
   }
 
   return <main className="onboarding-shell">
-    <div className="onboarding-header"><div className="onboarding-brand"><Sparkles size={21} /> hey broski<span>.</span></div><p>Your personal workspace, set up in three steps.</p></div>
+    <div className="onboarding-glow onboarding-glow-one" aria-hidden="true" /><div className="onboarding-glow onboarding-glow-two" aria-hidden="true" />
+    <div className="onboarding-header"><div className="onboarding-brand"><span className="onboarding-brand-mark"><Sparkles size={19} /></span> hey broski<span>.</span></div><p><span className="onboarding-header-dot" /> A little clarity, from the start</p></div>
     <div className="onboarding-layout">
       <aside className="onboarding-progress" aria-label="Setup progress">
-        {([['profile', 'Your profile'], ['connections', 'Connect your mail'], ['sync', 'Import and sync']] as const).map(([key, label], index) =>
-          <div className={`progress-step ${step === key ? 'current' : ''}`} key={key}><span>{index + 1}</span><div><strong>{label}</strong><small>{key === 'profile' ? 'A little about you' : key === 'connections' ? 'Read-only access' : 'Choose what to bring in'}</small></div></div>)}
+        <div className="onboarding-aside-intro"><span className="section-label">A SPACE THAT FEELS LIKE YOURS</span><h2>Good things<br />start <em>here.</em></h2><p>Three thoughtful steps, and your space is ready to work with you.</p></div>
+        <div className="onboarding-step-list">{([['profile', 'Your profile'], ['connections', 'Connect your mail'], ['sync', 'Import and sync']] as const).map(([key, label], index) =>
+          <div className={`progress-step ${step === key ? 'current' : ''} ${index < currentStepIndex ? 'completed' : ''}`} key={key}><span>{index < currentStepIndex ? <Check size={15} /> : `0${index + 1}`}</span><div><strong>{label}</strong><small>{key === 'profile' ? 'A little about you' : key === 'connections' ? 'Read-only access' : 'Choose what to bring in'}</small></div></div>)}</div>
+        <div className="onboarding-aside-note"><span className="onboarding-note-icon"><LockKeyhole size={16} /></span><p><strong>Made for your peace of mind.</strong><br />Your profile and imported mail live on this computer.</p></div>
       </aside>
       <section className="onboarding-card">
         {error && <div className="onboarding-error" role="alert">{error}</div>}
+        <div key={step} className="onboarding-stage">
         {step === 'profile' && <><span className="section-label">STEP 01 / 03</span><h1>Let&apos;s get to know you.</h1><p className="onboarding-intro">These details stay in your local Hey Broski database. Your computer supplies the time zone automatically.</p>
           <form onSubmit={saveProfile} className="onboarding-form">
             <div className="field-row"><label>First name<input autoComplete="given-name" value={firstName} onChange={e => setFirstName(e.target.value)} required maxLength={80} /></label><label>Last name<input autoComplete="family-name" value={lastName} onChange={e => setLastName(e.target.value)} required maxLength={80} /></label></div>
@@ -169,8 +174,9 @@ export function Onboarding({ initial, onComplete, initialStep }: { initial: Onbo
             <p className="onboarding-note"><LockKeyhole size={15} /> Imported mail is stored on this computer. Keep Hey Broski open while the first import finishes.</p>
             <button className="onboarding-primary" type="submit" disabled={busy || waitingForImport && !state.accounts.some(account => state.sync_jobs[account.id]?.status === 'failed')}>{busy ? 'Saving…' : waitingForImport && !state.accounts.some(account => state.sync_jobs[account.id]?.status === 'failed') ? 'Importing your mail…' : 'Enter my workspace'} <ArrowRight size={17} /></button>
           </form><button type="button" className="onboarding-back" onClick={() => setStep('connections')}><ChevronLeft size={15} /> Back to connections</button></>}
+        </div>
       </section>
     </div>
-    <footer className="onboarding-footer"><RefreshCw size={14} /> You can change connections and sync settings later.</footer>
+    <footer className="onboarding-footer"><RefreshCw size={14} /> Your connections and sync settings can always be changed later.</footer>
   </main>
 }
