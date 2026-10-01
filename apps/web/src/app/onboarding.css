@@ -104,6 +104,17 @@
 .provider-mark.outlook { color: #5c70bb; background: linear-gradient(145deg, #e5efff, #e9e7ff); }
 .provider-details { display: grid; justify-items: start; gap: 14px; width: 100%; padding-top: 17px; border-top: 1px solid rgba(133,112,183,.13); color: #736b86; font-size: 11px; line-height: 1.65; animation: onboarding-stage-in .3s ease both; }
 .provider-details ol { display: grid; gap: 7px; margin: 0; padding-left: 20px; }
+.provider-details .setup-guide { width: 100%; gap: 0; padding-left: 0; list-style: none; counter-reset: setup-step; }
+.setup-guide li { position: relative; display: grid; gap: 5px; min-height: 54px; padding: 3px 0 17px 42px; border-left: 1px solid rgba(145,122,207,.22); margin-left: 13px; counter-increment: setup-step; }
+.setup-guide li:last-child { border-left-color: transparent; padding-bottom: 0; }
+.setup-guide li::before { position: absolute; top: 0; left: -14px; display: grid; place-items: center; width: 27px; height: 27px; border: 1px solid rgba(166,143,224,.32); border-radius: 9px; background: #f3efff; color: #715cc5; content: counter(setup-step, decimal-leading-zero); font: 650 9px 'DM Mono', monospace; }
+.setup-guide li > strong { color: #493c71; font-size: 11px; }
+.setup-guide li > span { color: #776e8c; line-height: 1.6; }
+.setup-guide li b { color: #594c7e; font-weight: 750; }
+.setup-cost { display: grid; gap: 4px; width: 100%; padding: 13px 15px; border: 1px solid rgba(157,135,221,.25); border-radius: 12px; background: rgba(242,238,255,.7); }
+.setup-cost strong { color: #5948a0; font-size: 11px; }
+.setup-cost span, .setup-footnote { color: #78708c; font-size: 10px; line-height: 1.6; }
+.provider-details .setup-footnote { margin: 0; padding: 10px 12px; border-radius: 10px; background: rgba(255,255,255,.54); }
 .provider-details p { margin: 0; }
 .provider-details a { color: #6955c8; font-weight: 750; text-underline-offset: 3px; }
 .provider-details textarea { min-height: 92px; resize: vertical; }
