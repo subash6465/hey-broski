@@ -1,7 +1,7 @@
 import time
 import asyncio
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
@@ -142,6 +142,78 @@ def test_outlook_connection_and_import(tmp_path: Path, monkeypatch) -> None:
         assert [(source.source_type, source.title, source.account_label) for source in sources] == [("email", "Project update", "Outlook / owner@outlook.com")]
 
 
+def test_gmail_subsequent_sync_fetches_only_recent_mail(tmp_path: Path, monkeypatch) -> None:
+    repository = Repository(tmp_path / "api.db")
+    repository.initialize()
+    account = repository.upsert_account("gmail", "owner@example.com", "Owner")
+    repository.save_sync_preferences(account["id"], 12, 24, True)
+    connector = ConnectorService(repository, CredentialVault(tmp_path))
+
+    async def token(_account):
+        return "access"
+
+    monkeypatch.setattr(connector, "access_token", token)
+    queries = []
+    details = []
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/messages"):
+            queries.append(request.url.params["q"])
+            return httpx.Response(200, json={"messages": [{"id": "old" if len(queries) == 1 else "new"}]})
+        message_id = request.url.path.rsplit("/", 1)[-1]
+        details.append(message_id)
+        return httpx.Response(200, json={"id": message_id, "internalDate": str(int(datetime.now(timezone.utc).timestamp() * 1000)),
+            "snippet": "Mail text", "payload": {"headers": [{"name": "Subject", "value": message_id}]}})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: real_client(transport=httpx.MockTransport(provider), **kwargs))
+    sync = MailSync(repository, connector)
+    asyncio.run(sync.run(account["id"]))
+    first = repository.get_sync_job(account["id"])
+    assert first["status"] == "complete"
+    asyncio.run(sync.run(account["id"]))
+    second = repository.get_sync_job(account["id"])
+    first_start = datetime.fromisoformat(first["started_at"])
+    second_cutoff = datetime.fromisoformat(second["cutoff_at"])
+    assert first_start - timedelta(minutes=5, seconds=1) <= second_cutoff <= first_start - timedelta(minutes=5)
+    assert queries[1].startswith(f"after:{int(second_cutoff.timestamp())} ")
+    assert int(queries[1].split()[0].removeprefix("after:")) > int(queries[0].split()[0].removeprefix("after:"))
+    assert details == ["old", "new"]
+    assert {item["message_id"] for item in repository.search_mail_sources("")} == {"old", "new"}
+
+
+def test_outlook_subsequent_sync_filters_from_last_scan(tmp_path: Path, monkeypatch) -> None:
+    repository = Repository(tmp_path / "api.db")
+    repository.initialize()
+    account = repository.upsert_account("outlook", "owner@example.com", "Owner")
+    repository.save_sync_preferences(account["id"], 6, 24, False)
+    connector = ConnectorService(repository, CredentialVault(tmp_path))
+
+    async def token(_account):
+        return "access"
+
+    monkeypatch.setattr(connector, "access_token", token)
+    filters = []
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        filters.append(request.url.params["$filter"])
+        message_id = "old" if len(filters) == 1 else "new"
+        return httpx.Response(200, json={"value": [{"id": message_id, "subject": message_id,
+            "receivedDateTime": datetime.now(timezone.utc).isoformat(), "bodyPreview": "Mail text"}]})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: real_client(transport=httpx.MockTransport(provider), **kwargs))
+    sync = MailSync(repository, connector)
+    asyncio.run(sync.run(account["id"]))
+    first = repository.get_sync_job(account["id"])
+    asyncio.run(sync.run(account["id"]))
+    second = repository.get_sync_job(account["id"])
+    assert filters[0].startswith("receivedDateTime ge ")
+    assert filters[1] == f"receivedDateTime ge {second['cutoff_at'].replace('+00:00', 'Z')}"
+    assert datetime.fromisoformat(second["cutoff_at"]) == datetime.fromisoformat(first["started_at"]) - timedelta(minutes=5)
+    assert {item["message_id"] for item in repository.search_mail_sources("")} == {"old", "new"}
+
+
 def test_gmail_import_resumes_after_page_failure(tmp_path: Path, monkeypatch) -> None:
     repository = Repository(tmp_path / "api.db")
     repository.initialize()
@@ -178,9 +250,12 @@ def test_gmail_import_resumes_after_page_failure(tmp_path: Path, monkeypatch) ->
     assert failed["status"] == "failed"
     assert failed["page_token"] == "page-2"
     assert failed["processed_count"] == 1
+    assert failed["cutoff_at"]
     asyncio.run(sync.run(account["id"]))
     done = repository.get_sync_job(account["id"])
     assert done["status"] == "complete"
+    assert done["cutoff_at"] == failed["cutoff_at"]
+    assert done["started_at"] == failed["started_at"]
     assert done["processed_count"] == 2
     assert {item["message_id"] for item in repository.search_mail_sources("")} == {"mail-1", "mail-2"}
 
@@ -296,7 +371,7 @@ def test_existing_sync_job_schema_gains_progress_columns(tmp_path: Path) -> None
     repository.initialize()
     with repository.connect() as connection:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(sync_jobs)")}
-    assert {"total_estimate", "skipped_count"} <= columns
+    assert {"total_estimate", "skipped_count", "cutoff_at"} <= columns
 
 
 def test_existing_profile_migrates_and_age_comes_from_birth_date(tmp_path: Path) -> None:

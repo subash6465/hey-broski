@@ -80,7 +80,7 @@ class Repository:
         CREATE TABLE IF NOT EXISTS oauth_attempts (state TEXT PRIMARY KEY, provider TEXT NOT NULL, code_verifier TEXT NOT NULL, expires_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS sync_preferences (account_id TEXT PRIMARY KEY REFERENCES connected_accounts(id) ON DELETE CASCADE, history_months INTEGER NOT NULL, interval_hours INTEGER NOT NULL, include_sent INTEGER NOT NULL, updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS mail_sources (provider TEXT NOT NULL, account_id TEXT NOT NULL REFERENCES connected_accounts(id) ON DELETE CASCADE, message_id TEXT NOT NULL, title TEXT NOT NULL, snippet TEXT NOT NULL, sent_at TEXT NOT NULL, sender TEXT NOT NULL, folder TEXT NOT NULL, PRIMARY KEY(account_id, message_id));
-        CREATE TABLE IF NOT EXISTS sync_jobs (account_id TEXT PRIMARY KEY REFERENCES connected_accounts(id) ON DELETE CASCADE, status TEXT NOT NULL, processed_count INTEGER NOT NULL DEFAULT 0, page_token TEXT, started_at TEXT NOT NULL, updated_at TEXT NOT NULL, error TEXT, total_estimate INTEGER, skipped_count INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS sync_jobs (account_id TEXT PRIMARY KEY REFERENCES connected_accounts(id) ON DELETE CASCADE, status TEXT NOT NULL, processed_count INTEGER NOT NULL DEFAULT 0, page_token TEXT, started_at TEXT NOT NULL, updated_at TEXT NOT NULL, error TEXT, total_estimate INTEGER, skipped_count INTEGER NOT NULL DEFAULT 0, cutoff_at TEXT);
         CREATE INDEX IF NOT EXISTS idx_mail_sources_account_date ON mail_sources(account_id, sent_at);
         """
         with self._lock, self.connect() as connection:
@@ -90,7 +90,7 @@ class Repository:
                 if name not in profile_columns:
                     connection.execute(f"ALTER TABLE owner_profile ADD COLUMN {name} TEXT")
             job_columns = {row[1] for row in connection.execute("PRAGMA table_info(sync_jobs)")}
-            for name, declaration in (("total_estimate", "INTEGER"), ("skipped_count", "INTEGER NOT NULL DEFAULT 0")):
+            for name, declaration in (("total_estimate", "INTEGER"), ("skipped_count", "INTEGER NOT NULL DEFAULT 0"), ("cutoff_at", "TEXT")):
                 if name not in job_columns:
                     connection.execute(f"ALTER TABLE sync_jobs ADD COLUMN {name} {declaration}")
             columns = {row[1] for row in connection.execute("PRAGMA table_info(messages)")}
@@ -438,15 +438,17 @@ class Repository:
         scored = [(sum(word in (row["title"] + " " + row["snippet"] + " " + row["sender"]).lower() for word in words), dict(row)) for row in rows]
         return [row for score, row in sorted(scored, key=lambda item: (item[0], item[1]["sent_at"]), reverse=True) if score or not words][:limit]
 
-    def start_sync_job(self, account_id: str) -> None:
+    def start_sync_job(self, account_id: str, cutoff_at: str | None = None) -> None:
         with self._lock, self.connect() as connection:
-            connection.execute("""INSERT INTO sync_jobs (account_id, status, processed_count, page_token, started_at, updated_at, error)
-                VALUES (?, 'running', 0, NULL, ?, ?, NULL)
+            connection.execute("""INSERT INTO sync_jobs (account_id, status, processed_count, page_token, started_at, updated_at, error, cutoff_at)
+                VALUES (?, 'running', 0, NULL, ?, ?, NULL, ?)
                 ON CONFLICT(account_id) DO UPDATE SET status='running', error=NULL, updated_at=excluded.updated_at,
+                started_at=CASE WHEN sync_jobs.status='complete' THEN excluded.started_at ELSE sync_jobs.started_at END,
+                cutoff_at=CASE WHEN sync_jobs.status='complete' THEN excluded.cutoff_at ELSE COALESCE(sync_jobs.cutoff_at, excluded.cutoff_at) END,
                 processed_count=CASE WHEN sync_jobs.status='complete' THEN 0 ELSE sync_jobs.processed_count END,
                 skipped_count=CASE WHEN sync_jobs.status='complete' THEN 0 ELSE sync_jobs.skipped_count END,
                 total_estimate=CASE WHEN sync_jobs.status='complete' THEN NULL ELSE sync_jobs.total_estimate END""",
-                (account_id, now_iso(), now_iso()))
+                (account_id, now_iso(), now_iso(), cutoff_at))
 
     def reset_sync_job(self, account_id: str) -> None:
         with self._lock, self.connect() as connection:

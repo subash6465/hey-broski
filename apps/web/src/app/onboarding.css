@@ -64,6 +64,11 @@
 .onboarding-aside-note strong { color: #61577b; font-weight: 750; }
 .onboarding-card { position: relative; min-width: 0; padding: clamp(28px, 4.2vw, 55px); border: 1px solid rgba(255,255,255,.9); border-radius: 27px; background: linear-gradient(145deg, rgba(255,255,255,.78), rgba(255,255,255,.49)); box-shadow: 0 26px 75px rgba(85,70,139,.11), inset 0 1px rgba(255,255,255,.84); backdrop-filter: blur(28px); animation: onboarding-rise .75s .15s both; }
 .onboarding-card::before { position: absolute; top: 0; left: 42px; right: 42px; height: 1px; content: ''; background: linear-gradient(90deg, transparent, #fff, transparent); }
+.onboarding-edit-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 12px; padding-top: 17px; border-top: 1px solid rgba(133,112,183,.15); }
+.onboarding-cancel { display: inline-flex; align-items: center; gap: 7px; min-height: 43px; padding: 9px 13px; border: 0; border-radius: 10px; background: transparent; color: #766a98; cursor: pointer; font-size: 11px; font-weight: 700; }
+.onboarding-cancel:hover { color: #5d48b2; }
+.onboarding-cancel:disabled { opacity: .5; cursor: default; }
+.onboarding-form .onboarding-back { justify-self: start; margin-top: 0; }
 .onboarding-stage { animation: onboarding-stage-in .43s ease both; }
 .onboarding-card h1 { margin: 16px 0 9px; font: 760 clamp(29px, 3.2vw, 42px)/1.15 'Manrope Variable', sans-serif; letter-spacing: -.065em; color: #2b2540; }
 .onboarding-intro { max-width: 510px; margin: 0 0 28px; color: #77718d; font-size: 12px; line-height: 1.75; }

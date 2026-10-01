@@ -1,7 +1,7 @@
 'use client'
 
 import { FormEvent, useCallback, useState } from 'react'
-import { ArrowRight, Check, ChevronLeft, LockKeyhole, Mail, RefreshCw, Sparkles } from 'lucide-react'
+import { ArrowRight, Check, ChevronLeft, LockKeyhole, Mail, RefreshCw, Sparkles, X } from 'lucide-react'
 import { request } from '@/lib/api'
 import { ConnectionDialog } from './ConnectionDialog'
 
@@ -23,7 +23,7 @@ export type OnboardingState = {
 
 type Step = 'profile' | 'connections' | 'sync'
 
-export function Onboarding({ initial, onComplete, initialStep }: { initial: OnboardingState; onComplete: (state: OnboardingState) => void; initialStep?: Step }) {
+export function Onboarding({ initial, onComplete, initialStep, editing = false, onCancel }: { initial: OnboardingState; onComplete: (state: OnboardingState) => void; initialStep?: Step; editing?: boolean; onCancel?: () => void }) {
   const [state, setState] = useState(initial)
   const [step, setStep] = useState<Step>(initialStep ?? (initial.profile_complete ? initial.accounts.length ? 'sync' : 'connections' : 'profile'))
   const [firstName, setFirstName] = useState(initial.profile?.first_name ?? '')
@@ -60,15 +60,17 @@ export function Onboarding({ initial, onComplete, initialStep }: { initial: Onbo
     return next
   }
 
-  async function saveProfile(event: FormEvent) {
+  async function saveProfile(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
+    const saveAndExit = (event.nativeEvent as SubmitEvent).submitter?.getAttribute('value') === 'save'
     setBusy(true); setError('')
     try {
       await request('/api/profile', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ first_name: firstName, last_name: lastName, date_of_birth: dateOfBirth, country_code: countryCode,
           phone_number: phone, gender: genderOption === 'self-describe' ? genderDescription : genderOption, time_zone: timeZone }) })
-      await refresh()
-      setStep('connections')
+      const next = await refresh()
+      if (editing && saveAndExit) onComplete(next)
+      else setStep('connections')
     } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not save your profile') }
     finally { setBusy(false) }
   }
@@ -98,6 +100,16 @@ export function Onboarding({ initial, onComplete, initialStep }: { initial: Onbo
       const result = await request<{ authorization_url: string }>(`/api/accounts/${provider}/start`, { method: 'POST' })
       window.location.assign(result.authorization_url)
     } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not start sign-in'); setBusy(false) }
+  }
+
+  async function saveConnections() {
+    setBusy(true); setError('')
+    try {
+      const next = await refresh()
+      if (next.ready) onComplete(next)
+      else setError('Connect at least one mailbox before returning to the workspace')
+    } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not save connections') }
+    finally { setBusy(false) }
   }
 
   async function saveSync(event: FormEvent) {
@@ -139,7 +151,8 @@ export function Onboarding({ initial, onComplete, initialStep }: { initial: Onbo
             <label>Gender<select value={genderOption} onChange={e => setGenderOption(e.target.value)} required><option value="" disabled>Select an option</option><option value="male">Male</option><option value="female">Female</option><option value="non-binary">Non-binary</option><option value="self-describe">Self describe</option></select></label>
             {genderOption === 'self-describe' && <label>Describe your gender<input value={genderDescription} onChange={e => setGenderDescription(e.target.value)} placeholder="How you describe yourself" required maxLength={80} /></label>}
             <p className="detected-setting">Time zone detected from this computer: <strong>{timeZone}</strong></p>
-            <button className="onboarding-primary" type="submit" disabled={busy}>{busy ? 'Saving…' : 'Continue to connections'} <ArrowRight size={17} /></button>
+            <button className="onboarding-primary" type="submit" value="continue" disabled={busy}>{busy ? 'Saving…' : 'Continue to connections'} <ArrowRight size={17} /></button>
+            {editing && <div className="onboarding-edit-actions"><button className="onboarding-secondary" type="submit" value="save" disabled={busy}>Save profile</button><button className="onboarding-cancel" type="button" onClick={onCancel} disabled={busy}>Cancel <X size={15} /></button></div>}
           </form></>}
         {step === 'connections' && <><span className="section-label">STEP 02 / 03</span><h1>Connect your inbox.</h1><p className="onboarding-intro">Connect at least one account. You&apos;ll sign in with Google or Microsoft and approve read-only mail access.</p>
           {connectionResult && <div className={connectionResult === 'connected' ? 'onboarding-success' : 'onboarding-error'} role="status">{connectionResult === 'connected' ? 'Mailbox connected and verified.' : 'Connection was not completed. You can try again.'}</div>}
@@ -153,6 +166,7 @@ export function Onboarding({ initial, onComplete, initialStep }: { initial: Onbo
           {!!state.accounts.length && <div className="connected-list"><strong>Verified mailboxes</strong>{state.accounts.map(account => <div key={account.id}><Check size={16} /> {account.email}</div>)}</div>}
           <button className="onboarding-primary" type="button" disabled={!state.accounts.length} onClick={() => setStep('sync')}>Choose import and sync settings <ArrowRight size={17} /></button>
           <button type="button" className="onboarding-back" onClick={() => setStep('profile')}><ChevronLeft size={15} /> Edit profile</button>
+          {editing && <div className="onboarding-edit-actions"><button className="onboarding-secondary" type="button" onClick={() => void saveConnections()} disabled={busy}>Save connections</button><button className="onboarding-cancel" type="button" onClick={onCancel} disabled={busy}>Cancel <X size={15} /></button></div>}
         </>}
         {step === 'sync' && <><span className="section-label">STEP 03 / 03</span><h1>Make it yours.</h1><p className="onboarding-intro">Choose how much existing mail to import and how often Hey Broski checks for updates while it is running. These choices apply to all connected mailboxes.</p>
           <div className="connected-list"><strong>Connected mailboxes</strong>{state.accounts.map(account => <div key={account.id}><Check size={16} /> {account.email}</div>)}</div>
@@ -163,7 +177,9 @@ export function Onboarding({ initial, onComplete, initialStep }: { initial: Onbo
             <label className="onboarding-check"><input type="checkbox" checked={includeSent} onChange={e => setIncludeSent(e.target.checked)} /> Include sent mail, to help identify follow-ups</label>
             <p className="onboarding-note"><LockKeyhole size={15} /> Imported mail is stored on this computer. Keep Hey Broski open while the first import finishes.</p>
             <button className="onboarding-primary" type="submit" disabled={busy}>{busy ? 'Saving…' : 'Enter my workspace'} <ArrowRight size={17} /></button>
-          </form><button type="button" className="onboarding-back" onClick={() => setStep('connections')}><ChevronLeft size={15} /> Back to connections</button></>}
+            <button type="button" className="onboarding-back" onClick={() => setStep('connections')}><ChevronLeft size={15} /> Back to connections</button>
+            {editing && <div className="onboarding-edit-actions"><button className="onboarding-secondary" type="submit" disabled={busy}>Save import and sync</button><button className="onboarding-cancel" type="button" onClick={onCancel} disabled={busy}>Cancel <X size={15} /></button></div>}
+          </form></>}
         </div>
       </section>
     </div>

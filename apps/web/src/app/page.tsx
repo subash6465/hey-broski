@@ -59,6 +59,8 @@ export default function Home() {
   const [sessionId, setSessionId] = useState<string>()
   const [sessions, setSessions] = useState<ChatSession[]>([])
   const [messages, setMessages] = useState<ChatMessage[]>([welcome])
+  const [sendingMessageId, setSendingMessageId] = useState<string>()
+  const [selectedSources, setSelectedSources] = useState<Source[] | null>(null)
   const [actions, setActions] = useState<ActionCard[]>([])
   const [documents, setDocuments] = useState<DocumentRecord[]>([])
   const [health, setHealth] = useState<Health>()
@@ -137,10 +139,20 @@ export default function Home() {
     return () => window.clearInterval(interval)
   }, [])
 
+  useEffect(() => {
+    if (!selectedSources) return
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') setSelectedSources(null) }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => { document.body.style.overflow = previousOverflow; window.removeEventListener('keydown', closeOnEscape) }
+  }, [selectedSources])
+
   async function sendMessage(event?: FormEvent, selectedPrompt?: string) {
     event?.preventDefault()
     const text = (selectedPrompt ?? input).trim()
     if (!text || busy) return
+    const fromDesk = view === 'desk'
     setView('chat')
     setError(undefined)
     setNotice(undefined)
@@ -148,8 +160,16 @@ export default function Home() {
     setStreamingText('')
     setStatusText('')
     const pendingId = crypto.randomUUID()
+    setSendingMessageId(pendingId)
+    if (fromDesk) {
+      setSessionId(undefined)
+      setMessages([welcome, { id: pendingId, role: 'user', content: text }])
+    } else {
+      setMessages((current) => [...current, { id: pendingId, role: 'user', content: text }])
+    }
+    setInput('')
     try {
-      let activeSession = sessionId
+      let activeSession = fromDesk ? undefined : sessionId
       if (!activeSession) {
         const session = await request<{ session_id: string }>(
           '/api/chat/sessions',
@@ -159,8 +179,6 @@ export default function Home() {
         activeSession = session.session_id
         setSessionId(activeSession)
       }
-      setInput('')
-      setMessages((current) => [...current, { id: pendingId, role: 'user', content: text }])
       await streamChat(`/api/chat/sessions/${activeSession}/messages/stream`, text, (update: ChatStreamEvent) => {
         if (update.type === 'status') setStatusText(update.text)
         if (update.type === 'content') {
@@ -189,6 +207,7 @@ export default function Home() {
       setError(caught instanceof Error ? caught.message : 'Message failed')
     } finally {
       setBusy(false)
+      setSendingMessageId(undefined)
       setStreamingText('')
       setStatusText('')
     }
@@ -335,7 +354,7 @@ export default function Home() {
 
   if (onboarding === undefined) return <div className="onboarding-shell"><div className="onboarding-header"><div className="onboarding-brand"><Sparkles size={21} /> hey broski<span>.</span></div></div><p>Opening your local workspace…</p></div>
   if (onboarding === null) return <div className="onboarding-shell"><div className="onboarding-card"><h1>Could not open setup</h1><p>Check that the local API is running, then reload this page.</p><button className="onboarding-primary" onClick={() => window.location.reload()}>Retry</button></div></div>
-  if (!onboarding.ready || showSetup) return <Onboarding initial={onboarding} initialStep={showSetup && onboarding.profile_complete ? setupStep : undefined} onComplete={next => { setOnboarding(next); setAccountJobs(next.sync_jobs); setShowSetup(false); window.history.replaceState({}, '', '/') }} />
+  if (!onboarding.ready || showSetup) return <Onboarding initial={onboarding} initialStep={showSetup && onboarding.profile_complete ? setupStep : undefined} editing={showSetup && onboarding.ready} onCancel={() => { setShowSetup(false); window.history.replaceState({}, '', '/') }} onComplete={next => { setOnboarding(next); setAccountJobs(next.sync_jobs); setView('desk'); setShowSetup(false); window.history.replaceState({}, '', '/') }} />
 
   return (
     <div className="app-shell">
@@ -376,6 +395,7 @@ export default function Home() {
           return <div className="import-progress-account" key={account.id}><div className="import-progress-line"><strong>{account.email}</strong><span>{job?.status === 'failed' ? 'Paused' : `${job?.processed_count ?? 0} messages imported${estimate ? ` · about ${estimate} expected` : ''}`}</span></div><div className={`import-progress-track ${percent === null && job?.status !== 'failed' ? 'indeterminate' : ''}`} role="progressbar" aria-label={`${account.email} import`} aria-valuemin={0} aria-valuemax={estimate ?? undefined} aria-valuenow={estimate ? done : undefined}><span style={{ width: job?.status === 'failed' ? `${percent ?? 0}%` : percent === null ? undefined : `${percent}%` }} /></div>{job?.status === 'failed' && <div className="import-progress-error"><span>{job.error || 'Import stopped. Try again.'}</span><button type="button" onClick={() => void syncAccount(account.id)} disabled={accountBusy === account.id}>Resume import</button></div>}{!!job?.skipped_count && <small>{job.skipped_count} inaccessible messages skipped.</small>}</div>
         })}</section>}
 
+        <div className="workspace-view" key={view}>
         {view === 'desk' && <section className="desk" aria-label="My desk">
           <div className="desk-intro"><p className="section-label">A LITTLE CLARITY FOR TODAY</p><h1>Hey, {onboarding.profile?.first_name ?? 'there'} <Sparkles aria-hidden="true" /></h1><p>Here&apos;s what&apos;s worth a look. The rest can wait.</p></div>
           <div className="desk-cards">
@@ -392,12 +412,12 @@ export default function Home() {
           <section className="chat-layout">
             <div className="messages">
               {messages.map((message) => (
-                <div className={`message-row ${message.role}`} key={message.id}>
+                <div className={`message-row ${message.role} ${message.id === sendingMessageId ? 'message-sending' : ''}`} key={message.id}>
                   {message.role === 'assistant' && <div className="bot-avatar"><Bot size={17} /></div>}
                   <div className="message-wrap">
                     <div className="message-bubble"><p>{message.content}</p></div>
                     {message.generatedBy && <span className="generated-by">Answered by local model ({health?.model ?? 'Ollama'})</span>}
-                    {!!message.sources?.length && <SourceList sources={message.sources} />}
+                    {!!message.sources?.length && <SourceList sources={message.sources} onOpen={() => setSelectedSources(message.sources ?? null)} />}
                     {!!message.actionCards?.length && <div className="inline-actions">{message.actionCards.map((card) => <ActionCardView key={card.id} card={actions.find((item) => item.id === card.id) ?? card} busy={decisionBusy === card.id} onDecision={decide} />)}</div>}
                   </div>
                 </div>
@@ -419,7 +439,9 @@ export default function Home() {
         {view === 'vault' && <Collection eyebrow="YOUR LIBRARY" title="Your local documents" subtitle="PDF, text, Markdown, and CSV files are searchable from chat."><label className="upload-card"><Upload size={22} /><strong>{uploading ? 'Uploading…' : 'Upload a document'}</strong><span>Maximum 10 MB</span><input type="file" disabled={uploading} accept=".pdf,.txt,.md,.csv" onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ''; void upload(file) }} /></label>{documents.map((doc) => <article className="document-card" key={doc.id}><FileText /><div><strong>{doc.filename}</strong><span>{Math.ceil(doc.size_bytes / 1024)} KB · {new Date(doc.created_at).toLocaleDateString()}</span><p>{doc.preview}</p><div className="document-actions"><button type="button" onClick={() => { setInput(`What does ${doc.filename} say about `); setView('chat') }}>Ask about this file</button><button type="button" className="delete-button" disabled={busy || uploading || deleting} onClick={() => setDeleteTarget({ kind: 'document', id: doc.id, label: doc.filename })}><Trash2 size={14} /> Delete</button></div></div></article>)}</Collection>}
         {view === 'history' && <Collection eyebrow="PAST CONVERSATIONS" title="Conversation history" subtitle="Your conversations are saved locally and can be reopened anytime.">{sessions.length ? sessions.map((session) => <div className="history-row" key={session.session_id}><button className="history-card" disabled={busy || deleting} onClick={() => void openConversation(session.session_id)}><strong>{session.title}</strong><span>{new Date(session.updated_at).toLocaleString()}</span><ChevronRight size={17} /></button><button className="history-delete delete-button" type="button" disabled={busy || deleting} onClick={() => setDeleteTarget({ kind: 'conversation', id: session.session_id, label: session.title })} aria-label={`Delete conversation ${session.title}`}><Trash2 size={16} /> Delete</button></div>) : <Empty text="Your conversations will appear here after you send a message." />}</Collection>}
         {view === 'accounts' && <Collection eyebrow="CONNECTED MAIL" title="Your accounts" subtitle="Your mail is imported and stored on this computer. Manage each connection and its sync here."><button className="account-add" onClick={() => { window.history.replaceState({}, '', '/?setup=connections'); setSetupStep('connections'); setShowSetup(true) }}>Connect another account <ArrowUpRight size={16} /></button><button className="account-add" onClick={() => { window.history.replaceState({}, '', '/?setup=sync'); setSetupStep('sync'); setShowSetup(true) }} disabled={onboarding.accounts.some(account => accountJobs[account.id]?.status === 'running')}>Change import and sync settings <ArrowUpRight size={16} /></button><button className="account-add" onClick={() => { window.history.replaceState({}, '', '/?setup=profile'); setSetupStep('profile'); setShowSetup(true) }}>Edit profile <ArrowUpRight size={16} /></button>{onboarding.accounts.map(account => <article className="account-card" key={account.id}><span className="provider-mark"><Mail size={20} /></span><div><strong>{account.display_name}</strong><p>{account.email} · {account.provider === 'gmail' ? 'Gmail' : 'Outlook'}</p><small>{accountJobs[account.id]?.status === 'running' ? `Importing · ${accountJobs[account.id]?.processed_count ?? 0} messages checked` : accountJobs[account.id]?.status === 'failed' ? `Sync needs attention: ${accountJobs[account.id]?.error}` : account.last_synced_at ? `Last synced ${new Date(account.last_synced_at).toLocaleString()} | ${accountJobs[account.id]?.processed_count ?? 0} messages checked${accountJobs[account.id]?.skipped_count ? ` | ${accountJobs[account.id]?.skipped_count} inaccessible skipped` : ''}` : 'Waiting to import'}</small><div className="account-buttons"><button onClick={() => void syncAccount(account.id)} disabled={accountBusy === account.id || accountJobs[account.id]?.status === 'running'}><RefreshCw size={14} /> Sync now</button><button onClick={() => void disconnectAccount(account.id)} disabled={accountBusy === account.id || accountJobs[account.id]?.status === 'running'}>Disconnect</button></div></div></article>)}</Collection>}
+        </div>
       </main>
+      {selectedSources && <SourceDialog sources={selectedSources} onClose={() => setSelectedSources(null)} />}
       {deleteTarget && <div className="confirm-backdrop" onClick={(event) => { if (event.target === event.currentTarget && !deleting) setDeleteTarget(undefined) }}><div className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-title" aria-describedby="delete-description" onKeyDown={(event) => { if (event.key === 'Escape' && !deleting) setDeleteTarget(undefined) }}><h2 id="delete-title">Delete {deleteTarget.kind}?</h2><p id="delete-description"><strong>{deleteTarget.label}</strong> {deleteTarget.kind === 'document' ? 'and its searchable text will be removed from the local vault. Future chats cannot retrieve it, but existing conversations and their saved source excerpts will remain.' : 'and its messages, related actions, and reminders will be permanently removed.'} This cannot be undone.</p><div className="confirm-actions"><button type="button" autoFocus disabled={deleting} onClick={() => setDeleteTarget(undefined)}>Cancel</button><button type="button" className="confirm-delete" disabled={deleting} onClick={() => void confirmDelete()}>{deleting ? 'Deleting…' : 'Delete permanently'}</button></div></div></div>}
     </div>
   )
@@ -446,8 +468,26 @@ function NavButton({ icon, label, count, active, onClick }: { icon: React.ReactN
   return <button className={active ? 'active' : ''} onClick={onClick}>{icon}<span>{label}</span>{count ? <b>{count}</b> : null}</button>
 }
 
-function SourceList({ sources }: { sources: Source[] }) {
-  return <details className="sources"><summary>{sources.length} grounded source{sources.length === 1 ? '' : 's'}</summary><div>{sources.map((source, index) => <article key={`${source.source_id}-${index}`}><span>{index + 1}</span><div><strong>{source.title}</strong><small>{source.account_label}</small><p>{source.snippet}</p></div></article>)}</div></details>
+function SourceList({ sources, onOpen }: { sources: Source[]; onOpen: () => void }) {
+  return <button type="button" className="sources-trigger" onClick={onOpen}><BookOpen size={14} /> {sources.length} grounded source{sources.length === 1 ? '' : 's'} <ChevronRight size={14} /></button>
+}
+
+function SourceDialog({ sources, onClose }: { sources: Source[]; onClose: () => void }) {
+  const [expanded, setExpanded] = useState<number[]>([])
+  return <div className="source-dialog-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) onClose() }}>
+    <section className="source-dialog" role="dialog" aria-modal="true" aria-labelledby="source-dialog-title" onKeyDown={event => {
+      if (event.key !== 'Tab') return
+      const buttons = event.currentTarget.querySelectorAll<HTMLButtonElement>('button:not([disabled])')
+      if (!buttons.length) return
+      const first = buttons[0]
+      const last = buttons[buttons.length - 1]
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus() }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus() }
+    }}>
+      <header><div><span className="section-label">ANSWER REFERENCES</span><h2 id="source-dialog-title">Grounded sources</h2><p>{sources.length} source{sources.length === 1 ? '' : 's'} used in this answer</p></div><button type="button" aria-label="Close sources" autoFocus onClick={onClose}><X size={18} /></button></header>
+      <div className="source-dialog-scroll">{sources.map((source, index) => <article key={`${source.source_id}-${index}`}><span className="source-number">{String(index + 1).padStart(2, '0')}</span><div><strong>{source.title}</strong><small>{source.account_label}{source.timestamp ? ` · ${new Date(source.timestamp).toLocaleDateString()}` : ''}</small><p className={source.snippet.length > 300 && !expanded.includes(index) ? 'source-snippet-preview' : ''}>{source.snippet}</p>{source.snippet.length > 300 && <button className="source-expand" type="button" onClick={() => setExpanded(current => current.includes(index) ? current.filter(item => item !== index) : [...current, index])}>{expanded.includes(index) ? 'Show less' : 'Read full excerpt'}</button>}</div></article>)}</div>
+    </section>
+  </div>
 }
 
 function Collection({ eyebrow, title, subtitle, children }: { eyebrow: string; title: string; subtitle: string; children: React.ReactNode }) {

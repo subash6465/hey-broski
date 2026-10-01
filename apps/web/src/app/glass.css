@@ -91,3 +91,34 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,summary:focus-vi
 body{font-family:'DM Sans Variable',Arial,ui-sans-serif,system-ui,sans-serif}
 .brand,.desk-intro h1,.glass-card h2,.desk-ask h2,.collection-heading h2,.action-card h4,.confirm-dialog h2{font-family:'Manrope Variable',Arial,ui-sans-serif,system-ui,sans-serif}
 .topbar-path,.section-label,.card-kicker,.mode-badge,.brief-source{font-family:'DM Mono',ui-monospace,Consolas,monospace}
+.workspace-view{flex:1;min-width:0;display:flex;flex-direction:column;animation:workspace-enter .3s ease both}
+.workspace-view>.desk,.workspace-view>.collection,.workspace-view>.chat-layout>.messages{animation:view-content-enter .32s cubic-bezier(.2,.75,.25,1) both}
+@keyframes workspace-enter{from{opacity:0}to{opacity:1}}
+@keyframes view-content-enter{from{transform:translateY(12px)}to{transform:translateY(0)}}
+.message-row.user.message-sending{animation:message-send .5s cubic-bezier(.17,.8,.25,1) both;transform-origin:right bottom}
+@keyframes message-send{from{opacity:0;transform:translateY(30px) scale(.94)}60%{opacity:1}to{opacity:1;transform:translateY(0) scale(1)}}
+.sources-trigger{display:inline-flex;align-items:center;gap:7px;margin-top:10px;padding:8px 11px;border:1px solid rgba(138,114,209,.22);border-radius:10px;background:rgba(255,255,255,.66);color:#6653af;cursor:pointer;font-size:11px;font-weight:750;box-shadow:0 8px 20px rgba(94,78,144,.06);transition:transform .2s ease,background .2s ease,border-color .2s ease}
+.sources-trigger:hover{transform:translateY(-2px);border-color:rgba(138,114,209,.45);background:#fff}
+.sources-trigger svg:last-child{margin-left:2px}
+.source-dialog-backdrop{position:fixed;inset:0;z-index:100;display:grid;place-items:center;padding:18px;background:rgba(35,27,63,.46);backdrop-filter:blur(10px);animation:source-backdrop-in .22s ease both}
+.source-dialog{display:flex;flex-direction:column;width:min(100%,650px);max-height:min(84dvh,760px);overflow:hidden;border:1px solid rgba(255,255,255,.9);border-radius:22px;background:linear-gradient(145deg,rgba(255,255,255,.97),rgba(245,242,255,.94));box-shadow:0 35px 95px rgba(38,27,76,.28);animation:source-dialog-in .34s cubic-bezier(.2,.75,.25,1) both}
+.source-dialog header{display:flex;justify-content:space-between;gap:18px;padding:25px 28px 19px;border-bottom:1px solid rgba(133,112,183,.14)}
+.source-dialog header h2{margin:8px 0 5px;color:#302746;font:750 27px/1.15 'Manrope Variable',Arial,sans-serif;letter-spacing:-.055em}
+.source-dialog header p{margin:0;color:#827993;font-size:11px}
+.source-dialog header button{flex:none;display:grid;place-items:center;width:34px;height:34px;border:1px solid rgba(132,111,194,.2);border-radius:10px;background:rgba(255,255,255,.7);color:#766a98;cursor:pointer}
+.source-dialog header button:hover{background:#fff;color:#5945ad}
+.source-dialog-scroll{min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:19px 28px 28px;scrollbar-color:#c9b9ed transparent}
+.source-dialog-scroll article{display:flex;gap:15px;padding:17px 0;border-bottom:1px solid rgba(133,112,183,.13)}
+.source-dialog-scroll article:first-child{padding-top:3px}
+.source-dialog-scroll article:last-child{border-bottom:0}
+.source-number{flex:none;display:grid;place-items:center;width:29px;height:29px;border-radius:9px;background:#eee9fb;color:#725eb5;font:700 10px 'DM Mono',monospace}
+.source-dialog-scroll article>div{min-width:0}
+.source-dialog-scroll strong{display:block;color:#3f345e;font-size:13px;overflow-wrap:anywhere}
+.source-dialog-scroll small{display:block;margin-top:5px;color:#7d6ab6;font-size:10px;overflow-wrap:anywhere}
+.source-dialog-scroll p{margin:10px 0 0;color:#6c657b;font-size:12px;line-height:1.7;white-space:pre-wrap;overflow-wrap:anywhere}
+.source-dialog-scroll .source-snippet-preview{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:4;overflow:hidden}
+.source-expand{margin-top:9px;padding:0;border:0;background:none;color:#725bb5;cursor:pointer;font-size:11px;font-weight:750}
+.source-expand:hover{text-decoration:underline}
+@keyframes source-backdrop-in{from{opacity:0}to{opacity:1}}
+@keyframes source-dialog-in{from{opacity:0;transform:translateY(18px) scale(.98)}to{opacity:1;transform:translateY(0) scale(1)}}
+@media(max-width:650px){.source-dialog-backdrop{padding:9px}.source-dialog{max-height:calc(100dvh - 18px);border-radius:17px}.source-dialog header{padding:20px 19px 15px}.source-dialog-scroll{padding:17px 19px 23px}}

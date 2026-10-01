@@ -9,7 +9,7 @@ import hashlib
 import json
 import random
 import re
-from datetime import datetime, timezone, time
+from datetime import datetime, timedelta, timezone, time
 from email.header import decode_header, make_header
 from html import unescape
 from urllib.parse import quote
@@ -125,14 +125,24 @@ class MailSync:
             return
         self._running.add(account_id)
         previous = self.repository.get_sync_job(account_id)
-        cursor = previous["page_token"] if previous and previous["status"] in {"running", "failed"} else None
-        self.repository.start_sync_job(account_id)
+        resuming = bool(previous and previous["status"] in {"running", "failed"})
+        cursor = previous["page_token"] if resuming else None
+        if resuming and previous["cutoff_at"]:
+            cutoff_at = previous["cutoff_at"]
+        else:
+            # A completed scan only guarantees coverage through its start time:
+            # mail arriving while pages were fetched must appear in the next scan.
+            last_covered = previous["started_at"] if previous and previous["status"] == "complete" else account["last_synced_at"]
+            cutoff = (datetime.fromisoformat(last_covered).astimezone(timezone.utc) - timedelta(minutes=5)
+                      if last_covered else months_ago(preferences["history_months"]))
+            cutoff_at = cutoff.isoformat()
+        self.repository.start_sync_job(account_id, cutoff_at)
         try:
             token = await self.connectors.access_token(account)
             if account["provider"] == "gmail":
-                await self._gmail(account, preferences, token, cursor)
+                await self._gmail(account, preferences, token, cursor, cutoff_at)
             else:
-                await self._outlook(account, preferences, token, cursor)
+                await self._outlook(account, preferences, token, cursor, cutoff_at)
             self.repository.update_sync_job(account_id, "complete")
         except (httpx.HTTPError, ValueError, KeyError, RuntimeError, ProviderConnectionError) as exc:
             # Keep the cursor already saved after the last successful page.
@@ -141,9 +151,10 @@ class MailSync:
         finally:
             self._running.discard(account_id)
 
-    async def _gmail(self, account: dict, preferences: dict, token: str, cursor: str | None) -> None:
-        cutoff = months_ago(preferences["history_months"]).strftime("%Y/%m/%d")
-        query = f"after:{cutoff} -in:spam -in:trash"
+    async def _gmail(self, account: dict, preferences: dict, token: str, cursor: str | None, cutoff_at: str) -> None:
+        # Gmail accepts Unix seconds, avoiding the PST-midnight interpretation of dates.
+        cutoff_seconds = int(datetime.fromisoformat(cutoff_at).timestamp())
+        query = f"after:{cutoff_seconds} -in:spam -in:trash"
         if not preferences["include_sent"]:
             query += " in:inbox"
         headers = {"Authorization": f"Bearer {token}"}
@@ -187,8 +198,8 @@ class MailSync:
                 if not position["page_token"]:
                     return
 
-    async def _outlook(self, account: dict, preferences: dict, token: str, cursor: str | None) -> None:
-        cutoff = months_ago(preferences["history_months"]).isoformat().replace("+00:00", "Z")
+    async def _outlook(self, account: dict, preferences: dict, token: str, cursor: str | None, cutoff_at: str) -> None:
+        cutoff = cutoff_at.replace("+00:00", "Z")
         folders = ["inbox"] + (["sentitems"] if preferences["include_sent"] else [])
         position = json.loads(cursor) if cursor else {"folder": folders[0], "url": None}
         headers = {"Authorization": f"Bearer {token}", "Prefer": 'outlook.body-content-type="text"'}
