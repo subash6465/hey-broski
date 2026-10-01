@@ -2,29 +2,47 @@ from __future__ import annotations
 
 import io
 import json
+import asyncio
+import contextlib
+import os
 from time import perf_counter
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile, status
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile, status, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse, RedirectResponse, JSONResponse
 
 from .assistant import AssistantService, ModelResponseError
+from .connectors import ConnectorService, ConnectionError
 from .config import settings
+from .credential_vault import CredentialVault
+from .mail_sync import MailSync
 from .repository import Repository
-from .schemas import ActionCard, ChatRequest, ChatResponse, DecisionRequest, DocumentRecord
+from .schemas import ActionCard, ChatRequest, ChatResponse, DecisionRequest, DocumentRecord, OwnerProfileInput, GmailClientInput, OutlookClientInput, SyncPreferencesInput
 
 repository = Repository(settings.database_path)
 assistant = AssistantService(repository, settings)
+vault = CredentialVault(settings.data_dir)
+connectors = ConnectorService(repository, vault)
+mail_sync = MailSync(repository, connectors)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     repository.initialize()
-    yield
+    global connectors, mail_sync
+    connectors = ConnectorService(repository, vault)
+    mail_sync = MailSync(repository, connectors)
+    scheduler = asyncio.create_task(mail_sync.scheduler())
+    try:
+        yield
+    finally:
+        scheduler.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await scheduler
 
 
 app = FastAPI(title="Hey Broski API", version="0.2.0", lifespan=lifespan)
@@ -36,6 +54,121 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def reject_foreign_browser_writes(request: Request, call_next):
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        origin = request.headers.get("origin")
+        allowed = {"http://localhost:3000", "http://127.0.0.1:3000", os.getenv("HEYBROSKI_WEB_BASE_URL", "http://localhost:3000").rstrip("/")}
+        if origin and origin not in allowed:
+            return JSONResponse({"detail": "This request did not come from the local Hey Broski app"}, status_code=403)
+    return await call_next(request)
+
+
+@app.get("/api/onboarding")
+async def onboarding_status() -> dict[str, Any]:
+    return {**repository.onboarding_status(), "gmail_client_imported": connectors.has_gmail_client(),
+            "outlook_available": connectors.has_outlook_client()}
+
+
+@app.put("/api/profile")
+async def save_profile(profile: OwnerProfileInput) -> dict[str, Any]:
+    return repository.save_profile(profile.model_dump())
+
+
+@app.post("/api/accounts/gmail/client")
+async def import_gmail_client(request: GmailClientInput) -> dict[str, bool]:
+    try:
+        connectors.import_gmail_client(request.credentials)
+    except ConnectionError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"imported": True}
+
+
+@app.post("/api/accounts/outlook/client")
+async def import_outlook_client(request: OutlookClientInput) -> dict[str, bool]:
+    try:
+        connectors.import_outlook_client(request.client_id)
+    except ConnectionError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"imported": True}
+
+
+@app.get("/api/accounts")
+async def list_accounts() -> dict[str, Any]:
+    return {"accounts": repository.list_accounts()}
+
+
+@app.post("/api/accounts/{provider}/start")
+async def start_connection(provider: str) -> dict[str, str]:
+    if provider not in {"gmail", "outlook"}:
+        raise HTTPException(404, "Unknown mail provider")
+    if not repository.get_profile():
+        raise HTTPException(409, "Complete your profile first")
+    try:
+        return {"authorization_url": connectors.start(provider)}
+    except ConnectionError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/accounts/{provider}/callback")
+async def connection_callback(provider: str, state: str = "", code: str = "", error: str = "") -> RedirectResponse:
+    base = os.getenv("HEYBROSKI_WEB_BASE_URL", "http://localhost:3000").rstrip("/")
+    if provider not in {"gmail", "outlook"}:
+        raise HTTPException(404, "Unknown mail provider")
+    if error or not code:
+        return RedirectResponse(f"{base}/?setup=connections&connection=cancelled", status_code=303)
+    try:
+        await connectors.finish(provider, state, code)
+    except ConnectionError:
+        return RedirectResponse(f"{base}/?setup=connections&connection=failed", status_code=303)
+    return RedirectResponse(f"{base}/?setup=connections&connection=connected", status_code=303)
+
+
+@app.delete("/api/accounts/{account_id}", status_code=204, response_class=Response)
+async def disconnect_account(account_id: str) -> Response:
+    if not repository.get_account(account_id):
+        raise HTTPException(404, "Account not found")
+    if account_id in mail_sync._running:
+        raise HTTPException(409, "Wait for the current import to finish before disconnecting")
+    vault.delete(f"account:{account_id}")
+    repository.delete_account(account_id)
+    return Response(status_code=204)
+
+
+@app.put("/api/accounts/{account_id}/sync-preferences")
+async def save_sync_preferences(account_id: str, preferences: SyncPreferencesInput) -> dict[str, Any]:
+    if not repository.get_account(account_id):
+        raise HTTPException(404, "Account not found")
+    previous = repository.get_sync_preferences(account_id)
+    changed = not previous or any((previous[key] != value for key, value in {
+        "history_months": preferences.history_months, "interval_hours": preferences.interval_hours,
+        "include_sent": int(preferences.include_sent)}.items()))
+    if changed and account_id in mail_sync._running:
+        raise HTTPException(409, "Wait for the current import to finish before changing sync settings")
+    result = repository.save_sync_preferences(account_id, preferences.history_months, preferences.interval_hours, preferences.include_sent)
+    if changed:
+        repository.reset_sync_job(account_id)
+        asyncio.create_task(mail_sync.run(account_id))
+    return result
+
+
+@app.get("/api/accounts/{account_id}/sync")
+async def sync_status(account_id: str) -> dict[str, Any]:
+    if not repository.get_account(account_id):
+        raise HTTPException(404, "Account not found")
+    return {"preferences": repository.get_sync_preferences(account_id), "job": repository.get_sync_job(account_id)}
+
+
+@app.post("/api/accounts/{account_id}/sync")
+async def start_sync(account_id: str) -> dict[str, str]:
+    if not repository.get_account(account_id):
+        raise HTTPException(404, "Account not found")
+    if not repository.get_sync_preferences(account_id):
+        raise HTTPException(409, "Choose import and sync settings first")
+    asyncio.create_task(mail_sync.run(account_id))
+    return {"status": "started"}
 
 
 @app.get("/api/live")
@@ -67,7 +200,7 @@ async def health_check() -> dict[str, Any]:
     return {
         "status": "healthy" if ollama_status == "available" else "degraded",
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "mode": "demo" if settings.demo_mode else "connected",
+        "mode": "connected" if repository.list_accounts() else "demo" if settings.demo_mode else "local",
         "inference_enabled": settings.use_ollama,
         "services": {"database": "connected", "ollama": ollama_status},
         "model": settings.chat_model,

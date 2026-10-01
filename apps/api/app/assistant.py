@@ -45,7 +45,13 @@ class AssistantService:
 
     def context_for(self, message: str, previous_question: str = "") -> tuple[list[Source], list[ActionCard]]:
         query = message.lower()
-        if not self.settings.demo_mode:
+        connected = bool(self.repository.list_accounts())
+        if connected:
+            selected = [Source(source_type="email", source_id=f"{item['account_id']}:{item['message_id']}",
+                account_label=f"{item['provider'].title()} / {item['email'] if 'email' in item else item['display_name']}",
+                title=item["title"], snippet=item["snippet"], timestamp=item["sent_at"])
+                for item in self.repository.search_mail_sources(f"{previous_question} {message}")]
+        elif not self.settings.demo_mode:
             selected = []
         elif any(word in query for word in ("wait", "reply", "follow")):
             selected = [DEMO_SOURCES[1]]
@@ -70,7 +76,7 @@ class AssistantService:
             week_start = date.fromordinal(today.toordinal() - today.weekday())
             demo_ids = {source.source_id for source in DEMO_SOURCES}
             selected = [source for source in selected if source.source_id not in demo_ids or self._is_current_demo_source(source, today, week_start)]
-        actionable = {"email-card-bill", "email-manager-report", "doc-headphones-warranty", "event-design-review", "email-canva-renewal"}
+        actionable = set() if connected else {"email-card-bill", "email-manager-report", "doc-headphones-warranty", "event-design-review", "email-canva-renewal"}
         return selected, [self._card_for(source) for source in selected if source.source_id in actionable]
 
     def _card_for(self, source: Source) -> ActionCard:

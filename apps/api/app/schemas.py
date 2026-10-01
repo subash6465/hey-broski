@@ -61,3 +61,34 @@ class DocumentRecord(BaseModel):
     size_bytes: int
     created_at: str
     preview: str
+
+
+class OwnerProfileInput(BaseModel):
+    first_name: str = Field(min_length=1, max_length=80)
+    last_name: str = Field(min_length=1, max_length=80)
+    age: int = Field(ge=1, le=120)
+    phone_number: str = Field(min_length=5, max_length=32)
+    gender: str = Field(min_length=1, max_length=80)
+    time_zone: str = Field(min_length=1, max_length=80)
+
+    @field_validator("first_name", "last_name", "phone_number", "gender", "time_zone")
+    @classmethod
+    def strip_required(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("This field is required")
+        return value
+
+
+class GmailClientInput(BaseModel):
+    credentials: dict[str, Any]
+
+
+class OutlookClientInput(BaseModel):
+    client_id: str = Field(min_length=36, max_length=36)
+
+
+class SyncPreferencesInput(BaseModel):
+    history_months: Literal[3, 6, 12, 24] = 12
+    interval_hours: Literal[1, 6, 12, 24] = 24
+    include_sent: bool = True

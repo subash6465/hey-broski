@@ -67,6 +67,13 @@ class Repository:
         CREATE TABLE IF NOT EXISTS document_chunks (document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE, chunk_index INTEGER NOT NULL, content TEXT NOT NULL, PRIMARY KEY(document_id, chunk_index));
         CREATE TABLE IF NOT EXISTS reminders (id TEXT PRIMARY KEY, action_id TEXT NOT NULL UNIQUE REFERENCES actions(id) ON DELETE CASCADE, title TEXT NOT NULL, due_at TEXT, created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS audit_log (id TEXT PRIMARY KEY, event_type TEXT NOT NULL, entity_id TEXT, details TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS owner_profile (id INTEGER PRIMARY KEY CHECK (id = 1), first_name TEXT NOT NULL, last_name TEXT NOT NULL, age INTEGER NOT NULL, phone_number TEXT NOT NULL, gender TEXT NOT NULL, time_zone TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS connected_accounts (id TEXT PRIMARY KEY, provider TEXT NOT NULL, email TEXT NOT NULL, display_name TEXT NOT NULL, status TEXT NOT NULL, connected_at TEXT NOT NULL, last_synced_at TEXT, sync_error TEXT, UNIQUE(provider, email));
+        CREATE TABLE IF NOT EXISTS oauth_attempts (state TEXT PRIMARY KEY, provider TEXT NOT NULL, code_verifier TEXT NOT NULL, expires_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS sync_preferences (account_id TEXT PRIMARY KEY REFERENCES connected_accounts(id) ON DELETE CASCADE, history_months INTEGER NOT NULL, interval_hours INTEGER NOT NULL, include_sent INTEGER NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS mail_sources (provider TEXT NOT NULL, account_id TEXT NOT NULL REFERENCES connected_accounts(id) ON DELETE CASCADE, message_id TEXT NOT NULL, title TEXT NOT NULL, snippet TEXT NOT NULL, sent_at TEXT NOT NULL, sender TEXT NOT NULL, folder TEXT NOT NULL, PRIMARY KEY(account_id, message_id));
+        CREATE TABLE IF NOT EXISTS sync_jobs (account_id TEXT PRIMARY KEY REFERENCES connected_accounts(id) ON DELETE CASCADE, status TEXT NOT NULL, processed_count INTEGER NOT NULL DEFAULT 0, page_token TEXT, started_at TEXT NOT NULL, updated_at TEXT NOT NULL, error TEXT);
+        CREATE INDEX IF NOT EXISTS idx_mail_sources_account_date ON mail_sources(account_id, sent_at);
         """
         with self._lock, self.connect() as connection:
             connection.executescript(schema)
@@ -191,8 +198,14 @@ class Repository:
 
     def list_actions(self, status: str | None = None) -> list[dict[str, Any]]:
         query, params = "SELECT * FROM actions", ()
+        clauses = []
         if status:
-            query, params = query + " WHERE status = ?", (status,)
+            clauses.append("status = ?")
+            params = (status,)
+        if self.list_accounts():
+            clauses.append("id NOT IN ('action_email-card-bill', 'action_email-manager-report', 'action_doc-headphones-warranty', 'action_event-design-review', 'action_email-canva-renewal')")
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
         with self.connect() as connection:
             rows = connection.execute(query + " ORDER BY created_at DESC", params).fetchall()
         return [self._decode_action(row) for row in rows]
@@ -300,3 +313,124 @@ class Repository:
         with self.connect() as connection:
             rows = connection.execute("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 100").fetchall()
         return [{**dict(row), "details": json.loads(row["details"])} for row in rows]
+
+    def get_profile(self) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM owner_profile WHERE id = 1").fetchone()
+        return dict(row) if row else None
+
+    def save_profile(self, profile: dict[str, Any]) -> dict[str, Any]:
+        with self._lock, self.connect() as connection:
+            connection.execute("""INSERT INTO owner_profile VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET first_name=excluded.first_name, last_name=excluded.last_name,
+                age=excluded.age, phone_number=excluded.phone_number, gender=excluded.gender,
+                time_zone=excluded.time_zone, updated_at=excluded.updated_at""",
+                (profile["first_name"], profile["last_name"], profile["age"], profile["phone_number"], profile["gender"], profile["time_zone"], now_iso()))
+        return self.get_profile() or profile
+
+    def create_oauth_attempt(self, state: str, provider: str, verifier: str, expires_at: str) -> None:
+        with self._lock, self.connect() as connection:
+            connection.execute("INSERT INTO oauth_attempts VALUES (?, ?, ?, ?)", (state, provider, verifier, expires_at))
+
+    def consume_oauth_attempt(self, state: str, provider: str) -> dict[str, Any] | None:
+        with self._lock, self.connect() as connection:
+            row = connection.execute("SELECT * FROM oauth_attempts WHERE state = ? AND provider = ?", (state, provider)).fetchone()
+            if row:
+                connection.execute("DELETE FROM oauth_attempts WHERE state = ?", (state,))
+        return dict(row) if row and row["expires_at"] > now_iso() else None
+
+    def upsert_account(self, provider: str, email: str, display_name: str) -> dict[str, Any]:
+        account_id = f"{provider}_{uuid4().hex}"
+        with self._lock, self.connect() as connection:
+            connection.execute("""INSERT INTO connected_accounts (id, provider, email, display_name, status, connected_at)
+                VALUES (?, ?, ?, ?, 'connected', ?) ON CONFLICT(provider, email) DO UPDATE SET
+                display_name=excluded.display_name, status='connected', sync_error=NULL""",
+                (account_id, provider, email.lower(), display_name, now_iso()))
+            row = connection.execute("SELECT * FROM connected_accounts WHERE provider = ? AND email = ?", (provider, email.lower())).fetchone()
+        return dict(row)
+
+    def list_accounts(self) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute("SELECT * FROM connected_accounts ORDER BY connected_at").fetchall()
+        return [dict(row) for row in rows]
+
+    def get_account(self, account_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM connected_accounts WHERE id = ?", (account_id,)).fetchone()
+        return dict(row) if row else None
+
+    def delete_account(self, account_id: str) -> bool:
+        with self._lock, self.connect() as connection:
+            related = {row["id"] for row in connection.execute("SELECT id, sources FROM actions")
+                if any(source.get("source_id", "").startswith(f"{account_id}:") for source in json.loads(row["sources"]))}
+            for action_id in related:
+                connection.execute("DELETE FROM actions WHERE id=?", (action_id,))
+            self._remove_action_cards(connection, related)
+            return connection.execute("DELETE FROM connected_accounts WHERE id = ?", (account_id,)).rowcount > 0
+
+    def save_sync_preferences(self, account_id: str, history_months: int, interval_hours: int, include_sent: bool) -> dict[str, Any]:
+        with self._lock, self.connect() as connection:
+            connection.execute("""INSERT INTO sync_preferences VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(account_id) DO UPDATE SET history_months=excluded.history_months,
+                interval_hours=excluded.interval_hours, include_sent=excluded.include_sent, updated_at=excluded.updated_at""",
+                (account_id, history_months, interval_hours, int(include_sent), now_iso()))
+        return self.get_sync_preferences(account_id) or {}
+
+    def get_sync_preferences(self, account_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM sync_preferences WHERE account_id = ?", (account_id,)).fetchone()
+        return dict(row) if row else None
+
+    def onboarding_status(self) -> dict[str, Any]:
+        accounts = self.list_accounts()
+        preferences = {item["id"]: self.get_sync_preferences(item["id"]) for item in accounts}
+        jobs = {item["id"]: self.get_sync_job(item["id"]) for item in accounts}
+        imported = bool(accounts) and all(preferences.values()) and all(item["last_synced_at"] for item in accounts)
+        return {"profile": self.get_profile(), "accounts": accounts, "sync_preferences": preferences,
+                "sync_jobs": jobs, "ready": bool(self.get_profile()) and imported}
+
+    def upsert_mail_source(self, account_id: str, provider: str, message_id: str, title: str, snippet: str, sent_at: str, sender: str, folder: str) -> None:
+        with self._lock, self.connect() as connection:
+            connection.execute("""INSERT INTO mail_sources VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id, message_id) DO UPDATE SET title=excluded.title, snippet=excluded.snippet,
+                sent_at=excluded.sent_at, sender=excluded.sender, folder=excluded.folder""",
+                (provider, account_id, message_id, title, snippet, sent_at, sender, folder))
+
+    def search_mail_sources(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
+        words = [word for word in re.findall(r"[a-z0-9]{3,}", query.lower()) if word not in {"what", "when", "show", "about", "needs", "attention", "with", "this", "week", "today", "email", "inbox", "please", "find", "from", "waiting", "follow", "reply", "recent", "important"}]
+        with self.connect() as connection:
+            rows = connection.execute("""SELECT m.*, a.display_name, a.email FROM mail_sources m JOIN connected_accounts a ON a.id=m.account_id ORDER BY sent_at DESC LIMIT 300""").fetchall()
+        scored = [(sum(word in (row["title"] + " " + row["snippet"] + " " + row["sender"]).lower() for word in words), dict(row)) for row in rows]
+        return [row for score, row in sorted(scored, key=lambda item: (item[0], item[1]["sent_at"]), reverse=True) if score or not words][:limit]
+
+    def start_sync_job(self, account_id: str) -> None:
+        with self._lock, self.connect() as connection:
+            connection.execute("""INSERT INTO sync_jobs VALUES (?, 'running', 0, NULL, ?, ?, NULL)
+                ON CONFLICT(account_id) DO UPDATE SET status='running', error=NULL, updated_at=excluded.updated_at,
+                processed_count=CASE WHEN sync_jobs.status='complete' THEN 0 ELSE sync_jobs.processed_count END""",
+                (account_id, now_iso(), now_iso()))
+
+    def reset_sync_job(self, account_id: str) -> None:
+        with self._lock, self.connect() as connection:
+            related = {row["id"] for row in connection.execute("SELECT id, sources FROM actions")
+                if any(source.get("source_id", "").startswith(f"{account_id}:") for source in json.loads(row["sources"]))}
+            for action_id in related:
+                connection.execute("DELETE FROM actions WHERE id=?", (action_id,))
+            self._remove_action_cards(connection, related)
+            connection.execute("DELETE FROM mail_sources WHERE account_id=?", (account_id,))
+            connection.execute("DELETE FROM sync_jobs WHERE account_id=?", (account_id,))
+            connection.execute("UPDATE connected_accounts SET last_synced_at=NULL, sync_error=NULL WHERE id=?", (account_id,))
+
+    def update_sync_job(self, account_id: str, status: str, page_token: str | None = None, increment: int = 0, error: str | None = None) -> None:
+        with self._lock, self.connect() as connection:
+            connection.execute("""UPDATE sync_jobs SET status=?, page_token=?, processed_count=processed_count+?, updated_at=?, error=? WHERE account_id=?""",
+                (status, page_token, increment, now_iso(), error, account_id))
+            if status == "complete":
+                connection.execute("UPDATE connected_accounts SET last_synced_at=?, sync_error=NULL WHERE id=?", (now_iso(), account_id))
+            elif status == "failed":
+                connection.execute("UPDATE connected_accounts SET sync_error=? WHERE id=?", (error, account_id))
+
+    def get_sync_job(self, account_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM sync_jobs WHERE account_id=?", (account_id,)).fetchone()
+        return dict(row) if row else None

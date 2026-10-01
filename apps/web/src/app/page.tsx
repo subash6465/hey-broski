@@ -13,6 +13,8 @@ import {
   Menu,
   MessageCircle,
   MessageSquarePlus,
+  Mail,
+  RefreshCw,
   History,
   Paperclip,
   Send,
@@ -23,10 +25,11 @@ import {
 } from 'lucide-react'
 import { ActionCardView } from '@/components/ActionCardView'
 import { LocalDateTime } from '@/components/LocalDateTime'
+import { Onboarding, type OnboardingState } from '@/components/Onboarding'
 import { request, streamChat, type ChatStreamEvent } from '@/lib/api'
 import type { ActionCard, ChatMessage, ChatSession, DocumentRecord, Source, StoredMessage } from '@/lib/types'
 
-type View = 'desk' | 'chat' | 'actions' | 'vault' | 'history'
+type View = 'desk' | 'chat' | 'actions' | 'vault' | 'history' | 'accounts'
 type DeleteTarget = { kind: 'conversation' | 'document'; id: string; label: string }
 type Health = { status: string; mode: string; inference_enabled: boolean; services: { database: string; ollama: string }; model: string }
 
@@ -42,6 +45,15 @@ const welcome: ChatMessage = {
 }
 
 export default function Home() {
+  const [onboarding, setOnboarding] = useState<OnboardingState | null>()
+  const [showSetup, setShowSetup] = useState(() => typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('setup'))
+  const [setupStep, setSetupStep] = useState<'profile' | 'connections' | 'sync'>(() => {
+    if (typeof window === 'undefined') return 'connections'
+    const requested = new URLSearchParams(window.location.search).get('setup')
+    return requested === 'profile' || requested === 'sync' ? requested : 'connections'
+  })
+  const [accountJobs, setAccountJobs] = useState<Record<string, { status: string; processed_count: number; error: string | null } | null>>({})
+  const [accountBusy, setAccountBusy] = useState<string>()
   const [view, setView] = useState<View>('desk')
   const [mobileNav, setMobileNav] = useState(false)
   const [sessionId, setSessionId] = useState<string>()
@@ -61,6 +73,28 @@ export default function Home() {
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget>()
   const [deleting, setDeleting] = useState(false)
   const bottom = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    void request<OnboardingState>('/api/onboarding').then(setOnboarding).catch(() => setOnboarding(null))
+  }, [])
+
+  useEffect(() => {
+    if (!onboarding?.ready || showSetup) return
+    async function pollAccounts() {
+      try {
+        const result = await request<{ accounts: OnboardingState['accounts'] }>('/api/accounts')
+        setOnboarding(current => current ? { ...current, accounts: result.accounts } : current)
+        const entries = await Promise.all(result.accounts.map(async account => {
+          const status = await request<{ job: { status: string; processed_count: number; error: string | null } | null }>(`/api/accounts/${account.id}/sync`)
+          return [account.id, status.job] as const
+        }))
+        setAccountJobs(Object.fromEntries(entries))
+      } catch { /* Account status is advisory; the workspace remains usable. */ }
+    }
+    void pollAccounts()
+    const interval = window.setInterval(() => void pollAccounts(), 12_000)
+    return () => window.clearInterval(interval)
+  }, [onboarding?.ready, showSetup])
 
   useEffect(() => {
     async function initialize() {
@@ -269,9 +303,34 @@ export default function Home() {
     }
   }
 
+  async function syncAccount(id: string) {
+    setAccountBusy(id)
+    try {
+      await request(`/api/accounts/${id}/sync`, { method: 'POST' })
+      setNotice('Mailbox sync started.')
+    } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not start sync') }
+    finally { setAccountBusy(undefined) }
+  }
+
+  async function disconnectAccount(id: string) {
+    if (!window.confirm('Disconnect this mailbox and remove its imported mail and pending actions? Existing conversations may still contain saved answers and source excerpts; delete those conversations separately if needed.')) return
+    setAccountBusy(id)
+    try {
+      await request(`/api/accounts/${id}`, { method: 'DELETE' })
+      const next = await request<OnboardingState>('/api/onboarding')
+      setOnboarding(next)
+      if (!next.ready) { setSetupStep('connections'); setShowSetup(true) }
+    } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not disconnect mailbox') }
+    finally { setAccountBusy(undefined) }
+  }
+
   const pendingCount = actions.filter((action) => action.status === 'pending').length
   const pendingActions = actions.filter((action) => action.status === 'pending')
   const firstAction = pendingActions[0]
+
+  if (onboarding === undefined) return <div className="onboarding-shell"><div className="onboarding-header"><div className="onboarding-brand"><Sparkles size={21} /> hey broski<span>.</span></div></div><p>Opening your local workspace…</p></div>
+  if (onboarding === null) return <div className="onboarding-shell"><div className="onboarding-card"><h1>Could not open setup</h1><p>Check that the local API is running, then reload this page.</p><button className="onboarding-primary" onClick={() => window.location.reload()}>Retry</button></div></div>
+  if (!onboarding.ready || showSetup) return <Onboarding initial={onboarding} initialStep={showSetup && onboarding.profile ? setupStep : undefined} onComplete={next => { setOnboarding(next); setShowSetup(false); window.history.replaceState({}, '', '/') }} />
 
   return (
     <div className="app-shell">
@@ -284,6 +343,7 @@ export default function Home() {
           <NavButton icon={<MessageCircle />} label="Chat" active={view === 'chat'} onClick={() => void switchView('chat')} />
           <NavButton icon={<CheckCircle2 />} label="To review" count={pendingCount} active={view === 'actions'} onClick={() => void switchView('actions')} />
           <NavButton icon={<BookOpen />} label="Library" active={view === 'vault'} onClick={() => void switchView('vault')} />
+          <NavButton icon={<Mail />} label="Accounts" active={view === 'accounts'} onClick={() => void switchView('accounts')} />
         </nav>
         <button className="new-chat" onClick={newConversation} disabled={busy}><MessageSquarePlus size={16} /> New conversation</button>
         <button className={`history-link ${view === 'history' ? 'active' : ''}`} onClick={() => void switchView('history')}><History size={16} /> History</button>
@@ -297,7 +357,7 @@ export default function Home() {
         <header className="topbar">
           <div className="topbar-path"><span>{viewTitles[view]}</span><span className="path-divider">/</span>{view === 'desk' ? <LocalDateTime /> : <span>HEY BROSKI</span>}</div>
           <div className="status-cluster">
-            <span className="mode-badge"><span className="status-dot" /> {!health ? 'Connecting...' : health.mode === 'demo' ? 'Demo mode' : 'Local workspace'}</span>
+            <span className="mode-badge"><span className="status-dot" /> {!health ? 'Connecting...' : onboarding.accounts.length ? `${onboarding.accounts.length} connected` : 'Local workspace'}</span>
             <span className="model-label">{!health ? 'Checking local model' : !health.inference_enabled ? 'Local model disabled' : health.services.ollama === 'available' ? `Local model: ${health.model}` : health.services.ollama.startsWith('model_missing:') ? `Model not ready: ${health.model}` : 'Local model offline'}</span>
           </div>
         </header>
@@ -305,7 +365,8 @@ export default function Home() {
         {notice && <div className="notice-banner" role="status"><span>{notice}</span><button onClick={() => setNotice(undefined)}><X size={16} /></button></div>}
 
         {view === 'desk' && <section className="desk" aria-label="My desk">
-          <div className="desk-intro"><p className="section-label">A LITTLE CLARITY FOR TODAY</p><h1>Hey, {health?.mode === 'demo' ? 'Subash' : 'there'} <Sparkles aria-hidden="true" /></h1><p>Here&apos;s what&apos;s worth a look. The rest can wait.</p></div>
+          <div className="desk-intro"><p className="section-label">A LITTLE CLARITY FOR TODAY</p><h1>Hey, {onboarding.profile?.first_name ?? 'there'} <Sparkles aria-hidden="true" /></h1><p>Here&apos;s what&apos;s worth a look. The rest can wait.</p></div>
+          {onboarding.accounts.some(account => !account.last_synced_at || accountJobs[account.id]?.status === 'running') && <div className="sync-banner"><RefreshCw size={16} /><span>Importing your mail in the background. Answers may be incomplete until sync finishes.</span><button onClick={() => void switchView('accounts')}>View progress</button></div>}
           <div className="desk-cards">
             <section className="glass-card brief-card" aria-label="Your brief"><div className="card-kicker"><span>YOUR BRIEF</span><span>01 / 02</span></div><h2>Today, at a glance.</h2>
               {pendingActions.length ? pendingActions.slice(0, 2).map((action) => <button className="brief-row" type="button" key={action.id} onClick={() => void switchView('actions')}><span className="brief-icon"><ArrowUpRight size={15} /></span><span className="brief-copy"><strong>{action.title}</strong><small>{action.description}</small></span><span className="brief-source">{action.source_refs[0]?.source_type ?? 'ACTION'}</span></button>) : <><button className="brief-row" type="button" onClick={() => void sendMessage(undefined, 'Who is waiting on me?')}><span className="brief-icon"><ArrowUpRight size={15} /></span><span className="brief-copy"><strong>Find follow-ups</strong><small>Ask who is waiting on you</small></span><span className="brief-source">ASK</span></button><button className="brief-row" type="button" onClick={() => void sendMessage(undefined, 'Show upcoming renewals and deadlines')}><span className="brief-icon"><Clock3 size={15} /></span><span className="brief-copy"><strong>Check upcoming dates</strong><small>Look for renewals and deadlines</small></span><span className="brief-source">ASK</span></button></>}
@@ -346,13 +407,14 @@ export default function Home() {
         {view === 'actions' && <Collection eyebrow="TO REVIEW" title={pendingCount === 1 ? '1 item needs a decision' : `${pendingCount} items need a decision`} subtitle="Review every proposed action before anything changes.">{actions.length ? actions.map((card) => <ActionCardView key={card.id} card={card} busy={decisionBusy === card.id} onDecision={decide} />) : <Empty text="Ask for your daily brief to generate action cards." />}</Collection>}
         {view === 'vault' && <Collection eyebrow="YOUR LIBRARY" title="Your local documents" subtitle="PDF, text, Markdown, and CSV files are searchable from chat."><label className="upload-card"><Upload size={22} /><strong>{uploading ? 'Uploading…' : 'Upload a document'}</strong><span>Maximum 10 MB</span><input type="file" disabled={uploading} accept=".pdf,.txt,.md,.csv" onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ''; void upload(file) }} /></label>{documents.map((doc) => <article className="document-card" key={doc.id}><FileText /><div><strong>{doc.filename}</strong><span>{Math.ceil(doc.size_bytes / 1024)} KB · {new Date(doc.created_at).toLocaleDateString()}</span><p>{doc.preview}</p><div className="document-actions"><button type="button" onClick={() => { setInput(`What does ${doc.filename} say about `); setView('chat') }}>Ask about this file</button><button type="button" className="delete-button" disabled={busy || uploading || deleting} onClick={() => setDeleteTarget({ kind: 'document', id: doc.id, label: doc.filename })}><Trash2 size={14} /> Delete</button></div></div></article>)}</Collection>}
         {view === 'history' && <Collection eyebrow="PAST CONVERSATIONS" title="Conversation history" subtitle="Your conversations are saved locally and can be reopened anytime.">{sessions.length ? sessions.map((session) => <div className="history-row" key={session.session_id}><button className="history-card" disabled={busy || deleting} onClick={() => void openConversation(session.session_id)}><strong>{session.title}</strong><span>{new Date(session.updated_at).toLocaleString()}</span><ChevronRight size={17} /></button><button className="history-delete delete-button" type="button" disabled={busy || deleting} onClick={() => setDeleteTarget({ kind: 'conversation', id: session.session_id, label: session.title })} aria-label={`Delete conversation ${session.title}`}><Trash2 size={16} /> Delete</button></div>) : <Empty text="Your conversations will appear here after you send a message." />}</Collection>}
+        {view === 'accounts' && <Collection eyebrow="CONNECTED MAIL" title="Your accounts" subtitle="Your mail is imported and stored on this computer. Manage each connection and its sync here."><button className="account-add" onClick={() => { window.history.replaceState({}, '', '/?setup=connections'); setSetupStep('connections'); setShowSetup(true) }}>Connect another account <ArrowUpRight size={16} /></button><button className="account-add" onClick={() => { window.history.replaceState({}, '', '/?setup=sync'); setSetupStep('sync'); setShowSetup(true) }} disabled={onboarding.accounts.some(account => accountJobs[account.id]?.status === 'running')}>Change import and sync settings <ArrowUpRight size={16} /></button><button className="account-add" onClick={() => { window.history.replaceState({}, '', '/?setup=profile'); setSetupStep('profile'); setShowSetup(true) }}>Edit profile <ArrowUpRight size={16} /></button>{onboarding.accounts.map(account => <article className="account-card" key={account.id}><span className="provider-mark"><Mail size={20} /></span><div><strong>{account.display_name}</strong><p>{account.email} · {account.provider === 'gmail' ? 'Gmail' : 'Outlook'}</p><small>{accountJobs[account.id]?.status === 'running' ? `Importing · ${accountJobs[account.id]?.processed_count ?? 0} messages checked` : accountJobs[account.id]?.status === 'failed' ? `Sync needs attention: ${accountJobs[account.id]?.error}` : account.last_synced_at ? `Last synced ${new Date(account.last_synced_at).toLocaleString()}` : 'Waiting to import'}</small><div className="account-buttons"><button onClick={() => void syncAccount(account.id)} disabled={accountBusy === account.id || accountJobs[account.id]?.status === 'running'}><RefreshCw size={14} /> Sync now</button><button onClick={() => void disconnectAccount(account.id)} disabled={accountBusy === account.id || accountJobs[account.id]?.status === 'running'}>Disconnect</button></div></div></article>)}</Collection>}
       </main>
       {deleteTarget && <div className="confirm-backdrop" onClick={(event) => { if (event.target === event.currentTarget && !deleting) setDeleteTarget(undefined) }}><div className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-title" aria-describedby="delete-description" onKeyDown={(event) => { if (event.key === 'Escape' && !deleting) setDeleteTarget(undefined) }}><h2 id="delete-title">Delete {deleteTarget.kind}?</h2><p id="delete-description"><strong>{deleteTarget.label}</strong> {deleteTarget.kind === 'document' ? 'and its searchable text will be removed from the local vault. Future chats cannot retrieve it, but existing conversations and their saved source excerpts will remain.' : 'and its messages, related actions, and reminders will be permanently removed.'} This cannot be undone.</p><div className="confirm-actions"><button type="button" autoFocus disabled={deleting} onClick={() => setDeleteTarget(undefined)}>Cancel</button><button type="button" className="confirm-delete" disabled={deleting} onClick={() => void confirmDelete()}>{deleting ? 'Deleting…' : 'Delete permanently'}</button></div></div></div>}
     </div>
   )
 }
 
-const viewTitles: Record<View, string> = { desk: 'MY DESK', chat: 'CHAT', actions: 'TO REVIEW', vault: 'LIBRARY', history: 'HISTORY' }
+const viewTitles: Record<View, string> = { desk: 'MY DESK', chat: 'CHAT', actions: 'TO REVIEW', vault: 'LIBRARY', history: 'HISTORY', accounts: 'ACCOUNTS' }
 
 function toChatMessage(message: StoredMessage): ChatMessage {
   return {

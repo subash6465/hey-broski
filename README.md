@@ -1,10 +1,12 @@
 # Hey Broski
 
-Hey Broski is a local-first personal admin copilot. It turns email, calendar, and document context into a grounded daily brief and explicit action proposals. Demo mode supplies sample data without connected accounts; chat answers still require a local model.
+Hey Broski is a local-first personal admin copilot. First-time setup collects a local profile, connects at least one read-only Gmail or Outlook mailbox, and lets the owner choose an import window and sync interval before entering the workspace. Chat answers still require a local Ollama model.
 
 ## What works today
 
-- Grounded chat over demo or uploaded data for attention summaries, follow-ups, renewals, and calendar conflicts
+- Grounded chat over imported mail and uploaded documents; legacy demo fixtures remain for API tests but are not used once an account is connected
+- Gmail and Outlook OAuth connection, mailbox verification, background import, and configurable polling sync
+- Local profile with name, age, phone number, gender, and machine-detected time zone
 - Answers generated only by a local Ollama `qwen3:4b-instruct` model; inference errors are reported rather than replaced with canned text
 - Persistent SQLite conversations, action cards, documents, and internal safety events
 - Approval and dismissal workflow—no proposal executes silently
@@ -14,7 +16,19 @@ Hey Broski is a local-first personal admin copilot. It turns email, calendar, an
 
 The current UI is a local React chat shell rather than hosted ChatKit. The current ChatKit session API expects an OpenAI workflow and returns an OpenAI client secret, which conflicts with this project's zero-paid-API and local-inference rules. The backend contracts are kept separate so a future fully self-hosted ChatKit adapter can replace the shell without changing the domain services.
 
-Gmail, Outlook, calendar sync, semantic vector search, and live n8n workflow execution remain planned integrations. The UI does not pretend they are connected.
+Calendar sync, semantic vector search, and live n8n workflow execution remain planned. Imported mail can produce reminder proposals when it contains an explicit due or renewal date in day-month-year format. More general commitment extraction remains planned.
+
+## First-time setup and connected mail
+
+Run the API and web app on your own computer using the instructions below, then open `http://localhost:3000`. Setup runs in three steps: profile, mail connection, and import/sync choices. The time zone is read from the browser's machine settings; it is not requested as a preference. A successfully verified Gmail or Outlook account and a completed first import are required to enter the workspace. Setup shows import progress and retry; the Accounts view shows later syncs, errors, manual sync, disconnect, and a way to change settings.
+
+For Gmail, the owner must create a Google Cloud project, enable the Gmail API, configure OAuth consent, and download a **Desktop app** OAuth client JSON. Import that JSON in the Gmail card. Hey Broski then opens Google sign-in and verifies `gmail.readonly` with a profile and one-message list request. The JSON is not a mailbox password or an access token. Google's [Python quickstart](https://developers.google.com/workspace/gmail/api/quickstart/python) documents the Cloud setup. An external Google app left in Testing can issue refresh tokens that expire after seven days for Gmail access; reconnect when prompted, or review Google's publishing rules for personal use.
+
+For Outlook, setup accepts a Microsoft Entra **Application (client) ID** for a public/mobile-desktop registration. Register `http://localhost:8000/api/accounts/outlook/callback` as the redirect URI and request delegated `Mail.Read`, `User.Read`, and `offline_access`. Alternatively, the app owner can set `MICROSOFT_CLIENT_ID` in `.env` to offer direct sign-in. Work accounts can require administrator approval. The Microsoft card links to registration instructions.
+
+Provider access tokens and imported OAuth client details are encrypted locally outside SQLite. On Windows, the encryption key is stored in the OS credential store when available; otherwise `vault.key` in `.hey-broski/` is used. For a backup, keep `credentials.enc.json`, `vault.key` when present, and the SQLite database together; an OS-stored key may require reconnecting accounts after moving to a different machine. Do not commit any of these files. Disconnect removes that account's tokens, imported mail, and generated pending actions. Existing conversation answers and saved source excerpts remain until their conversations are deleted.
+
+OAuth redirects currently target `localhost:8000` and require the browser and API to run on the same computer. Codespaces can still run the demo, but real account connection needs a separately configured public callback before it can work from a remote browser.
 
 ## Run locally on Windows (no Docker)
 
@@ -55,7 +69,7 @@ Install [Python 3.11+](https://www.python.org/downloads/), [Node.js 20.9+](https
    npm --prefix apps/web run dev
    ```
 
-Open http://localhost:3000. Check http://localhost:8000/api/health: `services.ollama` should be `available`. On later runs, keep Ollama running and repeat only steps 4 and 5. Stop each foreground server with Ctrl+C. n8n is not needed for the current demo chat, upload, and action inbox; the Compose setup below includes it.
+Open http://localhost:3000. Check http://localhost:8000/api/health: `services.ollama` should be `available`. On later runs, keep Ollama running and repeat only steps 4 and 5. Stop each foreground server with Ctrl+C. n8n is not needed for onboarding or mail import; the Compose setup below includes it.
 
 Chat displays a short source-checking status while the local model prepares an answer; it never displays the model's private reasoning. Completed turns are stored in SQLite with a conversation ID, a shared turn ID, separate user/assistant message IDs, source metadata, timestamps, and response time. Use **Conversation history** or the recent-chat list to reopen them; **New conversation** no longer discards past chats.
 
@@ -75,7 +89,7 @@ docker compose up -d --build
 docker compose logs -f ollama-model
 ```
 
-If you already have `.env`, do not copy over it; update `HEYBROSKI_CHAT_MODEL=qwen3:4b-instruct` and `OLLAMA_NUM_PREDICT=768`, then use `docker compose up -d --build`. The `ollama-model` service downloads the configured model on its first start. Exit the log view with Ctrl+C; the containers keep running. Forward port 3000 in Codespaces and open the forwarded web URL. Port 8000 serves the API and port 5678 serves n8n.
+If you already have `.env`, do not copy over it; update `HEYBROSKI_CHAT_MODEL=qwen3:4b-instruct` and `OLLAMA_NUM_PREDICT=768`, then use `docker compose up -d --build`. The `ollama-model` service downloads the configured model on its first start. Exit the log view with Ctrl+C; the containers keep running. Forward port 3000 in Codespaces and open the forwarded web URL. Port 8000 serves the API and port 5678 serves n8n. First-time mailbox connection currently requires a browser on the same computer as the API, so a fresh Codespace cannot complete onboarding without a supported remote OAuth callback implementation.
 
 Compose overrides the native URLs in `.env` inside its containers: web reaches the API through `host.docker.internal:8000`, and the API reaches Ollama through `host.docker.internal:11434`. Do not change `.env` back and forth between local Windows and Codespaces. This host-gateway routing also handles Codespaces environments where sibling-container bridge traffic is filtered.
 
@@ -123,7 +137,7 @@ Data defaults to `.hey-broski/` locally and `/data/heybroski` in Docker. The Doc
 - Suggested writes become pending action cards.
 - A user must approve or dismiss each card.
 - Decisions and uploads retain internal safety records; the UI shows conversation history instead of an audit-log page.
-- OAuth credentials are not implemented yet; no token is stored by this MVP.
+- OAuth credentials are encrypted in a device-local vault; read-only scopes are requested for both mail providers.
 - Never commit `.env` or the `.hey-broski/` directory.
 
 Approval currently creates a persisted local reminder and records its result before reporting completion. Live email/calendar/n8n adapters must keep the same policy boundary and mark an action complete only after a confirmed tool result.
@@ -144,6 +158,11 @@ Important variables are documented in `.env.example`:
 
 ## API surface
 
+- `GET /api/onboarding`, `PUT /api/profile`
+- `POST /api/accounts/gmail/client`, `POST /api/accounts/outlook/client`
+- `POST /api/accounts/{gmail|outlook}/start`, `GET /api/accounts/{gmail|outlook}/callback`
+- `GET /api/accounts`, `DELETE /api/accounts/{id}`
+- `PUT /api/accounts/{id}/sync-preferences`, `GET/POST /api/accounts/{id}/sync`
 - `GET /api/health`
 - `POST/GET /api/chat/sessions`
 - `POST /api/chat/sessions/{id}/messages`
@@ -161,11 +180,11 @@ Interactive request and response schemas are at `/docs`.
 
 ## Roadmap
 
-1. Encrypted OAuth token storage and Gmail/Outlook read sync
-2. Google and Microsoft calendar conflict detection
+1. Live Gmail and Outlook account smoke tests with real owner credentials
+2. More complete mail fact extraction, calendar conflict detection, and reply tracking
 3. Embeddings and LanceDB for semantic document retrieval
 4. Approved n8n workflow execution with idempotency keys
-5. Background synchronization and connector health reporting
+5. Incremental provider cursors and richer connector health reporting
 6. Playwright coverage for the full browser flow
 
 See `plan.md` for the product vision and complete scope.

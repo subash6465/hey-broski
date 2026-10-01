@@ -4,6 +4,7 @@ import '@fontsource-variable/manrope/wght.css'
 import '@fontsource/dm-mono/400.css'
 import './globals.css'
 import './glass.css'
+import './onboarding.css'
 
 export const metadata: Metadata = {
   title: 'Hey Broski',
