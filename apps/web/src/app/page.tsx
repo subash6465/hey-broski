@@ -330,7 +330,7 @@ export default function Home() {
 
   if (onboarding === undefined) return <div className="onboarding-shell"><div className="onboarding-header"><div className="onboarding-brand"><Sparkles size={21} /> hey broski<span>.</span></div></div><p>Opening your local workspace…</p></div>
   if (onboarding === null) return <div className="onboarding-shell"><div className="onboarding-card"><h1>Could not open setup</h1><p>Check that the local API is running, then reload this page.</p><button className="onboarding-primary" onClick={() => window.location.reload()}>Retry</button></div></div>
-  if (!onboarding.ready || showSetup) return <Onboarding initial={onboarding} initialStep={showSetup && onboarding.profile ? setupStep : undefined} onComplete={next => { setOnboarding(next); setShowSetup(false); window.history.replaceState({}, '', '/') }} />
+  if (!onboarding.ready || showSetup) return <Onboarding initial={onboarding} initialStep={showSetup && onboarding.profile_complete ? setupStep : undefined} onComplete={next => { setOnboarding(next); setShowSetup(false); window.history.replaceState({}, '', '/') }} />
 
   return (
     <div className="app-shell">

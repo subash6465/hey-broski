@@ -5,11 +5,12 @@ import re
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 def now_iso() -> str:
@@ -67,7 +68,7 @@ class Repository:
         CREATE TABLE IF NOT EXISTS document_chunks (document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE, chunk_index INTEGER NOT NULL, content TEXT NOT NULL, PRIMARY KEY(document_id, chunk_index));
         CREATE TABLE IF NOT EXISTS reminders (id TEXT PRIMARY KEY, action_id TEXT NOT NULL UNIQUE REFERENCES actions(id) ON DELETE CASCADE, title TEXT NOT NULL, due_at TEXT, created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS audit_log (id TEXT PRIMARY KEY, event_type TEXT NOT NULL, entity_id TEXT, details TEXT NOT NULL, created_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS owner_profile (id INTEGER PRIMARY KEY CHECK (id = 1), first_name TEXT NOT NULL, last_name TEXT NOT NULL, age INTEGER NOT NULL, phone_number TEXT NOT NULL, gender TEXT NOT NULL, time_zone TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS owner_profile (id INTEGER PRIMARY KEY CHECK (id = 1), first_name TEXT NOT NULL, last_name TEXT NOT NULL, age INTEGER NOT NULL, phone_number TEXT NOT NULL, gender TEXT NOT NULL, time_zone TEXT NOT NULL, updated_at TEXT NOT NULL, date_of_birth TEXT, country_code TEXT);
         CREATE TABLE IF NOT EXISTS connected_accounts (id TEXT PRIMARY KEY, provider TEXT NOT NULL, email TEXT NOT NULL, display_name TEXT NOT NULL, status TEXT NOT NULL, connected_at TEXT NOT NULL, last_synced_at TEXT, sync_error TEXT, UNIQUE(provider, email));
         CREATE TABLE IF NOT EXISTS oauth_attempts (state TEXT PRIMARY KEY, provider TEXT NOT NULL, code_verifier TEXT NOT NULL, expires_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS sync_preferences (account_id TEXT PRIMARY KEY REFERENCES connected_accounts(id) ON DELETE CASCADE, history_months INTEGER NOT NULL, interval_hours INTEGER NOT NULL, include_sent INTEGER NOT NULL, updated_at TEXT NOT NULL);
@@ -77,6 +78,10 @@ class Repository:
         """
         with self._lock, self.connect() as connection:
             connection.executescript(schema)
+            profile_columns = {row[1] for row in connection.execute("PRAGMA table_info(owner_profile)")}
+            for name in ("date_of_birth", "country_code"):
+                if name not in profile_columns:
+                    connection.execute(f"ALTER TABLE owner_profile ADD COLUMN {name} TEXT")
             columns = {row[1] for row in connection.execute("PRAGMA table_info(messages)")}
             for name, declaration in (
                 ("turn_id", "TEXT"),
@@ -317,15 +322,37 @@ class Repository:
     def get_profile(self) -> dict[str, Any] | None:
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM owner_profile WHERE id = 1").fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        profile = dict(row)
+        if profile["date_of_birth"]:
+            born = date.fromisoformat(profile["date_of_birth"])
+            try:
+                today = datetime.now(ZoneInfo(profile["time_zone"])).date()
+            except ZoneInfoNotFoundError:
+                today = datetime.now(timezone.utc).date()
+            profile["age"] = today.year - born.year - ((today.month, today.day) < (born.month, born.day))
+        return profile
+
+    def profile_complete(self) -> bool:
+        profile = self.get_profile()
+        return bool(profile and profile["date_of_birth"] and profile["country_code"])
 
     def save_profile(self, profile: dict[str, Any]) -> dict[str, Any]:
+        born = profile["date_of_birth"]
+        if isinstance(born, str):
+            born = date.fromisoformat(born)
+        today = datetime.now(ZoneInfo(profile["time_zone"])).date()
+        age = today.year - born.year - ((today.month, today.day) < (born.month, born.day))
         with self._lock, self.connect() as connection:
-            connection.execute("""INSERT INTO owner_profile VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+            connection.execute("""INSERT INTO owner_profile
+                (id, first_name, last_name, age, phone_number, gender, time_zone, updated_at, date_of_birth, country_code)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET first_name=excluded.first_name, last_name=excluded.last_name,
                 age=excluded.age, phone_number=excluded.phone_number, gender=excluded.gender,
-                time_zone=excluded.time_zone, updated_at=excluded.updated_at""",
-                (profile["first_name"], profile["last_name"], profile["age"], profile["phone_number"], profile["gender"], profile["time_zone"], now_iso()))
+                time_zone=excluded.time_zone, updated_at=excluded.updated_at,
+                date_of_birth=excluded.date_of_birth, country_code=excluded.country_code""",
+                (profile["first_name"], profile["last_name"], age, profile["phone_number"], profile["gender"], profile["time_zone"], now_iso(), born.isoformat(), profile["country_code"]))
         return self.get_profile() or profile
 
     def create_oauth_attempt(self, state: str, provider: str, verifier: str, expires_at: str) -> None:
@@ -386,8 +413,8 @@ class Repository:
         preferences = {item["id"]: self.get_sync_preferences(item["id"]) for item in accounts}
         jobs = {item["id"]: self.get_sync_job(item["id"]) for item in accounts}
         imported = bool(accounts) and all(preferences.values()) and all(item["last_synced_at"] for item in accounts)
-        return {"profile": self.get_profile(), "accounts": accounts, "sync_preferences": preferences,
-                "sync_jobs": jobs, "ready": bool(self.get_profile()) and imported}
+        return {"profile": self.get_profile(), "profile_complete": self.profile_complete(), "accounts": accounts, "sync_preferences": preferences,
+                "sync_jobs": jobs, "ready": self.profile_complete() and imported}
 
     def upsert_mail_source(self, account_id: str, provider: str, message_id: str, title: str, snippet: str, sent_at: str, sender: str, folder: str) -> None:
         with self._lock, self.connect() as connection:

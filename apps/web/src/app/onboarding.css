@@ -70,12 +70,16 @@
 .onboarding-form { display: grid; gap: 18px; }
 .onboarding-form label, .provider-details label:not(.onboarding-file) { display: grid; gap: 8px; color: #665d80; font-size: 11px; font-weight: 730; }
 .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
+.phone-fields { display: grid; grid-template-columns: minmax(91px, .37fr) minmax(0, 1fr); gap: 10px; min-width: 0; }
+.phone-fields label { min-width: 0; }
 .onboarding-form input:not([type=checkbox]), .onboarding-form select, .provider-details input:not([type=file]), .provider-details textarea {
   width: 100%; min-height: 45px; padding: 11px 13px; border: 1px solid rgba(137,119,184,.19); border-radius: 11px; outline: none; color: #312a47; background: rgba(255,255,255,.62); box-shadow: inset 0 1px 3px rgba(96,80,139,.02); font-size: 12px; transition: border-color .2s ease, background .2s ease, box-shadow .2s ease;
 }
 .onboarding-form input:hover, .onboarding-form select:hover, .provider-details input:hover, .provider-details textarea:hover { background: rgba(255,255,255,.88); }
 .onboarding-form input:focus, .onboarding-form select:focus, .provider-details input:focus, .provider-details textarea:focus { border-color: #a48de8; background: #fff; box-shadow: 0 0 0 3px rgba(145,117,225,.12); }
 .onboarding-form input::placeholder, .provider-details input::placeholder, .provider-details textarea::placeholder { color: #aaa1bc; }
+.onboarding-form input[type=date] { color-scheme: light; }
+.onboarding-form input[type=date]::-webkit-calendar-picker-indicator { cursor: pointer; opacity: .65; filter: hue-rotate(22deg); }
 .detected-setting { margin: -2px 0 0; color: #9189a3; font-size: 10px; line-height: 1.5; }
 .detected-setting strong { color: #6a56b2; }
 .onboarding-primary, .onboarding-secondary { display: inline-flex; align-items: center; justify-content: center; gap: 10px; min-height: 43px; padding: 11px 16px; border-radius: 10px; font-size: 11px; font-weight: 750; cursor: pointer; transition: transform .22s ease, box-shadow .22s ease, background .22s ease, border-color .22s ease; }

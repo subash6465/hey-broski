@@ -104,7 +104,7 @@ async def list_accounts() -> dict[str, Any]:
 async def start_connection(provider: str) -> dict[str, str]:
     if provider not in {"gmail", "outlook"}:
         raise HTTPException(404, "Unknown mail provider")
-    if not repository.get_profile():
+    if not repository.profile_complete():
         raise HTTPException(409, "Complete your profile first")
     try:
         return {"authorization_url": connectors.start(provider)}

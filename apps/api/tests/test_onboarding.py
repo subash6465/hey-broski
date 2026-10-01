@@ -1,7 +1,10 @@
 import time
 import asyncio
+import sqlite3
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi.testclient import TestClient
@@ -42,7 +45,7 @@ def test_profile_connection_and_real_mail_import(tmp_path: Path, monkeypatch) ->
     with TestClient(main.app) as client:
         assert client.get("/api/onboarding").json()["ready"] is False
         assert client.post("/api/accounts/gmail/start").status_code == 409
-        profile = {"first_name": "Asha", "last_name": "Rao", "age": 29, "phone_number": "+91 98765 43210", "gender": "woman", "time_zone": "Asia/Kolkata"}
+        profile = {"first_name": "Asha", "last_name": "Rao", "date_of_birth": "1997-05-12", "country_code": "+91", "phone_number": "9876543210", "gender": "female", "time_zone": "Asia/Kolkata"}
         assert client.put("/api/profile", json=profile).status_code == 200
         assert client.post("/api/accounts/gmail/client", json={"credentials": {"installed": {"client_id": "abc.apps.googleusercontent.com", "client_secret": "secret"}}}).status_code == 200
         start = client.post("/api/accounts/gmail/start").json()["authorization_url"]
@@ -81,7 +84,7 @@ def test_foreign_origin_cannot_write_profile(tmp_path: Path) -> None:
     main.repository = Repository(tmp_path / "api.db")
     with TestClient(main.app) as client:
         response = client.put("/api/profile", headers={"Origin": "https://unrelated.example"}, json={
-            "first_name": "Asha", "last_name": "Rao", "age": 29, "phone_number": "+91 98765 43210", "gender": "woman", "time_zone": "Asia/Kolkata"})
+            "first_name": "Asha", "last_name": "Rao", "date_of_birth": "1997-05-12", "country_code": "+91", "phone_number": "9876543210", "gender": "female", "time_zone": "Asia/Kolkata"})
         assert response.status_code == 403
         assert main.repository.get_profile() is None
 
@@ -108,7 +111,7 @@ def test_outlook_connection_and_import(tmp_path: Path, monkeypatch) -> None:
     real_client = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: real_client(transport=httpx.MockTransport(provider), **kwargs))
     with TestClient(main.app) as client:
-        client.put("/api/profile", json={"first_name": "Asha", "last_name": "Rao", "age": 29, "phone_number": "+91 98765 43210", "gender": "woman", "time_zone": "Asia/Kolkata"})
+        client.put("/api/profile", json={"first_name": "Asha", "last_name": "Rao", "date_of_birth": "1997-05-12", "country_code": "+91", "phone_number": "9876543210", "gender": "female", "time_zone": "Asia/Kolkata"})
         assert client.post("/api/accounts/outlook/client", json={"client_id": "11111111-2222-3333-4444-555555555555"}).status_code == 200
         start = client.post("/api/accounts/outlook/start").json()["authorization_url"]
         state = parse_qs(urlparse(start).query)["state"][0]
@@ -171,8 +174,8 @@ def test_gmail_import_resumes_after_page_failure(tmp_path: Path, monkeypatch) ->
 def test_workspace_opens_only_after_first_import(tmp_path: Path) -> None:
     repository = Repository(tmp_path / "api.db")
     repository.initialize()
-    repository.save_profile({"first_name": "Asha", "last_name": "Rao", "age": 29,
-        "phone_number": "+91 98765 43210", "gender": "woman", "time_zone": "Asia/Kolkata"})
+    repository.save_profile({"first_name": "Asha", "last_name": "Rao", "date_of_birth": "1997-05-12",
+        "country_code": "+91", "phone_number": "9876543210", "gender": "female", "time_zone": "Asia/Kolkata"})
     account = repository.upsert_account("gmail", "owner@example.com", "Owner")
     repository.save_sync_preferences(account["id"], 12, 24, True)
     assert repository.onboarding_status()["ready"] is False
@@ -185,3 +188,33 @@ def test_workspace_opens_only_after_first_import(tmp_path: Path) -> None:
     assert repository.onboarding_status()["ready"] is False
     assert repository.search_mail_sources("") == []
     assert repository.get_account(account["id"])["last_synced_at"] is None
+
+
+def test_existing_profile_migrates_and_age_comes_from_birth_date(tmp_path: Path) -> None:
+    database = tmp_path / "api.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("""CREATE TABLE owner_profile (id INTEGER PRIMARY KEY, first_name TEXT NOT NULL,
+            last_name TEXT NOT NULL, age INTEGER NOT NULL, phone_number TEXT NOT NULL,
+            gender TEXT NOT NULL, time_zone TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+        connection.execute("INSERT INTO owner_profile VALUES (1, 'Asha', 'Rao', 29, '+91 9876543210', 'woman', 'Asia/Kolkata', '2026-01-01')")
+    repository = Repository(database)
+    repository.initialize()
+    assert repository.get_profile()["first_name"] == "Asha"
+    assert repository.profile_complete() is False
+    profile = repository.save_profile({"first_name": "Asha", "last_name": "Rao", "date_of_birth": "1997-05-12",
+        "country_code": "+91", "phone_number": "9876543210", "gender": "self described", "time_zone": "Asia/Kolkata"})
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    expected_age = today.year - 1997 - ((today.month, today.day) < (5, 12))
+    assert profile["age"] == expected_age
+    assert profile["gender"] == "self described"
+    assert repository.profile_complete() is True
+
+
+def test_profile_rejects_future_birth_date_and_invalid_phone(tmp_path: Path) -> None:
+    main.repository = Repository(tmp_path / "api.db")
+    with TestClient(main.app) as client:
+        profile = {"first_name": "Asha", "last_name": "Rao", "date_of_birth": "2999-01-01",
+            "country_code": "+91", "phone_number": "9876543210", "gender": "female", "time_zone": "Asia/Kolkata"}
+        assert client.put("/api/profile", json=profile).status_code == 422
+        assert client.put("/api/profile", json={**profile, "date_of_birth": "1997-05-12", "country_code": "91"}).status_code == 422
+        assert client.put("/api/profile", json={**profile, "date_of_birth": "1997-05-12", "phone_number": "98 765"}).status_code == 422

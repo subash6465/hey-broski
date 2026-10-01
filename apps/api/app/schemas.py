@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import re
+from datetime import date, datetime
 from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class Source(BaseModel):
@@ -66,18 +69,36 @@ class DocumentRecord(BaseModel):
 class OwnerProfileInput(BaseModel):
     first_name: str = Field(min_length=1, max_length=80)
     last_name: str = Field(min_length=1, max_length=80)
-    age: int = Field(ge=1, le=120)
-    phone_number: str = Field(min_length=5, max_length=32)
+    date_of_birth: date
+    country_code: str = Field(min_length=2, max_length=5)
+    phone_number: str = Field(min_length=4, max_length=15)
     gender: str = Field(min_length=1, max_length=80)
     time_zone: str = Field(min_length=1, max_length=80)
 
-    @field_validator("first_name", "last_name", "phone_number", "gender", "time_zone")
+    @field_validator("first_name", "last_name", "country_code", "phone_number", "gender", "time_zone")
     @classmethod
     def strip_required(cls, value: str) -> str:
         value = value.strip()
         if not value:
             raise ValueError("This field is required")
         return value
+
+    @model_validator(mode="after")
+    def validate_profile(self) -> "OwnerProfileInput":
+        if not re.fullmatch(r"\+[1-9][0-9]{0,3}", self.country_code):
+            raise ValueError("Enter a country calling code such as +91")
+        if not self.phone_number.isascii() or not self.phone_number.isdigit():
+            raise ValueError("Enter the phone number using digits only")
+        if len(self.country_code) - 1 + len(self.phone_number) > 15:
+            raise ValueError("The complete phone number must have at most 15 digits")
+        try:
+            today = datetime.now(ZoneInfo(self.time_zone)).date()
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("The detected time zone is not valid") from exc
+        age = today.year - self.date_of_birth.year - ((today.month, today.day) < (self.date_of_birth.month, self.date_of_birth.day))
+        if age < 0 or age > 120:
+            raise ValueError("Enter a valid date of birth")
+        return self
 
 
 class GmailClientInput(BaseModel):

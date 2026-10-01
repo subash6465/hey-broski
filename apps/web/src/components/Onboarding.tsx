@@ -10,7 +10,8 @@ export type ConnectedAccount = {
 }
 
 export type OnboardingState = {
-  profile: { first_name: string; last_name: string; age: number; phone_number: string; gender: string; time_zone: string } | null
+  profile: { first_name: string; last_name: string; age: number; date_of_birth: string | null; country_code: string | null; phone_number: string; gender: string; time_zone: string } | null
+  profile_complete: boolean
   accounts: ConnectedAccount[]
   sync_preferences: Record<string, { history_months: number; interval_hours: number; include_sent: number } | null>
   sync_jobs: Record<string, { status: string; processed_count: number; error: string | null } | null>
@@ -23,12 +24,15 @@ type Step = 'profile' | 'connections' | 'sync'
 
 export function Onboarding({ initial, onComplete, initialStep }: { initial: OnboardingState; onComplete: (state: OnboardingState) => void; initialStep?: Step }) {
   const [state, setState] = useState(initial)
-  const [step, setStep] = useState<Step>(initialStep ?? (initial.profile ? initial.accounts.length ? 'sync' : 'connections' : 'profile'))
+  const [step, setStep] = useState<Step>(initialStep ?? (initial.profile_complete ? initial.accounts.length ? 'sync' : 'connections' : 'profile'))
   const [firstName, setFirstName] = useState(initial.profile?.first_name ?? '')
   const [lastName, setLastName] = useState(initial.profile?.last_name ?? '')
-  const [age, setAge] = useState(initial.profile?.age?.toString() ?? '')
-  const [phone, setPhone] = useState(initial.profile?.phone_number ?? '')
-  const [gender, setGender] = useState(initial.profile?.gender ?? '')
+  const [dateOfBirth, setDateOfBirth] = useState(initial.profile?.date_of_birth ?? '')
+  const [countryCode, setCountryCode] = useState(initial.profile?.country_code ?? '')
+  const [phone, setPhone] = useState(initial.profile?.country_code ? initial.profile.phone_number : '')
+  const savedGender = initial.profile?.gender ?? ''
+  const [genderOption, setGenderOption] = useState(['male', 'female', 'non-binary'].includes(savedGender) ? savedGender : savedGender ? 'self-describe' : '')
+  const [genderDescription, setGenderDescription] = useState(['male', 'female', 'non-binary'].includes(savedGender) ? '' : savedGender)
   const [gmailJson, setGmailJson] = useState('')
   const [outlookId, setOutlookId] = useState('')
   const [openProvider, setOpenProvider] = useState<'gmail' | 'outlook' | null>(null)
@@ -41,6 +45,12 @@ export function Onboarding({ initial, onComplete, initialStep }: { initial: Onbo
   const [error, setError] = useState('')
   const connectionResult = typeof window === 'undefined' ? null : new URLSearchParams(window.location.search).get('connection')
   const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+  const today = new Date()
+  const latestBirthDate = [today.getFullYear(), String(today.getMonth() + 1).padStart(2, '0'), String(today.getDate()).padStart(2, '0')].join('-')
+  const birth = dateOfBirth ? new Date(`${dateOfBirth}T12:00:00`) : null
+  const calculatedAge = birth && !Number.isNaN(birth.getTime()) && dateOfBirth <= latestBirthDate
+    ? today.getFullYear() - birth.getFullYear() - (today.getMonth() < birth.getMonth() || today.getMonth() === birth.getMonth() && today.getDate() < birth.getDate() ? 1 : 0)
+    : null
   const currentStepIndex = (['profile', 'connections', 'sync'] as const).indexOf(step)
 
   useEffect(() => {
@@ -68,7 +78,8 @@ export function Onboarding({ initial, onComplete, initialStep }: { initial: Onbo
     setBusy(true); setError('')
     try {
       await request('/api/profile', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ first_name: firstName, last_name: lastName, age: Number(age), phone_number: phone, gender, time_zone: timeZone }) })
+        body: JSON.stringify({ first_name: firstName, last_name: lastName, date_of_birth: dateOfBirth, country_code: countryCode,
+          phone_number: phone, gender: genderOption === 'self-describe' ? genderDescription : genderOption, time_zone: timeZone }) })
       await refresh()
       setStep('connections')
     } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not save your profile') }
@@ -137,8 +148,10 @@ export function Onboarding({ initial, onComplete, initialStep }: { initial: Onbo
         {step === 'profile' && <><span className="section-label">STEP 01 / 03</span><h1>Let&apos;s get to know you.</h1><p className="onboarding-intro">These details stay in your local Hey Broski database. Your computer supplies the time zone automatically.</p>
           <form onSubmit={saveProfile} className="onboarding-form">
             <div className="field-row"><label>First name<input autoComplete="given-name" value={firstName} onChange={e => setFirstName(e.target.value)} required maxLength={80} /></label><label>Last name<input autoComplete="family-name" value={lastName} onChange={e => setLastName(e.target.value)} required maxLength={80} /></label></div>
-            <div className="field-row"><label>Age<input type="number" min="1" max="120" value={age} onChange={e => setAge(e.target.value)} required /></label><label>Phone number<input type="tel" autoComplete="tel" value={phone} onChange={e => setPhone(e.target.value)} required maxLength={32} /></label></div>
-            <label>Gender<input value={gender} onChange={e => setGender(e.target.value)} placeholder="How you describe yourself" required maxLength={80} /></label>
+            <div className="field-row"><label>Date of birth<input type="date" autoComplete="bday" max={latestBirthDate} value={dateOfBirth} onChange={e => setDateOfBirth(e.target.value)} required /></label><div className="phone-fields"><label>Country code<input type="tel" inputMode="tel" autoComplete="tel-country-code" placeholder="+91" pattern="\+[1-9][0-9]{0,3}" title="Enter a calling code like +91" value={countryCode} onChange={e => setCountryCode(e.target.value)} required maxLength={5} /></label><label>Phone number<input type="tel" inputMode="numeric" autoComplete="tel-national" placeholder="Digits only" pattern="[0-9]{4,15}" title="Enter 4 to 15 digits without the country code" value={phone} onChange={e => setPhone(e.target.value)} required maxLength={15} /></label></div></div>
+            {calculatedAge !== null && <p className="detected-setting">Age calculated from your birth date: <strong>{calculatedAge}</strong></p>}
+            <label>Gender<select value={genderOption} onChange={e => setGenderOption(e.target.value)} required><option value="" disabled>Select an option</option><option value="male">Male</option><option value="female">Female</option><option value="non-binary">Non-binary</option><option value="self-describe">Self describe</option></select></label>
+            {genderOption === 'self-describe' && <label>Describe your gender<input value={genderDescription} onChange={e => setGenderDescription(e.target.value)} placeholder="How you describe yourself" required maxLength={80} /></label>}
             <p className="detected-setting">Time zone detected from this computer: <strong>{timeZone}</strong></p>
             <button className="onboarding-primary" type="submit" disabled={busy}>{busy ? 'Saving…' : 'Continue to connections'} <ArrowRight size={17} /></button>
           </form></>}

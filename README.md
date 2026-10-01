@@ -6,7 +6,7 @@ Hey Broski is a local-first personal admin copilot. First-time setup collects a 
 
 - Grounded chat over imported mail and uploaded documents; legacy demo fixtures remain for API tests but are not used once an account is connected
 - Gmail and Outlook OAuth connection, mailbox verification, background import, and configurable polling sync
-- Local profile with name, age, phone number, gender, and machine-detected time zone
+- Local profile with name, date of birth, country code and phone number, gender, and machine-detected time zone; age is calculated from the birth date
 - Answers generated only by a local Ollama `qwen3:4b-instruct` model; inference errors are reported rather than replaced with canned text
 - Persistent SQLite conversations, action cards, documents, and internal safety events
 - Approval and dismissal workflow—no proposal executes silently
@@ -20,7 +20,7 @@ Calendar sync, semantic vector search, and live n8n workflow execution remain pl
 
 ## First-time setup and connected mail
 
-Run the API and web app on your own computer using the instructions below, then open `http://localhost:3000`. Setup runs in three steps: profile, mail connection, and import/sync choices. The time zone is read from the browser's machine settings; it is not requested as a preference. A successfully verified Gmail or Outlook account and a completed first import are required to enter the workspace. Setup shows import progress and retry; the Accounts view shows later syncs, errors, manual sync, disconnect, and a way to change settings.
+Run the API and web app on your own computer using the instructions below, then open `http://localhost:3000`. Setup runs in three steps: profile, mail connection, and import/sync choices. The time zone is read from the browser's machine settings; it is not requested as a preference. Existing profiles are asked for a birth date and separate country code because those cannot be derived reliably from the old age and phone fields. A successfully verified Gmail or Outlook account and a completed first import are required to enter the workspace. Setup shows import progress and retry; the Accounts view shows later syncs, errors, manual sync, disconnect, and a way to change settings.
 
 For Gmail, the owner must create a Google Cloud project, enable the Gmail API, configure OAuth consent, and download a **Desktop app** OAuth client JSON. Import that JSON in the Gmail card. Hey Broski then opens Google sign-in and verifies `gmail.readonly` with a profile and one-message list request. The JSON is not a mailbox password or an access token. Google's [Python quickstart](https://developers.google.com/workspace/gmail/api/quickstart/python) documents the Cloud setup. An external Google app left in Testing can issue refresh tokens that expire after seven days for Gmail access; reconnect when prompted, or review Google's publishing rules for personal use.
 
