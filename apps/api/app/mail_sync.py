@@ -7,6 +7,7 @@ import base64
 import calendar
 import hashlib
 import json
+import random
 import re
 from datetime import datetime, timezone, time
 from email.header import decode_header, make_header
@@ -39,11 +40,51 @@ def gmail_text(payload: dict) -> str:
     return ""
 
 
+class GmailRequestError(RuntimeError):
+    def __init__(self, status: int, reason: str, message: str) -> None:
+        self.status = status
+        self.reason = reason
+        super().__init__(f"Gmail returned {status}{f' ({reason})' if reason else ''}: {message}")
+
+
 class MailSync:
     def __init__(self, repository: Repository, connectors: ConnectorService) -> None:
         self.repository = repository
         self.connectors = connectors
         self._running: set[str] = set()
+
+    async def _gmail_get(self, client: httpx.AsyncClient, account: dict, url: str, headers: dict[str, str], params: dict | None = None) -> httpx.Response:
+        refreshed = False
+        for attempt in range(10):
+            try:
+                response = await client.get(url, params=params, headers=headers)
+            except (httpx.TimeoutException, httpx.NetworkError):
+                if attempt == 9:
+                    raise
+                await asyncio.sleep(min(60, 2 ** attempt) + random.uniform(0, 1))
+                continue
+            if response.status_code == 401 and not refreshed:
+                headers["Authorization"] = f"Bearer {await self.connectors.access_token(account)}"
+                refreshed = True
+                continue
+            if response.status_code < 400:
+                return response
+            try:
+                problem = response.json().get("error", {})
+                reason = (problem.get("errors") or [{}])[0].get("reason", "")
+                message = problem.get("message", response.reason_phrase)
+            except (ValueError, AttributeError, TypeError):
+                reason, message = "", response.reason_phrase
+            retryable = response.status_code in {429, 500, 502, 503, 504} or response.status_code == 403 and reason in {"rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded"}
+            if retryable and attempt < 9:
+                retry_after = response.headers.get("Retry-After", "")
+                delay = min(60, 2 ** attempt) + random.uniform(0, 1)
+                if retry_after.isdigit():
+                    delay = max(delay, min(120, int(retry_after)))
+                await asyncio.sleep(delay)
+                continue
+            raise GmailRequestError(response.status_code, reason, message)
+        raise RuntimeError("Gmail did not respond after retries")
 
     def _maybe_action(self, account: dict, message_id: str, title: str, snippet: str, sent_at: str) -> None:
         """Create a conservative reminder only for an explicit dated obligation."""
@@ -106,18 +147,30 @@ class MailSync:
         if not preferences["include_sent"]:
             query += " in:inbox"
         headers = {"Authorization": f"Bearer {token}"}
+        position = json.loads(cursor) if cursor and cursor.startswith("{") else {"page_token": cursor, "offset": 0}
+        consecutive_inaccessible = 0
         async with httpx.AsyncClient(timeout=30) as client:
             while True:
-                params = {"q": query, "maxResults": 50}
-                if cursor:
-                    params["pageToken"] = cursor
-                response = await client.get("https://gmail.googleapis.com/gmail/v1/users/me/messages", params=params, headers=headers)
-                response.raise_for_status()
+                params = {"q": query, "maxResults": 100}
+                if position["page_token"]:
+                    params["pageToken"] = position["page_token"]
+                response = await self._gmail_get(client, account, "https://gmail.googleapis.com/gmail/v1/users/me/messages", headers, params)
                 page = response.json()
-                count = 0
-                for item in page.get("messages", []):
-                    detail = await client.get(f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{quote(item['id'], safe='')}", params={"format": "full"}, headers=headers)
-                    detail.raise_for_status()
+                if position["page_token"] is None and position["offset"] == 0:
+                    self.repository.update_sync_job(account["id"], "running", cursor, total_estimate=page.get("resultSizeEstimate"))
+                for index, item in enumerate(page.get("messages", [])[position["offset"]:], start=position["offset"]):
+                    message_cursor = json.dumps({"page_token": position["page_token"], "offset": index + 1})
+                    try:
+                        detail = await self._gmail_get(client, account, f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{quote(item['id'], safe='')}", headers, {"format": "full"})
+                    except GmailRequestError as exc:
+                        if exc.status not in {403, 404} or exc.status == 403 and exc.reason not in {"", "forbidden", "notFound"}:
+                            raise
+                        consecutive_inaccessible += 1
+                        if consecutive_inaccessible > 5:
+                            raise RuntimeError("Google denied several messages in a row. Check Gmail access and retry the import") from exc
+                        self.repository.update_sync_job(account["id"], "running", message_cursor, skipped=1)
+                        continue
+                    consecutive_inaccessible = 0
                     message = detail.json()
                     fields = {entry["name"].lower(): entry["value"] for entry in message.get("payload", {}).get("headers", [])}
                     title = str(make_header(decode_header(fields.get("subject", "(No subject)"))))
@@ -127,10 +180,11 @@ class MailSync:
                     folder = "sent" if "SENT" in message.get("labelIds", []) else "inbox" if "INBOX" in message.get("labelIds", []) else "archive"
                     self.repository.upsert_mail_source(account["id"], "gmail", item["id"], title[:300], snippet, sent_at, fields.get("from", "")[:300], folder)
                     self._maybe_action(account, item["id"], title[:300], snippet, sent_at)
-                    count += 1
-                cursor = page.get("nextPageToken")
-                self.repository.update_sync_job(account["id"], "running", cursor, count)
-                if not cursor:
+                    self.repository.update_sync_job(account["id"], "running", message_cursor, 1)
+                    await asyncio.sleep(0.25)
+                position = {"page_token": page.get("nextPageToken"), "offset": 0}
+                self.repository.update_sync_job(account["id"], "running", position["page_token"])
+                if not position["page_token"]:
                     return
 
     async def _outlook(self, account: dict, preferences: dict, token: str, cursor: str | None) -> None:
@@ -177,8 +231,11 @@ class MailSync:
                     continue
                 job = self.repository.get_sync_job(account["id"])
                 due = not account["last_synced_at"] or (datetime.now(timezone.utc) - datetime.fromisoformat(account["last_synced_at"])).total_seconds() >= preferences["interval_hours"] * 3600
-                if job and job["status"] == "failed":
-                    due = False  # explicit retry after a connection or provider error
+                if job and job["status"] == "running":
+                    due = True  # Resume a job left running when the API process restarted.
+                elif job and job["status"] == "failed":
+                    transient = any(marker in (job["error"] or "") for marker in ("rateLimitExceeded", "quotaExceeded", "Gmail returned 429", "Gmail returned 5", "Client error '403 Forbidden'"))
+                    due = transient and (datetime.now(timezone.utc) - datetime.fromisoformat(job["updated_at"])).total_seconds() >= 300
                 if due:
                     asyncio.create_task(self.run(account["id"]))
             await asyncio.sleep(60)

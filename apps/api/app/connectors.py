@@ -16,6 +16,7 @@ from .credential_vault import CredentialVault
 from .repository import Repository
 
 GOOGLE_AUTH = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_CLIENT_AUTH_URIS = {GOOGLE_AUTH, "https://accounts.google.com/o/oauth2/auth"}
 GOOGLE_TOKEN = "https://oauth2.googleapis.com/token"
 GOOGLE_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 MICROSOFT_SCOPE = "offline_access User.Read Mail.Read"
@@ -42,7 +43,7 @@ class ConnectorService:
             raise ConnectionError("Upload the Desktop OAuth client JSON downloaded from Google Cloud")
         if not installed["client_id"].endswith(".apps.googleusercontent.com"):
             raise ConnectionError("The Google OAuth client ID is invalid")
-        if installed.get("auth_uri") not in (None, GOOGLE_AUTH) or installed.get("token_uri") not in (None, GOOGLE_TOKEN):
+        if installed.get("auth_uri") not in (None, *GOOGLE_CLIENT_AUTH_URIS) or installed.get("token_uri") not in (None, GOOGLE_TOKEN):
             raise ConnectionError("The OAuth client does not use Google's standard authorization endpoints")
         self.vault.put("gmail_client", {"client_id": installed["client_id"], "client_secret": installed.get("client_secret", "")})
 

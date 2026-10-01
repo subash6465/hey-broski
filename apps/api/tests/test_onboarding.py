@@ -91,6 +91,18 @@ def test_foreign_origin_cannot_write_profile(tmp_path: Path) -> None:
         assert main.repository.get_profile() is None
 
 
+def test_google_desktop_json_accepts_google_issued_auth_uri(tmp_path: Path) -> None:
+    main.repository = Repository(tmp_path / "api.db")
+    main.vault = CredentialVault(tmp_path)
+    with TestClient(main.app) as client:
+        credentials = {"installed": {"client_id": "abc.apps.googleusercontent.com", "client_secret": "secret",
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth", "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": ["http://localhost"]}}
+        assert client.post("/api/accounts/gmail/client", json={"credentials": credentials}).status_code == 200
+        credentials["installed"]["auth_uri"] = "https://attacker.example/authorize"
+        assert client.post("/api/accounts/gmail/client", json={"credentials": credentials}).status_code == 400
+
+
 def test_outlook_connection_and_import(tmp_path: Path, monkeypatch) -> None:
     repository = Repository(tmp_path / "api.db")
     main.repository = repository
@@ -149,7 +161,7 @@ def test_gmail_import_resumes_after_page_failure(tmp_path: Path, monkeypatch) ->
             if request.url.params.get("pageToken") == "page-2":
                 if second_page_fails:
                     second_page_fails = False
-                    return httpx.Response(503)
+                    return httpx.Response(403, json={"error": {"message": "Daily limit exceeded", "errors": [{"reason": "dailyLimitExceeded"}]}})
                 return httpx.Response(200, json={"messages": [{"id": "mail-2"}]})
             return httpx.Response(200, json={"messages": [{"id": "mail-1"}], "nextPageToken": "page-2"})
         if request.url.path.endswith("/messages/mail-1") or request.url.path.endswith("/messages/mail-2"):
@@ -173,23 +185,118 @@ def test_gmail_import_resumes_after_page_failure(tmp_path: Path, monkeypatch) ->
     assert {item["message_id"] for item in repository.search_mail_sources("")} == {"mail-1", "mail-2"}
 
 
-def test_workspace_opens_only_after_first_import(tmp_path: Path) -> None:
+def test_gmail_import_retries_rate_limit_and_checkpoints_each_message(tmp_path: Path, monkeypatch) -> None:
+    repository = Repository(tmp_path / "api.db")
+    repository.initialize()
+    account = repository.upsert_account("gmail", "owner@example.com", "Owner")
+    repository.save_sync_preferences(account["id"], 24, 24, True)
+    connector = ConnectorService(repository, CredentialVault(tmp_path))
+
+    async def token(_account):
+        return "access"
+
+    async def no_delay(_seconds):
+        return None
+
+    monkeypatch.setattr(connector, "access_token", token)
+    monkeypatch.setattr("app.mail_sync.asyncio.sleep", no_delay)
+    requests = {"first": 0, "second": 0}
+    fail_second = True
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        nonlocal fail_second
+        path = request.url.path
+        if path.endswith("/messages"):
+            return httpx.Response(200, json={"resultSizeEstimate": 2, "messages": [{"id": "mail-1"}, {"id": "mail-2"}]})
+        if path.endswith("/messages/mail-1"):
+            requests["first"] += 1
+            if requests["first"] == 1:
+                return httpx.Response(403, json={"error": {"message": "User Rate Limit Exceeded", "errors": [{"reason": "userRateLimitExceeded"}]}})
+        elif path.endswith("/messages/mail-2"):
+            requests["second"] += 1
+            if fail_second:
+                fail_second = False
+                return httpx.Response(403, json={"error": {"message": "Daily Limit Exceeded", "errors": [{"reason": "dailyLimitExceeded"}]}})
+        else:
+            raise AssertionError(f"Unexpected request: {request.url}")
+        return httpx.Response(200, json={"id": path.rsplit("/", 1)[-1], "internalDate": "1790870400000",
+            "snippet": "A unique message.", "payload": {"headers": [{"name": "Subject", "value": "Test"}]}})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: real_client(transport=httpx.MockTransport(provider), **kwargs))
+    sync = MailSync(repository, connector)
+    asyncio.run(sync.run(account["id"]))
+    failed = repository.get_sync_job(account["id"])
+    assert failed["status"] == "failed"
+    assert failed["processed_count"] == 1
+    assert failed["total_estimate"] == 2
+    assert '"offset": 1' in failed["page_token"]
+    asyncio.run(sync.run(account["id"]))
+    done = repository.get_sync_job(account["id"])
+    assert done["status"] == "complete"
+    assert done["processed_count"] == 2
+    assert requests == {"first": 2, "second": 2}  # Retry mail-1 in place; resume skips it later.
+
+
+def test_gmail_skips_one_inaccessible_message_without_stopping_import(tmp_path: Path, monkeypatch) -> None:
+    repository = Repository(tmp_path / "api.db")
+    repository.initialize()
+    account = repository.upsert_account("gmail", "owner@example.com", "Owner")
+    repository.save_sync_preferences(account["id"], 3, 24, True)
+    connector = ConnectorService(repository, CredentialVault(tmp_path))
+
+    async def token(_account):
+        return "access"
+
+    monkeypatch.setattr(connector, "access_token", token)
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/messages"):
+            return httpx.Response(200, json={"resultSizeEstimate": 2, "messages": [{"id": "gone"}, {"id": "good"}]})
+        if request.url.path.endswith("/messages/gone"):
+            return httpx.Response(403, json={"error": {"message": "Message unavailable", "errors": [{"reason": "forbidden"}]}})
+        return httpx.Response(200, json={"id": "good", "internalDate": "1790870400000", "snippet": "Good message",
+            "payload": {"headers": [{"name": "Subject", "value": "Good"}]}})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: real_client(transport=httpx.MockTransport(provider), **kwargs))
+    asyncio.run(MailSync(repository, connector).run(account["id"]))
+    job = repository.get_sync_job(account["id"])
+    assert job["status"] == "complete"
+    assert job["processed_count"] == 1
+    assert job["skipped_count"] == 1
+
+
+def test_workspace_opens_when_import_is_configured(tmp_path: Path) -> None:
     repository = Repository(tmp_path / "api.db")
     repository.initialize()
     repository.save_profile({"first_name": "Asha", "last_name": "Rao", "date_of_birth": "1997-05-12",
         "country_code": "+91", "phone_number": "9876543210", "gender": "female", "time_zone": "Asia/Kolkata"})
     account = repository.upsert_account("gmail", "owner@example.com", "Owner")
     repository.save_sync_preferences(account["id"], 12, 24, True)
-    assert repository.onboarding_status()["ready"] is False
+    assert repository.onboarding_status()["ready"] is True
     repository.start_sync_job(account["id"])
-    assert repository.onboarding_status()["ready"] is False
+    assert repository.onboarding_status()["ready"] is True
     repository.update_sync_job(account["id"], "complete")
     assert repository.onboarding_status()["ready"] is True
     repository.upsert_mail_source(account["id"], "gmail", "old-message", "Older mail", "A message", "2025-01-01T00:00:00Z", "sender@example.com", "inbox")
     repository.reset_sync_job(account["id"])
-    assert repository.onboarding_status()["ready"] is False
+    assert repository.onboarding_status()["ready"] is True
     assert repository.search_mail_sources("") == []
     assert repository.get_account(account["id"])["last_synced_at"] is None
+
+
+def test_existing_sync_job_schema_gains_progress_columns(tmp_path: Path) -> None:
+    database = tmp_path / "api.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("""CREATE TABLE sync_jobs (account_id TEXT PRIMARY KEY, status TEXT NOT NULL,
+            processed_count INTEGER NOT NULL DEFAULT 0, page_token TEXT, started_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL, error TEXT)""")
+    repository = Repository(database)
+    repository.initialize()
+    with repository.connect() as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(sync_jobs)")}
+    assert {"total_estimate", "skipped_count"} <= columns
 
 
 def test_existing_profile_migrates_and_age_comes_from_birth_date(tmp_path: Path) -> None:

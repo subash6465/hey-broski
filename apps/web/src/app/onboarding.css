@@ -95,8 +95,9 @@
 .provider-list { display: grid; gap: 11px; margin-bottom: 23px; }
 .provider-card { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 15px; border: 1px solid rgba(255,255,255,.9); border-radius: 16px; background: rgba(255,255,255,.46); box-shadow: 0 8px 25px rgba(93,75,146,.04); transition: border-color .22s ease, transform .22s ease, box-shadow .22s ease; }
 .provider-card:hover { transform: translateY(-2px); border-color: rgba(159,137,224,.4); box-shadow: 0 13px 30px rgba(93,75,146,.09); }
-.provider-title { display: flex; align-items: center; gap: 12px; }
-.provider-title > div { display: grid; gap: 4px; }
+.provider-title { display: flex; align-items: center; gap: 12px; padding: 0; border: 0; text-align: left; background: transparent; cursor: pointer; }
+.provider-title-copy { display: grid; gap: 4px; }
+.provider-title:focus-visible { outline: 2px solid #8f75e1; outline-offset: 5px; border-radius: 5px; }
 .provider-title strong { color: #342b4f; font-size: 13px; }
 .provider-title small { color: #968da9; font-size: 10px; }
 .provider-mark { flex: none; display: grid; place-items: center; width: 42px; height: 42px; border: 1px solid rgba(255,255,255,.8); border-radius: 12px; }
@@ -123,6 +124,23 @@
 .provider-details a { color: #6955c8; font-weight: 750; text-underline-offset: 3px; }
 .provider-details textarea { min-height: 92px; resize: vertical; }
 .provider-details code { overflow-wrap: anywhere; color: #6555a2; font-size: 10px; }
+.connection-dialog-backdrop { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; padding: 20px; background: rgba(35,27,63,.43); backdrop-filter: blur(10px); animation: onboarding-stage-in .24s ease both; }
+.connection-dialog { display: flex; flex-direction: column; width: min(100%, 710px); max-height: min(88dvh, 850px); min-height: 0; overflow: hidden; border: 1px solid rgba(255,255,255,.9); border-radius: 24px; background: linear-gradient(145deg, rgba(255,255,255,.96), rgba(246,244,255,.93)); box-shadow: 0 36px 100px rgba(38,27,76,.3), inset 0 1px rgba(255,255,255,.95); }
+.connection-dialog-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; flex: none; padding: 25px 30px 18px; border-bottom: 1px solid rgba(133,112,183,.13); }
+.connection-dialog-header h2 { margin: 8px 0 4px; color: #2b2540; font: 760 clamp(24px, 3vw, 32px)/1.15 'Manrope Variable', sans-serif; letter-spacing: -.055em; }
+.connection-dialog-header p { margin: 0; color: #817990; font-size: 11px; }
+.connection-dialog-close { display: grid; place-items: center; flex: none; width: 34px; height: 34px; border: 1px solid rgba(132,111,194,.2); border-radius: 10px; color: #766a98; background: rgba(255,255,255,.65); cursor: pointer; }
+.connection-dialog-close:hover { color: #4d399f; background: white; }
+.connection-dialog-scroll { display: block; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 23px 30px 30px; scrollbar-color: #c9b9ed transparent; }
+.connection-dialog-scroll > * + * { margin-top: 22px; }
+.connection-dialog-scroll .onboarding-error { width: 100%; margin: 0 0 18px; }
+.setup-segment { width: 100%; padding: 18px 18px 12px; border: 1px solid rgba(157,135,221,.21); border-radius: 15px; background: rgba(255,255,255,.57); }
+.setup-segment h3 { margin: 0 0 18px; color: #5d4ba5; font: 760 13px 'Manrope Variable', sans-serif; }
+.setup-segment .setup-guide li:last-child { min-height: 32px; }
+.setup-command { display: block; margin-top: 4px; padding: 12px; border: 1px solid rgba(157,135,221,.17); border-radius: 9px; background: #f4f0ff; user-select: all; line-height: 1.7; }
+.connection-dialog-action { display: grid; justify-items: start; gap: 12px; width: 100%; padding-top: 18px; border-top: 1px solid rgba(133,112,183,.18); }
+.connection-dialog-action textarea, .connection-dialog-action label:not(.onboarding-file) { width: 100%; }
+.connection-dialog-action .onboarding-primary { margin-top: 0; }
 .onboarding-file { display: inline-flex; padding: 11px 13px; border: 1px dashed #baa8e8; border-radius: 10px; color: #6650b4; background: rgba(239,234,253,.44); cursor: pointer; font-size: 11px; font-weight: 750; }
 .onboarding-file:hover { background: rgba(239,234,253,.8); }
 .onboarding-file input { display: none; }
@@ -141,6 +159,21 @@
 .sync-banner { display: flex; align-items: center; gap: 10px; margin: 0 0 24px; padding: 12px 16px; border: 1px solid #d9cef6; border-radius: 12px; color: #6753a9; background: rgba(241,235,255,.76); font-size: 11px; }
 .sync-banner span { flex: 1; }
 .sync-banner button { border: 0; color: #6955c8; background: transparent; font-weight: 800; cursor: pointer; }
+.import-progress { display: grid; gap: 13px; margin: 16px 40px 0; padding: 16px 19px; border: 1px solid rgba(159,137,224,.36); border-radius: 15px; background: linear-gradient(125deg, rgba(255,255,255,.75), rgba(241,235,255,.78)); box-shadow: 0 12px 35px rgba(93,75,146,.07); backdrop-filter: blur(18px); }
+.import-progress-heading { display: flex; align-items: center; gap: 10px; color: #6955c8; }
+.import-progress-heading > div { display: grid; gap: 3px; }
+.import-progress-heading strong { color: #453778; font-size: 12px; }
+.import-progress-heading span, .import-progress-account small { color: #807493; font-size: 10px; }
+.import-progress-account { display: grid; gap: 7px; }
+.import-progress-line { display: flex; justify-content: space-between; gap: 12px; color: #6c6084; font-size: 10px; }
+.import-progress-line strong { color: #514273; font-weight: 750; overflow-wrap: anywhere; }
+.import-progress-line span { text-align: right; }
+.import-progress-track { height: 7px; overflow: hidden; border-radius: 999px; background: rgba(145,122,207,.16); }
+.import-progress-track > span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #a180e4, #6651ce); transition: width .5s ease; }
+.import-progress-track.indeterminate > span { width: 35%; animation: import-progress-sweep 1.8s ease-in-out infinite; }
+.import-progress-error { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; color: #94425d; font-size: 10px; line-height: 1.5; }
+.import-progress-error button { flex: none; padding: 5px 8px; border: 1px solid rgba(190,95,124,.25); border-radius: 7px; color: #94425d; background: rgba(255,255,255,.7); cursor: pointer; font-size: 10px; font-weight: 750; }
+@keyframes import-progress-sweep { from { transform: translateX(-100%); } to { transform: translateX(290%); } }
 .account-add { display: flex; align-items: center; gap: 8px; padding: 18px; border: 1px dashed rgba(133,111,199,.4); border-radius: 13px; color: #6652b6; background: rgba(255,255,255,.44); font-weight: 750; cursor: pointer; }
 .account-add:hover { background: rgba(255,255,255,.7); }
 .account-card { display: flex; align-items: flex-start; gap: 14px; padding: 18px; border: 1px solid rgba(255,255,255,.86); border-radius: 14px; background: rgba(255,255,255,.58); backdrop-filter: blur(20px); }
@@ -161,6 +194,7 @@
   .onboarding-card { padding: 28px; }
 }
 @media (max-width: 700px) {
+  .import-progress { margin: 12px 16px 0; }
   .onboarding-shell { padding: 21px 16px 28px; }
   .onboarding-header { margin-bottom: 36px; }
   .onboarding-header p { display: none; }
@@ -185,6 +219,11 @@
   .provider-card { align-items: stretch; }
   .provider-card > .onboarding-secondary { width: 100%; }
   .onboarding-card h1 { font-size: 30px; }
+  .connection-dialog-backdrop { padding: 9px; }
+  .connection-dialog { max-height: calc(100dvh - 18px); border-radius: 18px; }
+  .connection-dialog-header { padding: 20px 20px 15px; }
+  .connection-dialog-scroll { padding: 18px 17px 22px; }
+  .setup-segment { padding: 16px 13px 9px; }
 }
 @media (prefers-reduced-motion: reduce) {
   .onboarding-shell *, .onboarding-shell *::before, .onboarding-shell *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }

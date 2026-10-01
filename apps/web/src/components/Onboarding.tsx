@@ -1,8 +1,9 @@
 'use client'
 
-import { FormEvent, useEffect, useState } from 'react'
+import { FormEvent, useCallback, useState } from 'react'
 import { ArrowRight, Check, ChevronLeft, LockKeyhole, Mail, RefreshCw, Sparkles } from 'lucide-react'
 import { request } from '@/lib/api'
+import { ConnectionDialog } from './ConnectionDialog'
 
 export type ConnectedAccount = {
   id: string; provider: 'gmail' | 'outlook'; email: string; display_name: string
@@ -14,7 +15,7 @@ export type OnboardingState = {
   profile_complete: boolean
   accounts: ConnectedAccount[]
   sync_preferences: Record<string, { history_months: number; interval_hours: number; include_sent: number } | null>
-  sync_jobs: Record<string, { status: string; processed_count: number; error: string | null } | null>
+  sync_jobs: Record<string, { status: string; processed_count: number; skipped_count: number; total_estimate: number | null; error: string | null } | null>
   ready: boolean
   gmail_client_imported: boolean
   outlook_available: boolean
@@ -36,12 +37,12 @@ export function Onboarding({ initial, onComplete, initialStep }: { initial: Onbo
   const [gmailJson, setGmailJson] = useState('')
   const [outlookId, setOutlookId] = useState('')
   const [openProvider, setOpenProvider] = useState<'gmail' | 'outlook' | null>(null)
+  const closeProvider = useCallback(() => setOpenProvider(null), [])
   const firstPreferences = initial.accounts.length ? initial.sync_preferences[initial.accounts[0].id] : null
   const [historyMonths, setHistoryMonths] = useState(firstPreferences?.history_months ?? 12)
   const [intervalHours, setIntervalHours] = useState(firstPreferences?.interval_hours ?? 24)
   const [includeSent, setIncludeSent] = useState(firstPreferences ? Boolean(firstPreferences.include_sent) : true)
   const [busy, setBusy] = useState(false)
-  const [waitingForImport, setWaitingForImport] = useState(false)
   const [error, setError] = useState('')
   const connectionResult = typeof window === 'undefined' ? null : new URLSearchParams(window.location.search).get('connection')
   const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
@@ -52,20 +53,6 @@ export function Onboarding({ initial, onComplete, initialStep }: { initial: Onbo
     ? today.getFullYear() - birth.getFullYear() - (today.getMonth() < birth.getMonth() || today.getMonth() === birth.getMonth() && today.getDate() < birth.getDate() ? 1 : 0)
     : null
   const currentStepIndex = (['profile', 'connections', 'sync'] as const).indexOf(step)
-
-  useEffect(() => {
-    if (step !== 'sync' || !waitingForImport) return
-    const timer = window.setInterval(() => {
-      void request<OnboardingState>('/api/onboarding').then(next => {
-        setState(next)
-        if (next.ready) {
-          window.clearInterval(timer)
-          onComplete(next)
-        }
-      }).catch(() => setError('Could not check import progress. Try again.'))
-    }, 2000)
-    return () => window.clearInterval(timer)
-  }, [step, waitingForImport, onComplete])
 
   async function refresh() {
     const next = await request<OnboardingState>('/api/onboarding')
@@ -126,7 +113,6 @@ export function Onboarding({ initial, onComplete, initialStep }: { initial: Onbo
       }
       const next = await refresh()
       if (next.ready) onComplete(next)
-      else if (next.accounts.length) setWaitingForImport(true)
       else setError('Connect at least one mailbox before continuing')
     } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not save sync settings') }
     finally { setBusy(false) }
@@ -143,7 +129,7 @@ export function Onboarding({ initial, onComplete, initialStep }: { initial: Onbo
         <div className="onboarding-aside-note"><span className="onboarding-note-icon"><LockKeyhole size={16} /></span><p><strong>Made for your peace of mind.</strong><br />Your profile and imported mail live on this computer.</p></div>
       </aside>
       <section className="onboarding-card">
-        {error && <div className="onboarding-error" role="alert">{error}</div>}
+        {error && !openProvider && <div className="onboarding-error" role="alert">{error}</div>}
         <div key={step} className="onboarding-stage">
         {step === 'profile' && <><span className="section-label">STEP 01 / 03</span><h1>Let&apos;s get to know you.</h1><p className="onboarding-intro">These details stay in your local Hey Broski database. Your computer supplies the time zone automatically.</p>
           <form onSubmit={saveProfile} className="onboarding-form">
@@ -159,30 +145,9 @@ export function Onboarding({ initial, onComplete, initialStep }: { initial: Onbo
           {connectionResult && <div className={connectionResult === 'connected' ? 'onboarding-success' : 'onboarding-error'} role="status">{connectionResult === 'connected' ? 'Mailbox connected and verified.' : 'Connection was not completed. You can try again.'}</div>}
           <div className="provider-list">
             {(['gmail', 'outlook'] as const).map(provider => <div className="provider-card" key={provider}>
-              <div className="provider-title"><span className={`provider-mark ${provider}`}><Mail size={20} /></span><div><strong>{provider === 'gmail' ? 'Gmail' : 'Outlook'}</strong><small>{state.accounts.filter(a => a.provider === provider).length ? `${state.accounts.filter(a => a.provider === provider).length} connected` : 'Read-only mail access'}</small></div></div>
-              <button type="button" className="onboarding-secondary" onClick={() => setOpenProvider(openProvider === provider ? null : provider)}>{openProvider === provider ? 'Hide steps' : 'Set up connection'}</button>
-              {openProvider === provider && <div className="provider-details">
-                {provider === 'gmail' ? <><div className="setup-cost"><strong>Check the billing choice first</strong><span>Google currently provides standard Gmail API use at no additional cost. But if this project is linked to a Cloud Billing account, other Cloud services and future billable usage could charge it. Do not create a project with a billing account selected unless you accept that link.</span></div>
-                  <details className="setup-alternative"><summary>Only billing accounts appear in New Project?</summary><p>Cancel that form. Open <a href="https://shell.cloud.google.com/" target="_blank" rel="noreferrer">Google Cloud Shell ↗</a> and run the command below, replacing <code>your-unique-id</code> with a unique lowercase name. This command does not specify a billing account. After it finishes, refresh Cloud Console, open the project picker, and search the exact project ID under <b>All</b> or <b>No organization</b>. Check that Billing shows no linked account, then return to step 3. If enabling Gmail API asks you to link billing, stop there.</p><code>gcloud projects create your-unique-id --name=&quot;Hey Broski Personal&quot;</code></details>
-                  <ol className="setup-guide">
-                    <li><strong>Open Google Cloud Console.</strong><span>Visit <a href="https://console.cloud.google.com/" target="_blank" rel="noreferrer">console.cloud.google.com ↗</a> and sign in with the Gmail account you want to connect.</span></li>
-                    <li><strong>Create a project without linking billing.</strong><span>Click the project name at the top, then <b>New Project</b>. Enter a name such as <b>Hey Broski Personal</b>. If a <b>Billing account</b> field appears, select <b>No billing account</b> if offered. If the list contains only billing accounts, do not click <b>Create</b>; use the alternative above. Select the new project once it is created.</span></li>
-                    <li><strong>Enable Gmail API.</strong><span>Open the <b>☰ Menu → APIs &amp; Services → Library</b>. Search for <b>Gmail API</b>, open it, and click <b>Enable</b>.</span></li>
-                    <li><strong>Enter the app details.</strong><span>Open <b>☰ Menu → Google Auth platform → Branding</b> and click <b>Get started</b> if shown. Enter <b>Hey Broski</b> as the app name, select your email as the user support email, then click <b>Next</b>.</span></li>
-                    <li><strong>Choose who can use it.</strong><span>Select <b>External</b> for a personal Gmail account and click <b>Next</b>. Enter your email as the contact address, click <b>Next</b>, review the Google API Services User Data Policy, then click <b>Continue → Create</b>. For a managed Google Workspace account, your administrator may instead require <b>Internal</b>.</span></li>
-                    <li><strong>Add yourself as a test user.</strong><span>In <b>Google Auth platform → Audience</b>, find <b>Test users</b>, click <b>Add users</b>, enter the same Gmail address, and save.</span></li>
-                    <li><strong>Allow read-only mail access.</strong><span>In <b>Google Auth platform → Data Access</b>, click <b>Add or remove scopes</b>. Find and select <code>https://www.googleapis.com/auth/gmail.readonly</code>, then update and save. This lets Hey Broski read mail; it cannot send or delete it.</span></li>
-                    <li><strong>Create the Desktop client.</strong><span>Open <b>Google Auth platform → Clients → Create client</b>. Choose <b>Desktop app</b>, name it <b>Hey Broski Local</b>, and click <b>Create</b>.</span></li>
-                    <li><strong>Download and import the JSON.</strong><span>Click <b>Download JSON</b> in the confirmation window, or use the download icon beside the client in <b>Clients</b>. Save the file on this computer, choose it below, then click <b>Confirm client details</b>. After that, use <b>Continue with Google</b> to approve access.</span></li>
-                  </ol>
-                  <p className="setup-footnote">While your Google app stays in <b>Testing</b>, Google may ask you to reconnect after seven days. Your previously imported local mail stays available.</p>
-                  {!state.gmail_client_imported && <><label className="onboarding-file">Choose downloaded JSON<input type="file" accept="application/json,.json" onChange={async e => { const file = e.target.files?.[0]; if (file) setGmailJson(await file.text()) }} /></label><textarea aria-label="Google OAuth client JSON" placeholder="Or paste the downloaded Desktop OAuth JSON here" value={gmailJson} onChange={e => setGmailJson(e.target.value)} rows={4} /><button type="button" className="onboarding-secondary" onClick={importGmail} disabled={busy || !gmailJson.trim()}>Confirm client details</button></>}
-                  {state.gmail_client_imported && <button type="button" className="onboarding-primary" disabled={busy} onClick={() => void connect('gmail')}>Continue with Google <ArrowRight size={16} /></button>}
-                </> : <><p>Sign in with a personal Outlook account or a Microsoft 365 account whose administrator permits this application.</p>
-                  {!state.outlook_available && <><ol><li>Register an application in Microsoft Entra.</li><li>Choose personal and organizational account support, add a Mobile and desktop redirect URI matching <code>http://localhost:8000/api/accounts/outlook/callback</code>.</li><li>Add delegated <code>Mail.Read</code> and <code>User.Read</code> permissions. Copy its Application (client) ID below.</li></ol><a href="https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app" target="_blank" rel="noreferrer">Microsoft&apos;s registration guide ↗</a><label>Application (client) ID<input value={outlookId} onChange={e => setOutlookId(e.target.value)} placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" /></label><button type="button" className="onboarding-secondary" disabled={busy || !outlookId.trim()} onClick={importOutlook}>Confirm application ID</button></>}
-                  {state.outlook_available && <button type="button" className="onboarding-primary" disabled={busy} onClick={() => void connect('outlook')}>Continue with Microsoft <ArrowRight size={16} /></button>}
-                </>}
-              </div>}
+              <button type="button" className="provider-title" onClick={() => { setError(''); setOpenProvider(provider) }}><span className={`provider-mark ${provider}`}><Mail size={20} /></span><span className="provider-title-copy"><strong>{provider === 'gmail' ? 'Gmail' : 'Outlook'}</strong><small>{state.accounts.filter(a => a.provider === provider).length ? `${state.accounts.filter(a => a.provider === provider).length} connected` : 'Read-only mail access'}</small></span></button>
+              <button type="button" className="onboarding-secondary" onClick={() => { setError(''); setOpenProvider(provider) }}>Set up connection</button>
+
             </div>)}
           </div>
           {!!state.accounts.length && <div className="connected-list"><strong>Verified mailboxes</strong>{state.accounts.map(account => <div key={account.id}><Check size={16} /> {account.email}</div>)}</div>}
@@ -191,17 +156,18 @@ export function Onboarding({ initial, onComplete, initialStep }: { initial: Onbo
         </>}
         {step === 'sync' && <><span className="section-label">STEP 03 / 03</span><h1>Make it yours.</h1><p className="onboarding-intro">Choose how much existing mail to import and how often Hey Broski checks for updates while it is running. These choices apply to all connected mailboxes.</p>
           <div className="connected-list"><strong>Connected mailboxes</strong>{state.accounts.map(account => <div key={account.id}><Check size={16} /> {account.email}</div>)}</div>
-          {state.accounts.some(account => state.sync_jobs[account.id]) && <div className="connected-list" role="status"><strong>First import</strong>{state.accounts.map(account => { const job = state.sync_jobs[account.id]; return <div key={account.id}>{account.email}: {job?.status === 'complete' ? `${job.processed_count} messages checked` : job?.status === 'failed' ? `Import paused: ${job.error || 'provider error'}` : job?.status === 'running' ? `Importing · ${job.processed_count} messages checked` : 'Waiting to start'}</div> })}</div>}
+          <p className="onboarding-note"><RefreshCw size={15} /> Import starts in the background. You can use your workspace while it runs.</p>
           <form className="onboarding-form" onSubmit={saveSync}>
             <label>How far back should we import?<select value={historyMonths} onChange={e => setHistoryMonths(Number(e.target.value))}><option value="3">Last 3 months</option><option value="6">Last 6 months</option><option value="12">Last 1 year</option><option value="24">Last 2 years</option></select></label>
             <label>How often should we sync?<select value={intervalHours} onChange={e => setIntervalHours(Number(e.target.value))}><option value="1">Every hour</option><option value="6">Every 6 hours</option><option value="12">Every 12 hours</option><option value="24">Every day</option></select></label>
             <label className="onboarding-check"><input type="checkbox" checked={includeSent} onChange={e => setIncludeSent(e.target.checked)} /> Include sent mail, to help identify follow-ups</label>
             <p className="onboarding-note"><LockKeyhole size={15} /> Imported mail is stored on this computer. Keep Hey Broski open while the first import finishes.</p>
-            <button className="onboarding-primary" type="submit" disabled={busy || waitingForImport && !state.accounts.some(account => state.sync_jobs[account.id]?.status === 'failed')}>{busy ? 'Saving…' : waitingForImport && !state.accounts.some(account => state.sync_jobs[account.id]?.status === 'failed') ? 'Importing your mail…' : 'Enter my workspace'} <ArrowRight size={17} /></button>
+            <button className="onboarding-primary" type="submit" disabled={busy}>{busy ? 'Saving…' : 'Enter my workspace'} <ArrowRight size={17} /></button>
           </form><button type="button" className="onboarding-back" onClick={() => setStep('connections')}><ChevronLeft size={15} /> Back to connections</button></>}
         </div>
       </section>
     </div>
     <footer className="onboarding-footer"><RefreshCw size={14} /> Your connections and sync settings can always be changed later.</footer>
+    <ConnectionDialog provider={openProvider} onClose={closeProvider} error={error} gmailJson={gmailJson} setGmailJson={setGmailJson} gmailClientImported={state.gmail_client_imported} outlookId={outlookId} setOutlookId={setOutlookId} outlookAvailable={state.outlook_available} busy={busy} importGmail={() => void importGmail()} importOutlook={() => void importOutlook()} connect={provider => void connect(provider)} />
   </main>
 }

@@ -80,7 +80,7 @@ class Repository:
         CREATE TABLE IF NOT EXISTS oauth_attempts (state TEXT PRIMARY KEY, provider TEXT NOT NULL, code_verifier TEXT NOT NULL, expires_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS sync_preferences (account_id TEXT PRIMARY KEY REFERENCES connected_accounts(id) ON DELETE CASCADE, history_months INTEGER NOT NULL, interval_hours INTEGER NOT NULL, include_sent INTEGER NOT NULL, updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS mail_sources (provider TEXT NOT NULL, account_id TEXT NOT NULL REFERENCES connected_accounts(id) ON DELETE CASCADE, message_id TEXT NOT NULL, title TEXT NOT NULL, snippet TEXT NOT NULL, sent_at TEXT NOT NULL, sender TEXT NOT NULL, folder TEXT NOT NULL, PRIMARY KEY(account_id, message_id));
-        CREATE TABLE IF NOT EXISTS sync_jobs (account_id TEXT PRIMARY KEY REFERENCES connected_accounts(id) ON DELETE CASCADE, status TEXT NOT NULL, processed_count INTEGER NOT NULL DEFAULT 0, page_token TEXT, started_at TEXT NOT NULL, updated_at TEXT NOT NULL, error TEXT);
+        CREATE TABLE IF NOT EXISTS sync_jobs (account_id TEXT PRIMARY KEY REFERENCES connected_accounts(id) ON DELETE CASCADE, status TEXT NOT NULL, processed_count INTEGER NOT NULL DEFAULT 0, page_token TEXT, started_at TEXT NOT NULL, updated_at TEXT NOT NULL, error TEXT, total_estimate INTEGER, skipped_count INTEGER NOT NULL DEFAULT 0);
         CREATE INDEX IF NOT EXISTS idx_mail_sources_account_date ON mail_sources(account_id, sent_at);
         """
         with self._lock, self.connect() as connection:
@@ -89,6 +89,10 @@ class Repository:
             for name in ("date_of_birth", "country_code"):
                 if name not in profile_columns:
                     connection.execute(f"ALTER TABLE owner_profile ADD COLUMN {name} TEXT")
+            job_columns = {row[1] for row in connection.execute("PRAGMA table_info(sync_jobs)")}
+            for name, declaration in (("total_estimate", "INTEGER"), ("skipped_count", "INTEGER NOT NULL DEFAULT 0")):
+                if name not in job_columns:
+                    connection.execute(f"ALTER TABLE sync_jobs ADD COLUMN {name} {declaration}")
             columns = {row[1] for row in connection.execute("PRAGMA table_info(messages)")}
             for name, declaration in (
                 ("turn_id", "TEXT"),
@@ -416,9 +420,9 @@ class Repository:
         accounts = self.list_accounts()
         preferences = {item["id"]: self.get_sync_preferences(item["id"]) for item in accounts}
         jobs = {item["id"]: self.get_sync_job(item["id"]) for item in accounts}
-        imported = bool(accounts) and all(preferences.values()) and all(item["last_synced_at"] for item in accounts)
+        configured = bool(accounts) and all(preferences.values())
         return {"profile": self.get_profile(), "profile_complete": self.profile_complete(), "accounts": accounts, "sync_preferences": preferences,
-                "sync_jobs": jobs, "ready": self.profile_complete() and imported}
+                "sync_jobs": jobs, "ready": self.profile_complete() and configured}
 
     def upsert_mail_source(self, account_id: str, provider: str, message_id: str, title: str, snippet: str, sent_at: str, sender: str, folder: str) -> None:
         with self._lock, self.connect() as connection:
@@ -436,9 +440,12 @@ class Repository:
 
     def start_sync_job(self, account_id: str) -> None:
         with self._lock, self.connect() as connection:
-            connection.execute("""INSERT INTO sync_jobs VALUES (?, 'running', 0, NULL, ?, ?, NULL)
+            connection.execute("""INSERT INTO sync_jobs (account_id, status, processed_count, page_token, started_at, updated_at, error)
+                VALUES (?, 'running', 0, NULL, ?, ?, NULL)
                 ON CONFLICT(account_id) DO UPDATE SET status='running', error=NULL, updated_at=excluded.updated_at,
-                processed_count=CASE WHEN sync_jobs.status='complete' THEN 0 ELSE sync_jobs.processed_count END""",
+                processed_count=CASE WHEN sync_jobs.status='complete' THEN 0 ELSE sync_jobs.processed_count END,
+                skipped_count=CASE WHEN sync_jobs.status='complete' THEN 0 ELSE sync_jobs.skipped_count END,
+                total_estimate=CASE WHEN sync_jobs.status='complete' THEN NULL ELSE sync_jobs.total_estimate END""",
                 (account_id, now_iso(), now_iso()))
 
     def reset_sync_job(self, account_id: str) -> None:
@@ -452,10 +459,11 @@ class Repository:
             connection.execute("DELETE FROM sync_jobs WHERE account_id=?", (account_id,))
             connection.execute("UPDATE connected_accounts SET last_synced_at=NULL, sync_error=NULL WHERE id=?", (account_id,))
 
-    def update_sync_job(self, account_id: str, status: str, page_token: str | None = None, increment: int = 0, error: str | None = None) -> None:
+    def update_sync_job(self, account_id: str, status: str, page_token: str | None = None, increment: int = 0, error: str | None = None, skipped: int = 0, total_estimate: int | None = None) -> None:
         with self._lock, self.connect() as connection:
-            connection.execute("""UPDATE sync_jobs SET status=?, page_token=?, processed_count=processed_count+?, updated_at=?, error=? WHERE account_id=?""",
-                (status, page_token, increment, now_iso(), error, account_id))
+            connection.execute("""UPDATE sync_jobs SET status=?, page_token=?, processed_count=processed_count+?,
+                skipped_count=skipped_count+?, total_estimate=COALESCE(?, total_estimate), updated_at=?, error=? WHERE account_id=?""",
+                (status, page_token, increment, skipped, total_estimate, now_iso(), error, account_id))
             if status == "complete":
                 connection.execute("UPDATE connected_accounts SET last_synced_at=?, sync_error=NULL WHERE id=?", (now_iso(), account_id))
             elif status == "failed":
