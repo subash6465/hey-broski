@@ -6,3 +6,6 @@ httpx==0.28.1
 structlog==25.3.0
 pypdf==5.5.0
 python-dotenv==1.0.1
+cryptography>=45,<50
+keyring>=25,<27
+tzdata>=2025.2

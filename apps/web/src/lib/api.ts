@@ -5,6 +5,21 @@ export const apiBase = configuredBase && configuredBase !== '/api' && !configure
   ? configuredBase
   : ''
 
+function errorMessage(detail: unknown, fallback: string): string {
+  if (typeof detail === 'string') return detail || fallback
+  if (Array.isArray(detail)) {
+    const messages = detail.map(item => {
+      if (!item || typeof item !== 'object') return ''
+      const issue = item as { loc?: unknown; msg?: unknown }
+      const field = Array.isArray(issue.loc) ? issue.loc.filter(part => part !== 'body').join(' ') : ''
+      return typeof issue.msg === 'string' ? `${field ? `${field}: ` : ''}${issue.msg}` : ''
+    }).filter(Boolean)
+    return messages.join('; ') || fallback
+  }
+  if (detail && typeof detail === 'object' && 'message' in detail && typeof detail.message === 'string') return detail.message
+  return fallback
+}
+
 export async function request<T>(path: string, init: RequestInit = {}, timeoutMs = 60_000): Promise<T> {
   const controller = new AbortController()
   const timeout = window.setTimeout(() => controller.abort(), timeoutMs)
@@ -18,8 +33,8 @@ export async function request<T>(path: string, init: RequestInit = {}, timeoutMs
       body = text
     }
     if (!response.ok) {
-      const detail = typeof body === 'object' && body && 'detail' in body ? String(body.detail) : text
-      throw new Error(detail || `Request failed (${response.status})`)
+      const detail = typeof body === 'object' && body && 'detail' in body ? body.detail : body
+      throw new Error(errorMessage(detail, `Request failed (${response.status})`))
     }
     return body as T
   } catch (error) {
@@ -45,7 +60,7 @@ export async function streamChat(path: string, message: string, onEvent: (event:
   })
   if (!response.ok) {
     const body = await response.json().catch(() => ({}))
-    throw new Error(body.detail || `Chat failed (${response.status})`)
+    throw new Error(errorMessage(body.detail, `Chat failed (${response.status})`))
   }
   if (!response.body) throw new Error('The chat stream did not open')
   const reader = response.body.getReader()
