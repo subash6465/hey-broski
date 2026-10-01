@@ -114,6 +114,10 @@
 .setup-cost { display: grid; gap: 4px; width: 100%; padding: 13px 15px; border: 1px solid rgba(157,135,221,.25); border-radius: 12px; background: rgba(242,238,255,.7); }
 .setup-cost strong { color: #5948a0; font-size: 11px; }
 .setup-cost span, .setup-footnote { color: #78708c; font-size: 10px; line-height: 1.6; }
+.setup-alternative { width: 100%; padding: 12px 14px; border: 1px solid rgba(160,134,220,.25); border-radius: 11px; background: rgba(255,255,255,.52); }
+.setup-alternative summary { color: #6652b6; font-size: 11px; font-weight: 750; cursor: pointer; }
+.setup-alternative p { margin: 10px 0 !important; color: #776e8c; font-size: 10px; line-height: 1.65; }
+.setup-alternative > code { display: block; padding: 10px; border-radius: 8px; background: rgba(239,234,253,.8); overflow-wrap: anywhere; }
 .provider-details .setup-footnote { margin: 0; padding: 10px 12px; border-radius: 10px; background: rgba(255,255,255,.54); }
 .provider-details p { margin: 0; }
 .provider-details a { color: #6955c8; font-weight: 750; text-underline-offset: 3px; }
