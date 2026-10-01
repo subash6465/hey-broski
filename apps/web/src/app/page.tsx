@@ -2,45 +2,47 @@
 
 import { FormEvent, useEffect, useRef, useState } from 'react'
 import {
-  Archive,
+  ArrowUpRight,
+  BookOpen,
   Bot,
   CheckCircle2,
   ChevronRight,
+  Clock3,
   FileText,
-  Inbox,
+  House,
   Menu,
+  MessageCircle,
   MessageSquarePlus,
   History,
   Paperclip,
   Send,
-  ShieldCheck,
   Sparkles,
   Trash2,
   Upload,
   X,
 } from 'lucide-react'
 import { ActionCardView } from '@/components/ActionCardView'
+import { LocalDateTime } from '@/components/LocalDateTime'
 import { request, streamChat, type ChatStreamEvent } from '@/lib/api'
 import type { ActionCard, ChatMessage, ChatSession, DocumentRecord, Source, StoredMessage } from '@/lib/types'
 
-type View = 'chat' | 'actions' | 'vault' | 'history'
+type View = 'desk' | 'chat' | 'actions' | 'vault' | 'history'
 type DeleteTarget = { kind: 'conversation' | 'document'; id: string; label: string }
 type Health = { status: string; mode: string; inference_enabled: boolean; services: { database: string; ollama: string }; model: string }
 
 const prompts = [
   { label: 'Daily brief', text: 'What needs my attention this week?' },
   { label: 'Waiting on me', text: 'Who is waiting on me?' },
-  { label: 'Renewals', text: 'Show upcoming renewals and deadlines' },
 ]
 
 const welcome: ChatMessage = {
   id: 'welcome',
   role: 'assistant',
-  content: "Morning! I’ve organized your demo inbox. Ask for a daily brief, check who needs a reply, or upload a document to search your local vault.",
+  content: "Hey, I'm Broski. Ask for a brief, check who needs a reply, or search a document in your local library.",
 }
 
 export default function Home() {
-  const [view, setView] = useState<View>('chat')
+  const [view, setView] = useState<View>('desk')
   const [mobileNav, setMobileNav] = useState(false)
   const [sessionId, setSessionId] = useState<string>()
   const [sessions, setSessions] = useState<ChatSession[]>([])
@@ -105,6 +107,7 @@ export default function Home() {
     event?.preventDefault()
     const text = (selectedPrompt ?? input).trim()
     if (!text || busy) return
+    setView('chat')
     setError(undefined)
     setNotice(undefined)
     setBusy(true)
@@ -258,7 +261,7 @@ export default function Home() {
     setView(next)
     setMobileNav(false)
     try {
-      if (next === 'actions') setActions(await request<ActionCard[]>('/api/actions'))
+      if (next === 'desk' || next === 'actions') setActions(await request<ActionCard[]>('/api/actions'))
       if (next === 'vault') setDocuments(await request<DocumentRecord[]>('/api/documents'))
       if (next === 'history') setSessions((await request<{ sessions: ChatSession[] }>('/api/chat/sessions')).sessions)
     } catch (caught) {
@@ -267,41 +270,51 @@ export default function Home() {
   }
 
   const pendingCount = actions.filter((action) => action.status === 'pending').length
+  const pendingActions = actions.filter((action) => action.status === 'pending')
+  const firstAction = pendingActions[0]
 
   return (
     <div className="app-shell">
       <button className="mobile-menu" onClick={() => setMobileNav(true)} aria-label="Open navigation"><Menu /></button>
       <aside className={`sidebar ${mobileNav ? 'sidebar-open' : ''}`}>
-        <div className="brand"><div className="brand-mark"><Sparkles size={20} /></div><span>Hey Broski</span></div>
+        <div className="brand"><div className="brand-mark"><Sparkles size={20} /></div><span>hey broski<span className="brand-dot">.</span></span></div>
         <button className="sidebar-close" onClick={() => setMobileNav(false)} aria-label="Close navigation"><X /></button>
-        <button className="new-chat" onClick={newConversation} disabled={busy}><MessageSquarePlus size={17} /> New conversation</button>
         <nav>
-          <NavButton icon={<Inbox />} label="Chat" active={view === 'chat'} onClick={() => void switchView('chat')} />
-          <NavButton icon={<CheckCircle2 />} label="Action inbox" count={pendingCount} active={view === 'actions'} onClick={() => void switchView('actions')} />
-          <NavButton icon={<Archive />} label="Document vault" active={view === 'vault'} onClick={() => void switchView('vault')} />
-          <NavButton icon={<History />} label="Conversation history" active={view === 'history'} onClick={() => void switchView('history')} />
+          <NavButton icon={<House />} label="My desk" active={view === 'desk'} onClick={() => void switchView('desk')} />
+          <NavButton icon={<MessageCircle />} label="Chat" active={view === 'chat'} onClick={() => void switchView('chat')} />
+          <NavButton icon={<CheckCircle2 />} label="To review" count={pendingCount} active={view === 'actions'} onClick={() => void switchView('actions')} />
+          <NavButton icon={<BookOpen />} label="Library" active={view === 'vault'} onClick={() => void switchView('vault')} />
         </nav>
-        <div className="recent-conversations" aria-label="Recent conversations">
-          <span className="recent-label">RECENT CHATS</span>
-          {sessions.slice(0, 8).map((session) => <div className="recent-chat-row" key={session.session_id}><button className={sessionId === session.session_id && view === 'chat' ? 'selected' : ''} disabled={busy || deleting} onClick={() => void openConversation(session.session_id)} title={session.title}>{session.title}</button><button className="recent-delete" type="button" disabled={busy || deleting} onClick={() => setDeleteTarget({ kind: 'conversation', id: session.session_id, label: session.title })} aria-label={`Delete conversation ${session.title}`} title="Delete conversation"><Trash2 size={14} /></button></div>)}
-        </div>
+        <button className="new-chat" onClick={newConversation} disabled={busy}><MessageSquarePlus size={16} /> New conversation</button>
+        <button className={`history-link ${view === 'history' ? 'active' : ''}`} onClick={() => void switchView('history')}><History size={16} /> History</button>
         <div className="sidebar-footer">
-          <div className="privacy-note"><ShieldCheck size={17} /><div><strong>Local-first</strong><span>Your data stays on this device.</span></div></div>
-          <div className="profile"><div className="avatar">Y</div><div><strong>You</strong><span>Demo workspace</span></div></div>
+          <div className="privacy-note"><span className="privacy-dot" /><div><strong>Local workspace</strong><span>Private by default</span></div></div>
         </div>
       </aside>
       {mobileNav && <button className="nav-overlay" onClick={() => setMobileNav(false)} aria-label="Close navigation" />}
 
       <main className="workspace">
         <header className="topbar">
-          <div><p className="eyebrow">PERSONAL ADMIN COPILOT</p><h1>{viewTitles[view]}</h1></div>
+          <div className="topbar-path"><span>{viewTitles[view]}</span><span className="path-divider">/</span>{view === 'desk' ? <LocalDateTime /> : <span>HEY BROSKI</span>}</div>
           <div className="status-cluster">
-            <span className="mode-badge"><span className="status-dot" /> {!health ? 'Connecting…' : health.mode === 'demo' ? 'Demo data' : 'Connected data'}</span>
+            <span className="mode-badge"><span className="status-dot" /> {!health ? 'Connecting...' : health.mode === 'demo' ? 'Demo mode' : 'Local workspace'}</span>
             <span className="model-label">{!health ? 'Checking local model' : !health.inference_enabled ? 'Local model disabled' : health.services.ollama === 'available' ? `Local model: ${health.model}` : health.services.ollama.startsWith('model_missing:') ? `Model not ready: ${health.model}` : 'Local model offline'}</span>
           </div>
         </header>
         {error && <div className="error-banner" role="alert"><span>{error}</span><button onClick={() => setError(undefined)}><X size={16} /></button></div>}
         {notice && <div className="notice-banner" role="status"><span>{notice}</span><button onClick={() => setNotice(undefined)}><X size={16} /></button></div>}
+
+        {view === 'desk' && <section className="desk" aria-label="My desk">
+          <div className="desk-intro"><p className="section-label">A LITTLE CLARITY FOR TODAY</p><h1>Hey, {health?.mode === 'demo' ? 'Subash' : 'there'} <Sparkles aria-hidden="true" /></h1><p>Here&apos;s what&apos;s worth a look. The rest can wait.</p></div>
+          <div className="desk-cards">
+            <section className="glass-card brief-card" aria-label="Your brief"><div className="card-kicker"><span>YOUR BRIEF</span><span>01 / 02</span></div><h2>Today, at a glance.</h2>
+              {pendingActions.length ? pendingActions.slice(0, 2).map((action) => <button className="brief-row" type="button" key={action.id} onClick={() => void switchView('actions')}><span className="brief-icon"><ArrowUpRight size={15} /></span><span className="brief-copy"><strong>{action.title}</strong><small>{action.description}</small></span><span className="brief-source">{action.source_refs[0]?.source_type ?? 'ACTION'}</span></button>) : <><button className="brief-row" type="button" onClick={() => void sendMessage(undefined, 'Who is waiting on me?')}><span className="brief-icon"><ArrowUpRight size={15} /></span><span className="brief-copy"><strong>Find follow-ups</strong><small>Ask who is waiting on you</small></span><span className="brief-source">ASK</span></button><button className="brief-row" type="button" onClick={() => void sendMessage(undefined, 'Show upcoming renewals and deadlines')}><span className="brief-icon"><Clock3 size={15} /></span><span className="brief-copy"><strong>Check upcoming dates</strong><small>Look for renewals and deadlines</small></span><span className="brief-source">ASK</span></button></>}
+              <button className="text-link" type="button" onClick={() => void switchView('actions')}>See everything <ArrowUpRight size={14} /></button>
+            </section>
+            <section className="glass-card review-card" aria-label="Suggestions for review"><div className="card-kicker"><span>NEEDS YOUR OKAY</span><span>{pendingCount} TO REVIEW</span></div><div className="review-orb"><Sparkles size={22} /></div><h2>{firstAction ? 'A suggestion is ready when you are.' : 'You call the shots.'}</h2><p>{firstAction ? firstAction.description : 'Ask Broski for a brief. Any suggested next steps will appear here for your review.'}</p><button className="primary-button" type="button" onClick={() => firstAction ? void switchView('actions') : void sendMessage(undefined, 'What needs my attention this week?')}>{firstAction ? 'Review suggestion' : 'Get my brief'} <ArrowUpRight size={16} /></button><small>Suggested actions wait for your approval.</small></section>
+          </div>
+          <form className="desk-ask" onSubmit={sendMessage}><label htmlFor="desk-input" className="section-label">ASK BROSKI</label><h2>What&apos;s on your mind?</h2><div className="desk-input"><input id="desk-input" value={input} onChange={(event) => setInput(event.target.value)} placeholder="Ask about your day, a document, or what's next..." disabled={busy} /><button type="submit" aria-label="Send message" disabled={!input.trim() || busy}><ArrowUpRight size={19} /></button></div><div className="desk-prompts"><span>Try:</span><button type="button" disabled={busy} onClick={() => void sendMessage(undefined, 'Who is waiting on me?')}>Who&apos;s waiting on me?</button><button type="button" disabled={busy} onClick={() => void sendMessage(undefined, 'Show my deadlines')}>Show my deadlines</button></div></form>
+        </section>}
 
         {view === 'chat' && (
           <section className="chat-layout">
@@ -330,16 +343,16 @@ export default function Home() {
           </section>
         )}
 
-        {view === 'actions' && <Collection title={`${pendingCount} items need a decision`} subtitle="Review every proposed action before anything changes.">{actions.length ? actions.map((card) => <ActionCardView key={card.id} card={card} busy={decisionBusy === card.id} onDecision={decide} />) : <Empty text="Ask for your daily brief to generate action cards." />}</Collection>}
-        {view === 'vault' && <Collection title="Your local documents" subtitle="PDF, text, Markdown, and CSV files are searchable from chat."><label className="upload-card"><Upload size={22} /><strong>{uploading ? 'Uploading…' : 'Upload a document'}</strong><span>Maximum 10 MB</span><input type="file" disabled={uploading} accept=".pdf,.txt,.md,.csv" onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ''; void upload(file) }} /></label>{documents.map((doc) => <article className="document-card" key={doc.id}><FileText /><div><strong>{doc.filename}</strong><span>{Math.ceil(doc.size_bytes / 1024)} KB · {new Date(doc.created_at).toLocaleDateString()}</span><p>{doc.preview}</p><div className="document-actions"><button type="button" onClick={() => { setInput(`What does ${doc.filename} say about `); setView('chat') }}>Ask about this file</button><button type="button" className="delete-button" disabled={busy || uploading || deleting} onClick={() => setDeleteTarget({ kind: 'document', id: doc.id, label: doc.filename })}><Trash2 size={14} /> Delete</button></div></div></article>)}</Collection>}
-        {view === 'history' && <Collection title="Conversation history" subtitle="Your conversations are saved locally and can be reopened anytime.">{sessions.length ? sessions.map((session) => <div className="history-row" key={session.session_id}><button className="history-card" disabled={busy || deleting} onClick={() => void openConversation(session.session_id)}><strong>{session.title}</strong><span>{new Date(session.updated_at).toLocaleString()}</span><ChevronRight size={17} /></button><button className="history-delete delete-button" type="button" disabled={busy || deleting} onClick={() => setDeleteTarget({ kind: 'conversation', id: session.session_id, label: session.title })} aria-label={`Delete conversation ${session.title}`}><Trash2 size={16} /> Delete</button></div>) : <Empty text="Your conversations will appear here after you send a message." />}</Collection>}
+        {view === 'actions' && <Collection eyebrow="TO REVIEW" title={pendingCount === 1 ? '1 item needs a decision' : `${pendingCount} items need a decision`} subtitle="Review every proposed action before anything changes.">{actions.length ? actions.map((card) => <ActionCardView key={card.id} card={card} busy={decisionBusy === card.id} onDecision={decide} />) : <Empty text="Ask for your daily brief to generate action cards." />}</Collection>}
+        {view === 'vault' && <Collection eyebrow="YOUR LIBRARY" title="Your local documents" subtitle="PDF, text, Markdown, and CSV files are searchable from chat."><label className="upload-card"><Upload size={22} /><strong>{uploading ? 'Uploading…' : 'Upload a document'}</strong><span>Maximum 10 MB</span><input type="file" disabled={uploading} accept=".pdf,.txt,.md,.csv" onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ''; void upload(file) }} /></label>{documents.map((doc) => <article className="document-card" key={doc.id}><FileText /><div><strong>{doc.filename}</strong><span>{Math.ceil(doc.size_bytes / 1024)} KB · {new Date(doc.created_at).toLocaleDateString()}</span><p>{doc.preview}</p><div className="document-actions"><button type="button" onClick={() => { setInput(`What does ${doc.filename} say about `); setView('chat') }}>Ask about this file</button><button type="button" className="delete-button" disabled={busy || uploading || deleting} onClick={() => setDeleteTarget({ kind: 'document', id: doc.id, label: doc.filename })}><Trash2 size={14} /> Delete</button></div></div></article>)}</Collection>}
+        {view === 'history' && <Collection eyebrow="PAST CONVERSATIONS" title="Conversation history" subtitle="Your conversations are saved locally and can be reopened anytime.">{sessions.length ? sessions.map((session) => <div className="history-row" key={session.session_id}><button className="history-card" disabled={busy || deleting} onClick={() => void openConversation(session.session_id)}><strong>{session.title}</strong><span>{new Date(session.updated_at).toLocaleString()}</span><ChevronRight size={17} /></button><button className="history-delete delete-button" type="button" disabled={busy || deleting} onClick={() => setDeleteTarget({ kind: 'conversation', id: session.session_id, label: session.title })} aria-label={`Delete conversation ${session.title}`}><Trash2 size={16} /> Delete</button></div>) : <Empty text="Your conversations will appear here after you send a message." />}</Collection>}
       </main>
       {deleteTarget && <div className="confirm-backdrop" onClick={(event) => { if (event.target === event.currentTarget && !deleting) setDeleteTarget(undefined) }}><div className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-title" aria-describedby="delete-description" onKeyDown={(event) => { if (event.key === 'Escape' && !deleting) setDeleteTarget(undefined) }}><h2 id="delete-title">Delete {deleteTarget.kind}?</h2><p id="delete-description"><strong>{deleteTarget.label}</strong> {deleteTarget.kind === 'document' ? 'and its searchable text will be removed from the local vault. Future chats cannot retrieve it, but existing conversations and their saved source excerpts will remain.' : 'and its messages, related actions, and reminders will be permanently removed.'} This cannot be undone.</p><div className="confirm-actions"><button type="button" autoFocus disabled={deleting} onClick={() => setDeleteTarget(undefined)}>Cancel</button><button type="button" className="confirm-delete" disabled={deleting} onClick={() => void confirmDelete()}>{deleting ? 'Deleting…' : 'Delete permanently'}</button></div></div></div>}
     </div>
   )
 }
 
-const viewTitles: Record<View, string> = { chat: 'Good morning', actions: 'Action inbox', vault: 'Document vault', history: 'Conversation history' }
+const viewTitles: Record<View, string> = { desk: 'MY DESK', chat: 'CHAT', actions: 'TO REVIEW', vault: 'LIBRARY', history: 'HISTORY' }
 
 function toChatMessage(message: StoredMessage): ChatMessage {
   return {
@@ -364,8 +377,8 @@ function SourceList({ sources }: { sources: Source[] }) {
   return <details className="sources"><summary>{sources.length} grounded source{sources.length === 1 ? '' : 's'}</summary><div>{sources.map((source, index) => <article key={`${source.source_id}-${index}`}><span>{index + 1}</span><div><strong>{source.title}</strong><small>{source.account_label}</small><p>{source.snippet}</p></div></article>)}</div></details>
 }
 
-function Collection({ title, subtitle, children }: { title: string; subtitle: string; children: React.ReactNode }) {
-  return <section className="collection"><div className="collection-heading"><h2>{title}</h2><p>{subtitle}</p></div><div className="collection-grid">{children}</div></section>
+function Collection({ eyebrow, title, subtitle, children }: { eyebrow: string; title: string; subtitle: string; children: React.ReactNode }) {
+  return <section className="collection"><div className="collection-heading"><span className="section-label">{eyebrow}</span><h2>{title}</h2><p>{subtitle}</p></div><div className="collection-grid">{children}</div></section>
 }
 
 function Empty({ text }: { text: string }) { return <div className="empty-state"><Sparkles /><p>{text}</p></div> }

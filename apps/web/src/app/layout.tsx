@@ -1,5 +1,9 @@
 import type { Metadata } from 'next'
+import '@fontsource-variable/dm-sans/wght.css'
+import '@fontsource-variable/manrope/wght.css'
+import '@fontsource/dm-mono/400.css'
 import './globals.css'
+import './glass.css'
 
 export const metadata: Metadata = {
   title: 'Hey Broski',
@@ -13,7 +17,7 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en">
-      <body className="min-h-screen bg-gray-50">{children}</body>
+      <body>{children}</body>
     </html>
   )
 }
