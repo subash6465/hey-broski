@@ -93,8 +93,10 @@ class OwnerProfileInput(BaseModel):
             raise ValueError("The complete phone number must have at most 15 digits")
         try:
             today = datetime.now(ZoneInfo(self.time_zone)).date()
-        except ZoneInfoNotFoundError as exc:
-            raise ValueError("The detected time zone is not valid") from exc
+        except ZoneInfoNotFoundError:
+            # Windows may have no IANA zone database until tzdata is installed.
+            # The local app runs on the same computer as the browser.
+            today = datetime.now().date()
         age = today.year - self.date_of_birth.year - ((today.month, today.day) < (self.date_of_birth.month, self.date_of_birth.day))
         if age < 0 or age > 120:
             raise ValueError("Enter a valid date of birth")

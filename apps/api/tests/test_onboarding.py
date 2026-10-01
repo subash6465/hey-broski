@@ -15,6 +15,8 @@ from app.credential_vault import CredentialVault
 from app.connectors import ConnectorService
 from app.mail_sync import MailSync
 from app.repository import Repository
+from app import repository as repository_module, schemas as profile_schemas
+from zoneinfo import ZoneInfoNotFoundError
 
 
 def test_profile_connection_and_real_mail_import(tmp_path: Path, monkeypatch) -> None:
@@ -218,3 +220,19 @@ def test_profile_rejects_future_birth_date_and_invalid_phone(tmp_path: Path) -> 
         assert client.put("/api/profile", json=profile).status_code == 422
         assert client.put("/api/profile", json={**profile, "date_of_birth": "1997-05-12", "country_code": "91"}).status_code == 422
         assert client.put("/api/profile", json={**profile, "date_of_birth": "1997-05-12", "phone_number": "98 765"}).status_code == 422
+
+
+def test_profile_uses_machine_date_if_zone_database_is_missing(tmp_path: Path, monkeypatch) -> None:
+    def missing_zone(_name: str):
+        raise ZoneInfoNotFoundError("zone data unavailable")
+
+    monkeypatch.setattr(profile_schemas, "ZoneInfo", missing_zone)
+    monkeypatch.setattr(repository_module, "ZoneInfo", missing_zone)
+    profile = profile_schemas.OwnerProfileInput.model_validate({"first_name": "Asha", "last_name": "Rao",
+        "date_of_birth": "1997-05-12", "country_code": "+91", "phone_number": "9876543210",
+        "gender": "female", "time_zone": "Asia/Calcutta"})
+    repository = Repository(tmp_path / "api.db")
+    repository.initialize()
+    saved = repository.save_profile(profile.model_dump())
+    assert saved["date_of_birth"] == "1997-05-12"
+    assert repository.profile_complete() is True

@@ -17,6 +17,13 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def today_in_zone(zone_name: str) -> date:
+    try:
+        return datetime.now(ZoneInfo(zone_name)).date()
+    except ZoneInfoNotFoundError:
+        return datetime.now().date()
+
+
 def document_chunks(text: str, size: int = 1000, overlap: int = 120) -> list[str]:
     """Split extracted text at word boundaries with a little context overlap."""
     words = text.split()
@@ -327,10 +334,7 @@ class Repository:
         profile = dict(row)
         if profile["date_of_birth"]:
             born = date.fromisoformat(profile["date_of_birth"])
-            try:
-                today = datetime.now(ZoneInfo(profile["time_zone"])).date()
-            except ZoneInfoNotFoundError:
-                today = datetime.now(timezone.utc).date()
+            today = today_in_zone(profile["time_zone"])
             profile["age"] = today.year - born.year - ((today.month, today.day) < (born.month, born.day))
         return profile
 
@@ -342,7 +346,7 @@ class Repository:
         born = profile["date_of_birth"]
         if isinstance(born, str):
             born = date.fromisoformat(born)
-        today = datetime.now(ZoneInfo(profile["time_zone"])).date()
+        today = today_in_zone(profile["time_zone"])
         age = today.year - born.year - ((today.month, today.day) < (born.month, born.day))
         with self._lock, self.connect() as connection:
             connection.execute("""INSERT INTO owner_profile
