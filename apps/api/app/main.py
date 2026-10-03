@@ -20,6 +20,7 @@ from .connectors import ConnectorService, ConnectionError
 from .config import settings
 from .credential_vault import CredentialVault
 from .mail_sync import MailSync
+from .mail_vectors import MailVectorIndex
 from .repository import Repository
 from .schemas import ActionCard, ChatRequest, ChatResponse, DecisionRequest, DocumentRecord, OwnerProfileInput, GmailClientInput, OutlookClientInput, SyncPreferencesInput
 
@@ -37,12 +38,16 @@ async def lifespan(_: FastAPI):
     connectors = ConnectorService(repository, vault)
     mail_sync = MailSync(repository, connectors)
     scheduler = asyncio.create_task(mail_sync.scheduler())
+    vector_worker = asyncio.create_task(assistant.mail_vectors.worker())
     try:
         yield
     finally:
         scheduler.cancel()
+        vector_worker.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await scheduler
+        with contextlib.suppress(asyncio.CancelledError):
+            await vector_worker
 
 
 app = FastAPI(title="Hey Broski API", version="0.2.0", lifespan=lifespan)
@@ -132,8 +137,51 @@ async def disconnect_account(account_id: str) -> Response:
         raise HTTPException(404, "Account not found")
     if account_id in mail_sync._running:
         raise HTTPException(409, "Wait for the current import to finish before disconnecting")
-    vault.delete(f"account:{account_id}")
-    repository.delete_account(account_id)
+    async with assistant.mail_vectors.lock:
+        await asyncio.to_thread(assistant.mail_vectors.remove_account, account_id)
+        vault.delete(f"account:{account_id}")
+        repository.delete_account(account_id)
+    return Response(status_code=204)
+
+
+@app.post("/api/accounts/{account_id}/sync/pause")
+async def pause_sync(account_id: str) -> dict[str, str]:
+    if not repository.get_account(account_id):
+        raise HTTPException(404, "Account not found")
+    job = repository.get_sync_job(account_id)
+    processing_only = job and job["status"] == "complete" and repository.mail_pipeline_counts(account_id, settings.embedding_model)["pending_embedding_chunks"] > 0
+    if not job or job["status"] != "running" and not processing_only:
+        raise HTTPException(409, "No active import or processing to pause")
+    await mail_sync.stop(account_id, "paused_processing" if processing_only else "paused")
+    async with assistant.mail_vectors.lock:
+        pass
+    return {"status": "paused"}
+
+
+@app.post("/api/accounts/{account_id}/sync/cancel")
+async def cancel_sync(account_id: str) -> dict[str, str]:
+    if not repository.get_account(account_id):
+        raise HTTPException(404, "Account not found")
+    job = repository.get_sync_job(account_id)
+    processing_only = job and job["status"] in {"complete", "paused_processing"} and repository.mail_pipeline_counts(account_id, settings.embedding_model)["pending_embedding_chunks"] > 0
+    if not job or job["status"] not in {"running", "paused", "failed"} and not processing_only:
+        raise HTTPException(409, "No active sync to cancel")
+    await mail_sync.stop(account_id, "canceled")
+    async with assistant.mail_vectors.lock:
+        pass
+    return {"status": "canceled"}
+
+
+@app.delete("/api/accounts/{account_id}/mail-data", status_code=204, response_class=Response)
+async def delete_imported_mail(account_id: str) -> Response:
+    if not repository.get_account(account_id):
+        raise HTTPException(404, "Account not found")
+    await mail_sync.stop(account_id, "canceled")
+    async with assistant.mail_vectors.lock:
+        await asyncio.to_thread(assistant.mail_vectors.remove_account, account_id)
+        repository.reset_sync_job(account_id, purge_mail_conversations=True)
+        repository.start_sync_job(account_id)
+        repository.set_sync_control(account_id, "canceled")
     return Response(status_code=204)
 
 
@@ -149,8 +197,10 @@ async def save_sync_preferences(account_id: str, preferences: SyncPreferencesInp
         raise HTTPException(409, "Wait for the current import to finish before changing sync settings")
     result = repository.save_sync_preferences(account_id, preferences.history_months, preferences.interval_hours, preferences.include_sent)
     if changed:
-        repository.reset_sync_job(account_id)
-        asyncio.create_task(mail_sync.run(account_id))
+        async with assistant.mail_vectors.lock:
+            await asyncio.to_thread(assistant.mail_vectors.remove_account, account_id)
+            repository.reset_sync_job(account_id)
+        mail_sync.schedule(account_id)
     return result
 
 
@@ -158,7 +208,8 @@ async def save_sync_preferences(account_id: str, preferences: SyncPreferencesInp
 async def sync_status(account_id: str) -> dict[str, Any]:
     if not repository.get_account(account_id):
         raise HTTPException(404, "Account not found")
-    return {"preferences": repository.get_sync_preferences(account_id), "job": repository.get_sync_job(account_id)}
+    return {"preferences": repository.get_sync_preferences(account_id), "job": repository.get_sync_job(account_id),
+            "pipeline": repository.mail_pipeline_counts(account_id, settings.embedding_model)}
 
 
 @app.post("/api/accounts/{account_id}/sync")
@@ -167,7 +218,11 @@ async def start_sync(account_id: str) -> dict[str, str]:
         raise HTTPException(404, "Account not found")
     if not repository.get_sync_preferences(account_id):
         raise HTTPException(409, "Choose import and sync settings first")
-    asyncio.create_task(mail_sync.run(account_id))
+    job = repository.get_sync_job(account_id)
+    if job and job["status"] == "paused_processing":
+        repository.set_sync_control(account_id, "complete")
+        return {"status": "resumed"}
+    mail_sync.schedule(account_id, manual=True)
     return {"status": "started"}
 
 
@@ -202,8 +257,11 @@ async def health_check() -> dict[str, Any]:
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "mode": "connected" if repository.list_accounts() else "demo" if settings.demo_mode else "local",
         "inference_enabled": settings.use_ollama,
-        "services": {"database": "connected", "ollama": ollama_status},
+        "services": {"database": "connected", "ollama": ollama_status,
+                     "embeddings": "available" if settings.embedding_model in models else f"model_missing:{settings.embedding_model}"},
         "model": settings.chat_model,
+        "embedding_model": settings.embedding_model,
+        "mail_chunks_pending_embedding": repository.pending_mail_vector_count(settings.embedding_model),
         "available_models": models,
     }
 
@@ -238,15 +296,13 @@ async def send_message(session_id: str, request: ChatRequest) -> ChatResponse:
         raise HTTPException(404, "Conversation not found")
     history = repository.list_messages(session_id)[-6:]
     previous_question = next((item["content"] for item in reversed(history) if item["role"] == "user"), "")
-    sources, cards = assistant.context_for(request.message, previous_question)
-    if not request.include_sources:
-        sources = []
+    sources, cards = await asyncio.to_thread(assistant.context_for, request.message, previous_question)
     started = perf_counter()
     try:
         content, generated_by = await assistant.answer(request.message, sources, history)
     except ModelResponseError as exc:
         raise HTTPException(exc.status_code, exc.detail) from exc
-    return save_chat_turn(session_id, request.message, content, sources, cards, generated_by, round((perf_counter() - started) * 1000))
+    return save_chat_turn(session_id, request.message, content, sources if request.include_sources else [], cards, generated_by, round((perf_counter() - started) * 1000))
 
 
 def save_chat_turn(session_id: str, question: str, content: str, sources: list, cards: list[ActionCard], generated_by: str, response_time_ms: int) -> ChatResponse:
@@ -294,16 +350,14 @@ async def stream_message(session_id: str, request: ChatRequest) -> StreamingResp
         raise HTTPException(404, "Conversation not found")
     history = repository.list_messages(session_id)[-6:]
     previous_question = next((item["content"] for item in reversed(history) if item["role"] == "user"), "")
-    sources, cards = assistant.context_for(request.message, previous_question)
-    if not request.include_sources:
-        sources = []
+    sources, cards = await asyncio.to_thread(assistant.context_for, request.message, previous_question)
 
     async def events():
         started = perf_counter()
         try:
             async for event in assistant.stream_answer(request.message, sources, history):
                 if event["type"] == "complete":
-                    result = save_chat_turn(session_id, request.message, event["content"], sources, cards, "ollama", round((perf_counter() - started) * 1000))
+                    result = save_chat_turn(session_id, request.message, event["content"], sources if request.include_sources else [], cards, event.get("generated_by", "ollama"), round((perf_counter() - started) * 1000))
                     event = {"type": "complete", **result.model_dump(mode="json")}
                 yield json.dumps(event) + "\n"
         except ModelResponseError as exc:

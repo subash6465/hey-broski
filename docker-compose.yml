@@ -28,9 +28,11 @@ services:
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
       - N8N_BASE_URL=http://host.docker.internal:5678
       - HEYBROSKI_CHAT_MODEL=${HEYBROSKI_CHAT_MODEL:-qwen3:4b-instruct}
+      - HEYBROSKI_EMBEDDING_MODEL=${HEYBROSKI_EMBEDDING_MODEL:-qwen3-embedding:0.6b}
       - HEYBROSKI_LLM_TEMPERATURE=${HEYBROSKI_LLM_TEMPERATURE:-0.2}
       - OLLAMA_TIMEOUT_SECONDS=${OLLAMA_TIMEOUT_SECONDS:-45}
       - OLLAMA_NUM_PREDICT=${OLLAMA_NUM_PREDICT:-768}
+      - OLLAMA_NUM_CTX=${OLLAMA_NUM_CTX:-8192}
       - HEYBROSKI_DATA_DIR=/data/heybroski
       - HEYBROSKI_DEMO_MODE=${HEYBROSKI_DEMO_MODE:-true}
       - HEYBROSKI_USE_OLLAMA=${HEYBROSKI_USE_OLLAMA:-true}
@@ -50,13 +52,25 @@ services:
     environment:
       - OLLAMA_NO_CLOUD=1
       - OLLAMA_KEEP_ALIVE=5m
-      - OLLAMA_MAX_LOADED_MODELS=1
+      - OLLAMA_MAX_LOADED_MODELS=2
       - OLLAMA_NUM_PARALLEL=1
     restart: unless-stopped
 
   ollama-model:
     image: ollama/ollama:latest
     command: ["pull", "${HEYBROSKI_CHAT_MODEL:-qwen3:4b-instruct}"]
+    environment:
+      - OLLAMA_HOST=http://host.docker.internal:11434
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      ollama:
+        condition: service_started
+    restart: on-failure
+
+  ollama-embedding-model:
+    image: ollama/ollama:latest
+    command: ["pull", "${HEYBROSKI_EMBEDDING_MODEL:-qwen3-embedding:0.6b}"]
     environment:
       - OLLAMA_HOST=http://host.docker.internal:11434
     extra_hosts:

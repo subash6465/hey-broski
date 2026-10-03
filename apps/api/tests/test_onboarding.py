@@ -30,7 +30,9 @@ def test_profile_connection_and_real_mail_import(tmp_path: Path, monkeypatch) ->
         if path == "/token":
             return httpx.Response(200, json={"access_token": "access", "refresh_token": "refresh", "token_type": "Bearer"})
         if path.endswith("/profile"):
-            return httpx.Response(200, json={"emailAddress": "owner@example.com"})
+            return httpx.Response(200, json={"emailAddress": "owner@example.com", "historyId": "100"})
+        if path.endswith("/history"):
+            return httpx.Response(200, json={"historyId": "101", "history": []})
         if path.endswith("/messages"):
             if "q" not in request.url.params:
                 return httpx.Response(200, json={"messages": []})
@@ -142,7 +144,7 @@ def test_outlook_connection_and_import(tmp_path: Path, monkeypatch) -> None:
         assert [(source.source_type, source.title, source.account_label) for source in sources] == [("email", "Project update", "Outlook / owner@outlook.com")]
 
 
-def test_gmail_subsequent_sync_fetches_only_recent_mail(tmp_path: Path, monkeypatch) -> None:
+def test_gmail_subsequent_sync_uses_history(tmp_path: Path, monkeypatch) -> None:
     repository = Repository(tmp_path / "api.db")
     repository.initialize()
     account = repository.upsert_account("gmail", "owner@example.com", "Owner")
@@ -157,9 +159,14 @@ def test_gmail_subsequent_sync_fetches_only_recent_mail(tmp_path: Path, monkeypa
     details = []
 
     def provider(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/profile"):
+            return httpx.Response(200, json={"historyId": "100"})
+        if request.url.path.endswith("/history"):
+            history = [{"messagesAdded": [{"message": {"id": "new"}}]}] if request.url.params["startHistoryId"] == "100" else []
+            return httpx.Response(200, json={"historyId": "102", "history": history})
         if request.url.path.endswith("/messages"):
             queries.append(request.url.params["q"])
-            return httpx.Response(200, json={"messages": [{"id": "old" if len(queries) == 1 else "new"}]})
+            return httpx.Response(200, json={"messages": [{"id": "old"}]})
         message_id = request.url.path.rsplit("/", 1)[-1]
         details.append(message_id)
         return httpx.Response(200, json={"id": message_id, "internalDate": str(int(datetime.now(timezone.utc).timestamp() * 1000)),
@@ -173,11 +180,7 @@ def test_gmail_subsequent_sync_fetches_only_recent_mail(tmp_path: Path, monkeypa
     assert first["status"] == "complete"
     asyncio.run(sync.run(account["id"]))
     second = repository.get_sync_job(account["id"])
-    first_start = datetime.fromisoformat(first["started_at"])
-    second_cutoff = datetime.fromisoformat(second["cutoff_at"])
-    assert first_start - timedelta(minutes=5, seconds=1) <= second_cutoff <= first_start - timedelta(minutes=5)
-    assert queries[1].startswith(f"after:{int(second_cutoff.timestamp())} ")
-    assert int(queries[1].split()[0].removeprefix("after:")) > int(queries[0].split()[0].removeprefix("after:"))
+    assert len(queries) == 1
     assert details == ["old", "new"]
     assert {item["message_id"] for item in repository.search_mail_sources("")} == {"old", "new"}
 
@@ -229,6 +232,10 @@ def test_gmail_import_resumes_after_page_failure(tmp_path: Path, monkeypatch) ->
 
     def provider(request: httpx.Request) -> httpx.Response:
         nonlocal second_page_fails
+        if request.url.path.endswith("/profile"):
+            return httpx.Response(200, json={"historyId": "100"})
+        if request.url.path.endswith("/history"):
+            return httpx.Response(200, json={"historyId": "101", "history": []})
         if request.url.path.endswith("/messages"):
             if request.url.params.get("pageToken") == "page-2":
                 if second_page_fails:
@@ -281,6 +288,10 @@ def test_gmail_import_retries_rate_limit_and_checkpoints_each_message(tmp_path: 
     def provider(request: httpx.Request) -> httpx.Response:
         nonlocal fail_second
         path = request.url.path
+        if path.endswith("/profile"):
+            return httpx.Response(200, json={"historyId": "100"})
+        if path.endswith("/history"):
+            return httpx.Response(200, json={"historyId": "101", "history": []})
         if path.endswith("/messages"):
             return httpx.Response(200, json={"resultSizeEstimate": 2, "messages": [{"id": "mail-1"}, {"id": "mail-2"}]})
         if path.endswith("/messages/mail-1"):
@@ -305,7 +316,8 @@ def test_gmail_import_retries_rate_limit_and_checkpoints_each_message(tmp_path: 
     assert failed["status"] == "failed"
     assert failed["processed_count"] == 1
     assert failed["total_estimate"] == 2
-    assert '"offset": 1' in failed["page_token"]
+    assert failed["discovery_complete"] == 1
+    assert repository.pending_sync_messages(account["id"]) == ["mail-2"]
     asyncio.run(sync.run(account["id"]))
     done = repository.get_sync_job(account["id"])
     assert done["status"] == "complete"
@@ -326,6 +338,10 @@ def test_gmail_skips_one_inaccessible_message_without_stopping_import(tmp_path: 
     monkeypatch.setattr(connector, "access_token", token)
 
     def provider(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/profile"):
+            return httpx.Response(200, json={"historyId": "100"})
+        if request.url.path.endswith("/history"):
+            return httpx.Response(200, json={"historyId": "101", "history": []})
         if request.url.path.endswith("/messages"):
             return httpx.Response(200, json={"resultSizeEstimate": 2, "messages": [{"id": "gone"}, {"id": "good"}]})
         if request.url.path.endswith("/messages/gone"):
@@ -340,6 +356,100 @@ def test_gmail_skips_one_inaccessible_message_without_stopping_import(tmp_path: 
     assert job["status"] == "complete"
     assert job["processed_count"] == 1
     assert job["skipped_count"] == 1
+
+
+def test_gmail_manifest_counts_ids_not_provider_estimate(tmp_path: Path, monkeypatch) -> None:
+    repository = Repository(tmp_path / "api.db")
+    repository.initialize()
+    account = repository.upsert_account("gmail", "owner@example.com", "Owner")
+    repository.save_sync_preferences(account["id"], 3, 24, True)
+    connector = ConnectorService(repository, CredentialVault(tmp_path))
+
+    async def token(_account):
+        return "access"
+
+    monkeypatch.setattr(connector, "access_token", token)
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/profile"):
+            return httpx.Response(200, json={"historyId": "100"})
+        if request.url.path.endswith("/history"):
+            return httpx.Response(200, json={"historyId": "101", "history": []})
+        if request.url.path.endswith("/messages"):
+            if request.url.params.get("pageToken"):
+                return httpx.Response(200, json={"resultSizeEstimate": 900, "messages": [{"id": "second"}]})
+            return httpx.Response(200, json={"resultSizeEstimate": 900, "messages": [{"id": "first"}], "nextPageToken": "next"})
+        return httpx.Response(200, json={"id": request.url.path.rsplit("/", 1)[-1], "internalDate": "1790870400000",
+            "payload": {"headers": [{"name": "Subject", "value": "Test"}]}})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: real_client(transport=httpx.MockTransport(provider), **kwargs))
+    asyncio.run(MailSync(repository, connector).run(account["id"]))
+    job = repository.get_sync_job(account["id"])
+    assert job["discovery_complete"] == 1
+    assert job["total_estimate"] == 2
+    assert job["processed_count"] == 2
+
+
+def test_pause_resume_and_cancel_keep_imported_mail(tmp_path: Path, monkeypatch) -> None:
+    repository = Repository(tmp_path / "api.db")
+    repository.initialize()
+    account = repository.upsert_account("gmail", "owner@example.com", "Owner")
+    repository.save_sync_preferences(account["id"], 3, 24, True)
+    connector = ConnectorService(repository, CredentialVault(tmp_path))
+
+    async def token(_account):
+        return "access"
+
+    monkeypatch.setattr(connector, "access_token", token)
+    blocked = asyncio.Event()
+    release = asyncio.Event()
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/profile"):
+            return httpx.Response(200, json={"historyId": "100"})
+        if request.url.path.endswith("/history"):
+            return httpx.Response(200, json={"historyId": "101", "history": []})
+        if request.url.path.endswith("/messages"):
+            return httpx.Response(200, json={"messages": [{"id": f"m{i}"} for i in range(9)]})
+        raise AssertionError(request.url)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: real_client(transport=httpx.MockTransport(provider), **kwargs))
+    sync = MailSync(repository, connector)
+
+    async def detail(_client, _account, message_id, _headers, _semaphore):
+        if message_id == "m8" and not release.is_set():
+            blocked.set()
+            await release.wait()
+        return {"id": message_id, "internalDate": "1790870400000", "payload": {"headers": [{"name": "Subject", "value": message_id}]}}
+
+    monkeypatch.setattr(sync, "_gmail_detail", detail)
+
+    async def exercise():
+        task = asyncio.create_task(sync.run(account["id"]))
+        await asyncio.wait_for(blocked.wait(), 5)
+        await sync.stop(account["id"], "paused")
+        assert repository.get_sync_job(account["id"])["status"] == "paused"
+        assert repository.get_sync_job(account["id"])["processed_count"] == 8
+        assert repository.mail_pipeline_counts(account["id"], "embed")["searchable_messages"] == 8
+        await sync.run(account["id"])
+        assert repository.get_sync_job(account["id"])["status"] == "paused"
+        blocked.clear()
+        resumed = asyncio.create_task(sync.run(account["id"], manual=True))
+        await asyncio.wait_for(blocked.wait(), 5)
+        await sync.stop(account["id"], "canceled")
+        assert repository.get_sync_job(account["id"])["status"] == "canceled"
+        assert repository.mail_pipeline_counts(account["id"], "embed")["searchable_messages"] == 8
+        assert resumed.cancelled()
+        release.set()
+        await sync.run(account["id"], manual=True)
+        assert repository.get_sync_job(account["id"])["processed_count"] == 9
+        assert repository.get_sync_job(account["id"])["status"] == "complete"
+        assert repository.mail_pipeline_counts(account["id"], "embed")["searchable_messages"] == 9
+        assert task.cancelled()
+
+    asyncio.run(exercise())
 
 
 def test_workspace_opens_when_import_is_configured(tmp_path: Path) -> None:

@@ -26,12 +26,15 @@ import {
 import { ActionCardView } from '@/components/ActionCardView'
 import { LocalDateTime } from '@/components/LocalDateTime'
 import { Onboarding, type OnboardingState } from '@/components/Onboarding'
+import { MailImportProgress } from '@/components/MailImportProgress'
+import { MailAccountCard } from '@/components/MailAccountCard'
 import { request, streamChat, type ChatStreamEvent } from '@/lib/api'
 import type { ActionCard, ChatMessage, ChatSession, DocumentRecord, Source, StoredMessage } from '@/lib/types'
 
 type View = 'desk' | 'chat' | 'actions' | 'vault' | 'history' | 'accounts'
 type DeleteTarget = { kind: 'conversation' | 'document'; id: string; label: string }
 type Health = { status: string; mode: string; inference_enabled: boolean; services: { database: string; ollama: string }; model: string }
+type MailPipeline = { searchable_messages: number; embedded_messages: number; pending_embedding_chunks: number; imported_messages: number; processed_messages: number; discovered_messages: number }
 
 const prompts = [
   { label: 'Daily brief', text: 'What needs my attention this week?' },
@@ -53,6 +56,7 @@ export default function Home() {
     return requested === 'profile' || requested === 'sync' ? requested : 'connections'
   })
   const [accountJobs, setAccountJobs] = useState<OnboardingState['sync_jobs']>({})
+  const [accountPipelines, setAccountPipelines] = useState<Record<string, MailPipeline>>({})
   const [accountBusy, setAccountBusy] = useState<string>()
   const [view, setView] = useState<View>('desk')
   const [mobileNav, setMobileNav] = useState(false)
@@ -87,14 +91,15 @@ export default function Home() {
         const result = await request<{ accounts: OnboardingState['accounts'] }>('/api/accounts')
         setOnboarding(current => current ? { ...current, accounts: result.accounts } : current)
         const entries = await Promise.all(result.accounts.map(async account => {
-          const status = await request<{ job: NonNullable<OnboardingState['sync_jobs'][string]> | null }>(`/api/accounts/${account.id}/sync`)
-          return [account.id, status.job] as const
+          const status = await request<{ job: NonNullable<OnboardingState['sync_jobs'][string]> | null; pipeline: MailPipeline }>(`/api/accounts/${account.id}/sync`)
+          return [account.id, status] as const
         }))
-        setAccountJobs(Object.fromEntries(entries))
+        setAccountJobs(Object.fromEntries(entries.map(([id, status]) => [id, status.job])))
+        setAccountPipelines(Object.fromEntries(entries.map(([id, status]) => [id, status.pipeline])))
       } catch { /* Account status is advisory; the workspace remains usable. */ }
     }
     void pollAccounts()
-    const interval = window.setInterval(() => void pollAccounts(), 12_000)
+    const interval = window.setInterval(() => void pollAccounts(), 4_000)
     return () => window.clearInterval(interval)
   }, [onboarding?.ready, showSetup])
 
@@ -325,10 +330,34 @@ export default function Home() {
   async function syncAccount(id: string) {
     setAccountBusy(id)
     try {
-      await request(`/api/accounts/${id}/sync`, { method: 'POST' })
-      setAccountJobs(current => ({ ...current, [id]: { ...(current[id] ?? onboarding?.sync_jobs[id] ?? { processed_count: 0, skipped_count: 0, total_estimate: null }), status: 'running', error: null } }))
-      setNotice('Mailbox sync started.')
+      const result = await request<{ status: string }>(`/api/accounts/${id}/sync`, { method: 'POST' })
+      setAccountJobs(current => ({ ...current, [id]: { ...(current[id] ?? onboarding?.sync_jobs[id] ?? { processed_count: 0, skipped_count: 0, total_estimate: null, discovery_complete: 0 }), status: result.status === 'resumed' ? 'complete' : 'running', error: null } }))
+      setNotice(result.status === 'resumed' ? 'Mail processing resumed.' : 'Mailbox sync started.')
     } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not start sync') }
+    finally { setAccountBusy(undefined) }
+  }
+
+  async function controlSync(id: string, action: 'pause' | 'cancel') {
+    setAccountBusy(id)
+    try {
+      await request(`/api/accounts/${id}/sync/${action}`, { method: 'POST' })
+      setAccountJobs(current => { const job = current[id] ?? onboarding?.sync_jobs[id]; return { ...current, [id]: job ? { ...job, status: action === 'pause' ? job.status === 'complete' ? 'paused_processing' : 'paused' : 'canceled' } : null } })
+      setNotice(action === 'pause' ? 'Import paused. Resume whenever you are ready.' : 'Import canceled. Already imported mail remains searchable.')
+    } catch (caught) { setError(caught instanceof Error ? caught.message : `Could not ${action} sync`) }
+    finally { setAccountBusy(undefined) }
+  }
+
+  async function deleteMailData(id: string) {
+    if (!window.confirm('Delete all imported mail and embeddings for this account? The account stays connected. Mail-sourced chat turns are removed; conversations without recorded mail sources may still contain copied excerpts. This cannot be undone.')) return
+    setAccountBusy(id)
+    try {
+      await request(`/api/accounts/${id}/mail-data`, { method: 'DELETE' })
+      const next = await request<OnboardingState>('/api/onboarding')
+      setOnboarding(next)
+      setAccountJobs(next.sync_jobs)
+      setAccountPipelines(current => ({ ...current, [id]: { searchable_messages: 0, embedded_messages: 0, pending_embedding_chunks: 0, imported_messages: 0, processed_messages: 0, discovered_messages: 0 } }))
+      setNotice('Imported mail and embeddings deleted. The account remains connected.')
+    } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not delete imported mail') }
     finally { setAccountBusy(undefined) }
   }
 
@@ -349,7 +378,8 @@ export default function Home() {
   const firstAction = pendingActions[0]
   const visibleSyncAccounts = onboarding?.accounts.filter(account => {
     const job = accountJobs[account.id] ?? onboarding.sync_jobs[account.id]
-    return !account.last_synced_at || job?.status === 'running' || job?.status === 'failed'
+    return (!account.last_synced_at && job?.status !== 'canceled') || job?.status === 'running' || job?.status === 'paused' || job?.status === 'paused_processing' || job?.status === 'failed' ||
+      (account.provider === 'gmail' && (accountPipelines[account.id]?.pending_embedding_chunks ?? 0) > 0)
   }) ?? []
 
   if (onboarding === undefined) return <div className="onboarding-shell"><div className="onboarding-header"><div className="onboarding-brand"><Sparkles size={21} /> hey broski<span>.</span></div></div><p>Opening your local workspace…</p></div>
@@ -387,13 +417,7 @@ export default function Home() {
         </header>
         {error && <div className="error-banner" role="alert"><span>{error}</span><button onClick={() => setError(undefined)}><X size={16} /></button></div>}
         {notice && <div className="notice-banner" role="status"><span>{notice}</span><button onClick={() => setNotice(undefined)}><X size={16} /></button></div>}
-        {!!visibleSyncAccounts.length && <section className="import-progress" aria-label="Mail import progress"><div className="import-progress-heading"><RefreshCw size={16} /><div><strong>Bringing your mail in</strong><span>You can keep using your workspace while this runs.</span></div></div>{visibleSyncAccounts.map(account => {
-          const job = accountJobs[account.id] ?? onboarding.sync_jobs[account.id]
-          const done = (job?.processed_count ?? 0) + (job?.skipped_count ?? 0)
-          const estimate = job?.total_estimate ?? null
-          const percent = estimate && estimate > 0 ? Math.min(95, Math.round(done / estimate * 100)) : null
-          return <div className="import-progress-account" key={account.id}><div className="import-progress-line"><strong>{account.email}</strong><span>{job?.status === 'failed' ? 'Paused' : `${job?.processed_count ?? 0} messages imported${estimate ? ` · about ${estimate} expected` : ''}`}</span></div><div className={`import-progress-track ${percent === null && job?.status !== 'failed' ? 'indeterminate' : ''}`} role="progressbar" aria-label={`${account.email} import`} aria-valuemin={0} aria-valuemax={estimate ?? undefined} aria-valuenow={estimate ? done : undefined}><span style={{ width: job?.status === 'failed' ? `${percent ?? 0}%` : percent === null ? undefined : `${percent}%` }} /></div>{job?.status === 'failed' && <div className="import-progress-error"><span>{job.error || 'Import stopped. Try again.'}</span><button type="button" onClick={() => void syncAccount(account.id)} disabled={accountBusy === account.id}>Resume import</button></div>}{!!job?.skipped_count && <small>{job.skipped_count} inaccessible messages skipped.</small>}</div>
-        })}</section>}
+        {!!visibleSyncAccounts.length && <section className="import-progress" aria-label="Mail import progress"><div className="import-progress-heading"><RefreshCw size={16} /><div><strong>Bringing your mail in</strong><span>Imported mail is searchable while processing continues. Answers may be incomplete until import finishes.</span></div></div>{visibleSyncAccounts.map(account => <MailImportProgress key={account.id} account={account} job={accountJobs[account.id] ?? onboarding.sync_jobs[account.id]} pipeline={accountPipelines[account.id]} busy={accountBusy === account.id} onResume={() => void syncAccount(account.id)} onPause={() => void controlSync(account.id, 'pause')} onCancel={() => void controlSync(account.id, 'cancel')} />)}</section>}
 
         <div className="workspace-view" key={view}>
         {view === 'desk' && <section className="desk" aria-label="My desk">
@@ -416,7 +440,7 @@ export default function Home() {
                   {message.role === 'assistant' && <div className="bot-avatar"><Bot size={17} /></div>}
                   <div className="message-wrap">
                     <div className="message-bubble"><p>{message.content}</p></div>
-                    {message.generatedBy && <span className="generated-by">Answered by local model ({health?.model ?? 'Ollama'})</span>}
+                    {message.generatedBy && <span className="generated-by">{message.generatedBy === 'ollama' ? `Answered by local model (${health?.model ?? 'Ollama'})` : message.generatedBy === 'agent' ? 'Answered with local search tools' : message.generatedBy === 'metadata' ? 'Answered from mail metadata' : 'Mailbox coverage notice'}</span>}
                     {!!message.sources?.length && <SourceList sources={message.sources} onOpen={() => setSelectedSources(message.sources ?? null)} />}
                     {!!message.actionCards?.length && <div className="inline-actions">{message.actionCards.map((card) => <ActionCardView key={card.id} card={actions.find((item) => item.id === card.id) ?? card} busy={decisionBusy === card.id} onDecision={decide} />)}</div>}
                   </div>
@@ -438,7 +462,7 @@ export default function Home() {
         {view === 'actions' && <Collection eyebrow="TO REVIEW" title={pendingCount === 1 ? '1 item needs a decision' : `${pendingCount} items need a decision`} subtitle="Review every proposed action before anything changes.">{actions.length ? actions.map((card) => <ActionCardView key={card.id} card={card} busy={decisionBusy === card.id} onDecision={decide} />) : <Empty text="Ask for your daily brief to generate action cards." />}</Collection>}
         {view === 'vault' && <Collection eyebrow="YOUR LIBRARY" title="Your local documents" subtitle="PDF, text, Markdown, and CSV files are searchable from chat."><label className="upload-card"><Upload size={22} /><strong>{uploading ? 'Uploading…' : 'Upload a document'}</strong><span>Maximum 10 MB</span><input type="file" disabled={uploading} accept=".pdf,.txt,.md,.csv" onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ''; void upload(file) }} /></label>{documents.map((doc) => <article className="document-card" key={doc.id}><FileText /><div><strong>{doc.filename}</strong><span>{Math.ceil(doc.size_bytes / 1024)} KB · {new Date(doc.created_at).toLocaleDateString()}</span><p>{doc.preview}</p><div className="document-actions"><button type="button" onClick={() => { setInput(`What does ${doc.filename} say about `); setView('chat') }}>Ask about this file</button><button type="button" className="delete-button" disabled={busy || uploading || deleting} onClick={() => setDeleteTarget({ kind: 'document', id: doc.id, label: doc.filename })}><Trash2 size={14} /> Delete</button></div></div></article>)}</Collection>}
         {view === 'history' && <Collection eyebrow="PAST CONVERSATIONS" title="Conversation history" subtitle="Your conversations are saved locally and can be reopened anytime.">{sessions.length ? sessions.map((session) => <div className="history-row" key={session.session_id}><button className="history-card" disabled={busy || deleting} onClick={() => void openConversation(session.session_id)}><strong>{session.title}</strong><span>{new Date(session.updated_at).toLocaleString()}</span><ChevronRight size={17} /></button><button className="history-delete delete-button" type="button" disabled={busy || deleting} onClick={() => setDeleteTarget({ kind: 'conversation', id: session.session_id, label: session.title })} aria-label={`Delete conversation ${session.title}`}><Trash2 size={16} /> Delete</button></div>) : <Empty text="Your conversations will appear here after you send a message." />}</Collection>}
-        {view === 'accounts' && <Collection eyebrow="CONNECTED MAIL" title="Your accounts" subtitle="Your mail is imported and stored on this computer. Manage each connection and its sync here."><button className="account-add" onClick={() => { window.history.replaceState({}, '', '/?setup=connections'); setSetupStep('connections'); setShowSetup(true) }}>Connect another account <ArrowUpRight size={16} /></button><button className="account-add" onClick={() => { window.history.replaceState({}, '', '/?setup=sync'); setSetupStep('sync'); setShowSetup(true) }} disabled={onboarding.accounts.some(account => accountJobs[account.id]?.status === 'running')}>Change import and sync settings <ArrowUpRight size={16} /></button><button className="account-add" onClick={() => { window.history.replaceState({}, '', '/?setup=profile'); setSetupStep('profile'); setShowSetup(true) }}>Edit profile <ArrowUpRight size={16} /></button>{onboarding.accounts.map(account => <article className="account-card" key={account.id}><span className="provider-mark"><Mail size={20} /></span><div><strong>{account.display_name}</strong><p>{account.email} · {account.provider === 'gmail' ? 'Gmail' : 'Outlook'}</p><small>{accountJobs[account.id]?.status === 'running' ? `Importing · ${accountJobs[account.id]?.processed_count ?? 0} messages checked` : accountJobs[account.id]?.status === 'failed' ? `Sync needs attention: ${accountJobs[account.id]?.error}` : account.last_synced_at ? `Last synced ${new Date(account.last_synced_at).toLocaleString()} | ${accountJobs[account.id]?.processed_count ?? 0} messages checked${accountJobs[account.id]?.skipped_count ? ` | ${accountJobs[account.id]?.skipped_count} inaccessible skipped` : ''}` : 'Waiting to import'}</small><div className="account-buttons"><button onClick={() => void syncAccount(account.id)} disabled={accountBusy === account.id || accountJobs[account.id]?.status === 'running'}><RefreshCw size={14} /> Sync now</button><button onClick={() => void disconnectAccount(account.id)} disabled={accountBusy === account.id || accountJobs[account.id]?.status === 'running'}>Disconnect</button></div></div></article>)}</Collection>}
+        {view === 'accounts' && <Collection eyebrow="CONNECTED MAIL" title="Your accounts" subtitle="Your mail is imported and stored on this computer. Manage each connection and its sync here."><button className="account-add" onClick={() => { window.history.replaceState({}, '', '/?setup=connections'); setSetupStep('connections'); setShowSetup(true) }}>Connect another account <ArrowUpRight size={16} /></button><button className="account-add" onClick={() => { window.history.replaceState({}, '', '/?setup=sync'); setSetupStep('sync'); setShowSetup(true) }} disabled={onboarding.accounts.some(account => accountJobs[account.id]?.status === 'running')}>Change import and sync settings <ArrowUpRight size={16} /></button><button className="account-add" onClick={() => { window.history.replaceState({}, '', '/?setup=profile'); setSetupStep('profile'); setShowSetup(true) }}>Edit profile <ArrowUpRight size={16} /></button>{onboarding.accounts.map(account => <MailAccountCard key={account.id} account={account} job={accountJobs[account.id] ?? onboarding.sync_jobs[account.id]} pendingChunks={accountPipelines[account.id]?.pending_embedding_chunks ?? 0} busy={accountBusy === account.id} onSync={() => void syncAccount(account.id)} onPause={() => void controlSync(account.id, 'pause')} onCancel={() => void controlSync(account.id, 'cancel')} onDelete={() => void deleteMailData(account.id)} onDisconnect={() => void disconnectAccount(account.id)} />)}</Collection>}
         </div>
       </main>
       {selectedSources && <SourceDialog sources={selectedSources} onClose={() => setSelectedSources(null)} />}

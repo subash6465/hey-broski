@@ -9,3 +9,4 @@ python-dotenv==1.0.1
 cryptography>=45,<50
 keyring>=25,<27
 tzdata>=2025.2
+lancedb>=0.39,<1

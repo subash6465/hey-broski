@@ -15,6 +15,7 @@ class Source(BaseModel):
     title: str
     snippet: str
     timestamp: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ActionCard(BaseModel):
@@ -50,7 +51,7 @@ class ChatResponse(BaseModel):
     content: str
     sources: list[Source] = Field(default_factory=list)
     action_cards: list[ActionCard] = Field(default_factory=list)
-    generated_by: Literal["ollama"]
+    generated_by: Literal["ollama", "metadata", "coverage", "agent"]
 
 
 class DecisionRequest(BaseModel):

@@ -27,6 +27,8 @@ class Settings:
     demo_mode: bool
     use_ollama: bool = True
     ollama_num_predict: int = 768
+    embedding_model: str = "qwen3-embedding:0.6b"
+    ollama_num_ctx: int = 8192
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -45,6 +47,8 @@ class Settings:
             use_ollama=_bool("HEYBROSKI_USE_OLLAMA", True),
             # Older local .env files used 128, which cut answers mid-sentence.
             ollama_num_predict=max(512, min(int(os.getenv("OLLAMA_NUM_PREDICT", "768")), 2048)),
+            embedding_model=os.getenv("HEYBROSKI_EMBEDDING_MODEL", "qwen3-embedding:0.6b"),
+            ollama_num_ctx=max(4096, min(int(os.getenv("OLLAMA_NUM_CTX", "8192")), 32768)),
         )
 
 
