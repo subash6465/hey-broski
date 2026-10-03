@@ -6,7 +6,61 @@ from fastapi.testclient import TestClient
 
 from app import main
 from app.assistant import AssistantService
+from app.mail_index import normalize_gmail_message
 from app.repository import Repository
+
+
+def test_delete_imported_mail_keeps_connection_and_removes_local_data(tmp_path: Path, monkeypatch) -> None:
+    repository = Repository(tmp_path / "api.db")
+    main.repository = repository
+    main.assistant = AssistantService(repository, main.settings)
+    removed = []
+    monkeypatch.setattr(main.assistant.mail_vectors, "remove_account", lambda account_id: removed.append(account_id))
+
+    with TestClient(main.app) as client:
+        account = repository.upsert_account("gmail", "owner@example.com", "Owner")
+        repository.save_sync_preferences(account["id"], 12, 24, True)
+        repository.upsert_mail_message(normalize_gmail_message({"id": "m1", "threadId": "t1", "internalDate": "1790870400000",
+            "payload": {"headers": [{"name": "Subject", "value": "Private mail"}]}}, account["id"], account["email"]))
+        repository.upsert_mail_source(account["id"], "gmail", "m1", "Private mail", "Private mail text",
+                                      "2026-10-01T00:00:00+00:00", "sender@example.com", "inbox")
+        session_id = client.post("/api/chat/sessions").json()["session_id"]
+        repository.add_turn(session_id, "What was in my mail?", "Private mail text", {
+            "sources": [{"source_id": f"{account['id']}:m1"}]}, 10)
+        response = client.delete(f"/api/accounts/{account['id']}/mail-data")
+
+    assert response.status_code == 204
+    assert repository.get_account(account["id"]) is not None
+    assert repository.mail_pipeline_counts(account["id"], "embed")["searchable_messages"] == 0
+    assert repository.search_mail_sources("Private mail") == []
+    assert repository.list_messages(session_id) == []
+    assert repository.get_sync_job(account["id"])["status"] == "canceled"
+    assert removed == [account["id"]]
+
+
+def test_processing_can_pause_and_resume_after_import(tmp_path: Path) -> None:
+    repository = Repository(tmp_path / "api.db")
+    main.repository = repository
+    main.assistant = AssistantService(repository, main.settings)
+
+    with TestClient(main.app) as client:
+        account = repository.upsert_account("gmail", "owner@example.com", "Owner")
+        repository.save_sync_preferences(account["id"], 12, 24, True)
+        repository.upsert_mail_message(normalize_gmail_message({"id": "m1", "threadId": "t1", "internalDate": "1790870400000",
+            "payload": {"headers": [{"name": "Subject", "value": "Pending embedding"}]}}, account["id"], account["email"]))
+        repository.start_sync_job(account["id"])
+        repository.update_sync_job(account["id"], "complete")
+        assert repository.pending_mail_vectors(main.settings.embedding_model)
+        assert client.post(f"/api/accounts/{account['id']}/sync/pause").status_code == 200
+        assert repository.get_sync_job(account["id"])["status"] == "paused_processing"
+        assert repository.pending_mail_vectors(main.settings.embedding_model) == []
+        resume = client.post(f"/api/accounts/{account['id']}/sync")
+        assert resume.json() == {"status": "resumed"}
+        assert repository.pending_mail_vectors(main.settings.embedding_model)
+        assert client.post(f"/api/accounts/{account['id']}/sync/cancel").status_code == 200
+        assert repository.get_sync_job(account["id"])["status"] == "canceled"
+        assert repository.pending_mail_vectors(main.settings.embedding_model) == []
+        assert repository.mail_pipeline_counts(account["id"], main.settings.embedding_model)["searchable_messages"] == 1
 
 
 @pytest.mark.parametrize("generated_by", ["metadata", "coverage"])

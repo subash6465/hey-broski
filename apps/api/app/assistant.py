@@ -196,7 +196,7 @@ class AssistantService:
             return None
         importing = self.repository.initial_mail_import_incomplete()
         if not sources or sources[0].source_type != "email":
-            return ("No matching mail has been indexed yet. The initial import is still running."
+            return ("No matching mail has been indexed yet. The initial import is incomplete."
                     if importing else "I found no matching message in the indexed mailbox. Check the last sync time in Accounts.")
         source = sources[0]
         if not source.metadata.get("message_id"):
@@ -211,7 +211,7 @@ class AssistantService:
         sender = source.metadata.get("sender", "unknown sender")
         freshness = source.metadata.get("last_synced_at")
         if importing:
-            return f"The latest {direction} email indexed so far is ‘{source.title}’ from {sender}, dated {stamp}. [Source 1] The initial mail import is still running, so this may change."
+            return f"The latest {direction} email indexed so far is ‘{source.title}’ from {sender}, dated {stamp}. [Source 1] The initial mail import is incomplete, so this may change."
         suffix = f" Mailbox last synced {freshness}." if freshness else ""
         if self.repository.inaccessible_mail_count():
             suffix += " Some messages were inaccessible during the last sync."
@@ -226,13 +226,13 @@ class AssistantService:
         skipped = self.repository.inaccessible_mail_count()
         broad = re.search(r"\b(all|every|how many|count|total)\b", message.lower())
         if importing and broad:
-            return "I cannot give a complete mailbox count or list yet because the initial import is still running. You can search the messages indexed so far.", None
+            return "I cannot give a complete mailbox count or list yet because the initial import is incomplete. You can search the messages indexed so far.", None
         if skipped and broad:
             noun = "message was" if skipped == 1 else "messages were"
             return f"I cannot guarantee a complete mailbox count or list because {skipped} {noun} inaccessible during the last sync.", None
         notes = []
         if importing:
-            notes.append("Mail import is still running; this answer uses only messages indexed so far.")
+            notes.append("Mail import is incomplete; this answer uses only messages indexed so far.")
         if skipped:
             noun = "message was" if skipped == 1 else "messages were"
             notes.append(f"{skipped} {noun} inaccessible during the last sync.")

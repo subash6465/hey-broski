@@ -144,6 +144,47 @@ async def disconnect_account(account_id: str) -> Response:
     return Response(status_code=204)
 
 
+@app.post("/api/accounts/{account_id}/sync/pause")
+async def pause_sync(account_id: str) -> dict[str, str]:
+    if not repository.get_account(account_id):
+        raise HTTPException(404, "Account not found")
+    job = repository.get_sync_job(account_id)
+    processing_only = job and job["status"] == "complete" and repository.mail_pipeline_counts(account_id, settings.embedding_model)["pending_embedding_chunks"] > 0
+    if not job or job["status"] != "running" and not processing_only:
+        raise HTTPException(409, "No active import or processing to pause")
+    await mail_sync.stop(account_id, "paused_processing" if processing_only else "paused")
+    async with assistant.mail_vectors.lock:
+        pass
+    return {"status": "paused"}
+
+
+@app.post("/api/accounts/{account_id}/sync/cancel")
+async def cancel_sync(account_id: str) -> dict[str, str]:
+    if not repository.get_account(account_id):
+        raise HTTPException(404, "Account not found")
+    job = repository.get_sync_job(account_id)
+    processing_only = job and job["status"] in {"complete", "paused_processing"} and repository.mail_pipeline_counts(account_id, settings.embedding_model)["pending_embedding_chunks"] > 0
+    if not job or job["status"] not in {"running", "paused", "failed"} and not processing_only:
+        raise HTTPException(409, "No active sync to cancel")
+    await mail_sync.stop(account_id, "canceled")
+    async with assistant.mail_vectors.lock:
+        pass
+    return {"status": "canceled"}
+
+
+@app.delete("/api/accounts/{account_id}/mail-data", status_code=204, response_class=Response)
+async def delete_imported_mail(account_id: str) -> Response:
+    if not repository.get_account(account_id):
+        raise HTTPException(404, "Account not found")
+    await mail_sync.stop(account_id, "canceled")
+    async with assistant.mail_vectors.lock:
+        await asyncio.to_thread(assistant.mail_vectors.remove_account, account_id)
+        repository.reset_sync_job(account_id, purge_mail_conversations=True)
+        repository.start_sync_job(account_id)
+        repository.set_sync_control(account_id, "canceled")
+    return Response(status_code=204)
+
+
 @app.put("/api/accounts/{account_id}/sync-preferences")
 async def save_sync_preferences(account_id: str, preferences: SyncPreferencesInput) -> dict[str, Any]:
     if not repository.get_account(account_id):
@@ -159,7 +200,7 @@ async def save_sync_preferences(account_id: str, preferences: SyncPreferencesInp
         async with assistant.mail_vectors.lock:
             await asyncio.to_thread(assistant.mail_vectors.remove_account, account_id)
             repository.reset_sync_job(account_id)
-        asyncio.create_task(mail_sync.run(account_id))
+        mail_sync.schedule(account_id)
     return result
 
 
@@ -177,7 +218,11 @@ async def start_sync(account_id: str) -> dict[str, str]:
         raise HTTPException(404, "Account not found")
     if not repository.get_sync_preferences(account_id):
         raise HTTPException(409, "Choose import and sync settings first")
-    asyncio.create_task(mail_sync.run(account_id))
+    job = repository.get_sync_job(account_id)
+    if job and job["status"] == "paused_processing":
+        repository.set_sync_control(account_id, "complete")
+        return {"status": "resumed"}
+    mail_sync.schedule(account_id, manual=True)
     return {"status": "started"}
 
 

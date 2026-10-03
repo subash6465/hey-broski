@@ -170,6 +170,13 @@
 .import-progress-heading strong { color: #453778; font-size: 12px; }
 .import-progress-heading span, .import-progress-account small { color: #807493; font-size: 10px; }
 .import-progress-account { display: grid; gap: 7px; }
+.import-progress-stages { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.import-progress-stage { display: grid; gap: 4px; padding: 11px 13px; border: 1px solid rgba(145,122,207,.18); border-radius: 10px; background: rgba(255,255,255,.62); }
+.import-progress-stage > span { color: #6955c8; font-size: 10px; font-weight: 750; }
+.import-progress-stage strong { color: #453778; font-size: 17px; }
+.import-progress-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.import-progress-actions button { padding: 6px 11px; border: 1px solid rgba(145,122,207,.32); border-radius: 8px; background: white; color: #514273; cursor: pointer; font-size: 11px; font-weight: 700; }
+.import-progress-actions button:disabled { opacity: .5; cursor: not-allowed; }
 .import-progress-line { display: flex; justify-content: space-between; gap: 12px; color: #6c6084; font-size: 10px; }
 .import-progress-line strong { color: #514273; font-weight: 750; overflow-wrap: anywhere; }
 .import-progress-line span { text-align: right; }
@@ -179,6 +186,7 @@
 .import-progress-error { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; color: #94425d; font-size: 10px; line-height: 1.5; }
 .import-progress-error button { flex: none; padding: 5px 8px; border: 1px solid rgba(190,95,124,.25); border-radius: 7px; color: #94425d; background: rgba(255,255,255,.7); cursor: pointer; font-size: 10px; font-weight: 750; }
 @keyframes import-progress-sweep { from { transform: translateX(-100%); } to { transform: translateX(290%); } }
+@media (max-width: 520px) { .import-progress-stages { grid-template-columns: 1fr; } }
 .account-add { display: flex; align-items: center; gap: 8px; padding: 18px; border: 1px dashed rgba(133,111,199,.4); border-radius: 13px; color: #6652b6; background: rgba(255,255,255,.44); font-weight: 750; cursor: pointer; }
 .account-add:hover { background: rgba(255,255,255,.7); }
 .account-card { display: flex; align-items: flex-start; gap: 14px; padding: 18px; border: 1px solid rgba(255,255,255,.86); border-radius: 14px; background: rgba(255,255,255,.58); backdrop-filter: blur(20px); }

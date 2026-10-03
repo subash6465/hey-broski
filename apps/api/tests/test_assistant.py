@@ -77,7 +77,7 @@ def test_initial_import_qualifies_latest_and_blocks_complete_counts(tmp_path: Pa
     assert "indexed so far" in latest
     count, generated_by = asyncio.run(assistant.answer("How many emails do I have?", sources))
     assert generated_by == "coverage"
-    assert "initial import is still running" in count
+    assert "initial import is incomplete" in count
 
     async def stream_count():
         return [event async for event in assistant.stream_answer("How many emails do I have?", sources)]

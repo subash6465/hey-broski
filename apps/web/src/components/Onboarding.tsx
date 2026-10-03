@@ -15,7 +15,7 @@ export type OnboardingState = {
   profile_complete: boolean
   accounts: ConnectedAccount[]
   sync_preferences: Record<string, { history_months: number; interval_hours: number; include_sent: number } | null>
-  sync_jobs: Record<string, { status: string; processed_count: number; skipped_count: number; total_estimate: number | null; error: string | null } | null>
+  sync_jobs: Record<string, { status: string; processed_count: number; skipped_count: number; total_estimate: number | null; discovery_complete: number; error: string | null } | null>
   ready: boolean
   gmail_client_imported: boolean
   outlook_available: boolean

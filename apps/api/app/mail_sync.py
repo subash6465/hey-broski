@@ -41,8 +41,19 @@ class MailSync:
         self.repository = repository
         self.connectors = connectors
         self._running: set[str] = set()
+        self._tasks: dict[str, asyncio.Task] = {}
         self._gmail_pace_lock = asyncio.Lock()
         self._next_gmail_detail_at = 0.0
+
+    def schedule(self, account_id: str, manual: bool = False) -> None:
+        if account_id in self._tasks:
+            return
+        task = asyncio.create_task(self.run(account_id, manual=manual))
+        self._tasks[account_id] = task
+        def release(_task: asyncio.Task) -> None:
+            if self._tasks.get(account_id) is _task:
+                self._tasks.pop(account_id, None)
+        task.add_done_callback(release)
 
     async def _gmail_detail(self, client: httpx.AsyncClient, account: dict, message_id: str,
                             headers: dict[str, str], semaphore: asyncio.Semaphore) -> dict:
@@ -120,18 +131,40 @@ class MailSync:
             "status": "pending", "due_at": due_at, "confidence": 0.75, "sources": [source],
             "proposed_action": {"tool": "reminders.create", "requires_approval": True, "input": {"title": title[:100], "due_at": due_at}}})
 
-    async def run(self, account_id: str) -> None:
+    async def stop(self, account_id: str, status: str) -> None:
+        if status not in {"paused", "paused_processing", "canceled"}:
+            raise ValueError("Invalid sync control")
+        self.repository.set_sync_control(account_id, status)
+        task = self._tasks.get(account_id)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            if self._tasks.get(account_id) is task:
+                self._tasks.pop(account_id, None)
+        if status == "canceled":
+            self.repository.clear_sync_manifest(account_id)
+
+    async def run(self, account_id: str, manual: bool = False) -> None:
         if account_id in self._running:
             return
         account = self.repository.get_account(account_id)
         preferences = self.repository.get_sync_preferences(account_id)
         if not account or not preferences:
             return
-        self._running.add(account_id)
         previous = self.repository.get_sync_job(account_id)
+        if not manual and previous and previous["status"] in {"paused", "paused_processing", "canceled"}:
+            return
+        if previous and previous["page_token"] and previous["page_token"].startswith("{") and account["provider"] == "gmail":
+            self.repository.restart_legacy_sync_discovery(account_id)
+            previous = self.repository.get_sync_job(account_id)
+        self._running.add(account_id)
+        self._tasks[account_id] = asyncio.current_task()
         backfill = account["provider"] == "gmail" and self.repository.needs_gmail_backfill(account_id)
-        resuming = bool(previous and previous["status"] in {"running", "failed"})
-        cursor = previous["page_token"] if resuming and not backfill else None
+        resuming = bool(previous and previous["status"] in {"running", "failed", "paused"})
+        cursor = previous["page_token"] if resuming else None
         if resuming and previous["cutoff_at"]:
             cutoff_at = previous["cutoff_at"]
         else:
@@ -150,13 +183,15 @@ class MailSync:
                 await self._gmail(account, preferences, token, cursor, cutoff_at)
             else:
                 await self._outlook(account, preferences, token, cursor, cutoff_at)
-            self.repository.update_sync_job(account_id, "complete")
+            if self.repository.get_sync_job(account_id)["status"] == "running":
+                self.repository.update_sync_job(account_id, "complete")
         except (httpx.HTTPError, ValueError, KeyError, RuntimeError, ProviderConnectionError) as exc:
             # Keep the cursor already saved after the last successful page.
             saved = self.repository.get_sync_job(account_id)
             self.repository.update_sync_job(account_id, "failed", saved["page_token"] if saved else None, error=str(exc)[:240])
         finally:
             self._running.discard(account_id)
+            self._tasks.pop(account_id, None)
 
     async def _gmail(self, account: dict, preferences: dict, token: str, cursor: str | None, cutoff_at: str) -> None:
         # Gmail accepts Unix seconds, avoiding the PST-midnight interpretation of dates.
@@ -165,8 +200,9 @@ class MailSync:
         if not preferences["include_sent"]:
             query += " -in:sent"
         headers = {"Authorization": f"Bearer {token}"}
-        position = json.loads(cursor) if cursor and cursor.startswith("{") else {"page_token": cursor, "offset": 0}
-        consecutive_inaccessible = 0
+        # Older imports used a per-page offset. Re-listing that page is safe;
+        # the manifest deduplicates IDs and previously stored messages are upserted.
+        page_token = json.loads(cursor)["page_token"] if cursor and cursor.startswith("{") else cursor
         detail_semaphore = asyncio.Semaphore(4)
         async with httpx.AsyncClient(timeout=30) as client:
             if account.get("gmail_history_id") and not cursor:
@@ -190,43 +226,61 @@ class MailSync:
                 profile = await self._gmail_get(client, account, "https://gmail.googleapis.com/gmail/v1/users/me/profile", headers)
                 starting_history = profile.json()["historyId"]
                 self.repository.set_sync_initial_history_id(account["id"], starting_history)
-            while True:
-                params = {"q": query, "maxResults": 100}
-                if position["page_token"]:
-                    params["pageToken"] = position["page_token"]
-                response = await self._gmail_get(client, account, "https://gmail.googleapis.com/gmail/v1/users/me/messages", headers, params)
-                page = response.json()
-                if position["page_token"] is None and position["offset"] == 0:
-                    self.repository.update_sync_job(account["id"], "running", cursor, total_estimate=page.get("resultSizeEstimate"))
-                items = page.get("messages", [])
-                for batch_start in range(position["offset"], len(items), 8):
-                    batch = items[batch_start:batch_start + 8]
-                    results = await asyncio.gather(*(self._gmail_detail(client, account, item["id"], headers,
-                        detail_semaphore) for item in batch), return_exceptions=True)
-                    # Commit in listing order so the durable offset never skips
-                    # an unfinished message after a crash or failed request.
-                    for index, result in enumerate(results, start=batch_start):
-                        message_cursor = json.dumps({"page_token": position["page_token"], "offset": index + 1})
+            discovery_done = asyncio.Event()
+
+            async def discover() -> None:
+                token = page_token
+                try:
+                    if job and job["discovery_complete"]:
+                        return
+                    while True:
+                        params = {"q": query, "maxResults": 500}
+                        if token:
+                            params["pageToken"] = token
+                        response = await self._gmail_get(client, account,
+                            "https://gmail.googleapis.com/gmail/v1/users/me/messages", headers, params)
+                        page = response.json()
+                        token = page.get("nextPageToken")
+                        self.repository.add_sync_page(account["id"],
+                            [item["id"] for item in page.get("messages", [])], token)
+                        if not token:
+                            return
+                finally:
+                    discovery_done.set()
+
+            async def import_pending() -> None:
+                consecutive_inaccessible = 0
+                while True:
+                    ids = self.repository.pending_sync_messages(account["id"])
+                    if not ids:
+                        if discovery_done.is_set():
+                            return
+                        await asyncio.sleep(0.1)
+                        continue
+                    results = await asyncio.gather(*(self._gmail_detail(client, account, message_id,
+                        headers, detail_semaphore) for message_id in ids), return_exceptions=True)
+                    for message_id, result in zip(ids, results):
                         if isinstance(result, GmailRequestError):
                             if result.status not in {403, 404} or result.status == 403 and result.reason not in {"", "forbidden", "notFound"}:
                                 raise result
                             consecutive_inaccessible += 1
                             if consecutive_inaccessible > 5:
                                 raise RuntimeError("Google denied several messages in a row. Check Gmail access and retry the import") from result
-                            self.repository.update_sync_job(account["id"], "running", message_cursor, skipped=1)
+                            self.repository.finish_sync_message(account["id"], message_id, skipped=True)
                             continue
                         if isinstance(result, BaseException):
                             raise result
                         consecutive_inaccessible = 0
                         self._save_gmail_message(account, result, scan_marker)
-                        self.repository.update_sync_job(account["id"], "running", message_cursor, 1)
-                position = {"page_token": page.get("nextPageToken"), "offset": 0}
-                self.repository.update_sync_job(account["id"], "running", position["page_token"])
-                if not position["page_token"]:
-                    self.repository.reconcile_full_gmail_scan(account["id"], scan_marker, cutoff_at, preferences["include_sent"])
-                    await self._gmail_history(client, account, headers, starting_history, preferences["include_sent"])
-                    self.repository.mark_mail_index_backfilled(account["id"])
-                    return
+                        self.repository.finish_sync_message(account["id"], message_id)
+
+            outcomes = await asyncio.gather(discover(), import_pending(), return_exceptions=True)
+            for outcome in outcomes:
+                if isinstance(outcome, BaseException):
+                    raise outcome
+            self.repository.reconcile_full_gmail_scan(account["id"], scan_marker, cutoff_at, preferences["include_sent"])
+            await self._gmail_history(client, account, headers, starting_history, preferences["include_sent"])
+            self.repository.mark_mail_index_backfilled(account["id"])
 
     def _save_gmail_message(self, account: dict, message: dict, seen_sync_at: str | None = None) -> None:
         normalized = normalize_gmail_message(message, account["id"], account["email"])
@@ -258,6 +312,7 @@ class MailSync:
                                if entry.get("message", {}).get("id"))
             for message_id in deleted:
                 self.repository.delete_mail_message(account["id"], message_id)
+                self.repository.drop_sync_message(account["id"], message_id)
             for message_id in changed - deleted:
                 try:
                     detail = await self._gmail_get(client, account,
@@ -266,16 +321,19 @@ class MailSync:
                 except GmailRequestError as exc:
                     if exc.status == 404:
                         self.repository.delete_mail_message(account["id"], message_id)
+                        self.repository.drop_sync_message(account["id"], message_id)
                         continue
                     raise
                 message = detail.json()
                 if any(label in message.get("labelIds", []) for label in ("TRASH", "SPAM", "DRAFT")) or not include_sent and "SENT" in message.get("labelIds", []):
                     self.repository.delete_mail_message(account["id"], message_id)
+                    self.repository.drop_sync_message(account["id"], message_id)
                 else:
                     self._save_gmail_message(account, message)
-            self.repository.update_sync_job(account["id"], "running", increment=len(changed))
+                    self.repository.record_history_message(account["id"], message_id)
             page_token = page.get("nextPageToken")
             if not page_token:
+                self.repository.complete_history_discovery(account["id"])
                 self.repository.set_gmail_history_id(account["id"], latest_history)
                 return
 
@@ -322,6 +380,8 @@ class MailSync:
                 if not preferences or account["id"] in self._running:
                     continue
                 job = self.repository.get_sync_job(account["id"])
+                if job and job["status"] in {"paused", "paused_processing", "canceled"}:
+                    continue
                 due = not account["last_synced_at"] or (datetime.now(timezone.utc) - datetime.fromisoformat(account["last_synced_at"])).total_seconds() >= preferences["interval_hours"] * 3600
                 if account["provider"] == "gmail" and self.repository.needs_gmail_backfill(account["id"]):
                     due = True
@@ -331,5 +391,5 @@ class MailSync:
                     transient = any(marker in (job["error"] or "") for marker in ("rateLimitExceeded", "quotaExceeded", "Gmail returned 429", "Gmail returned 5", "Client error '403 Forbidden'"))
                     due = transient and (datetime.now(timezone.utc) - datetime.fromisoformat(job["updated_at"])).total_seconds() >= 300
                 if due:
-                    asyncio.create_task(self.run(account["id"]))
+                    self.schedule(account["id"])
             await asyncio.sleep(60)

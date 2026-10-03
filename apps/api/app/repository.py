@@ -106,6 +106,8 @@ class Repository:
             INSERT INTO mail_chunks_fts(mail_chunks_fts, rowid, subject, sender, content) VALUES ('delete', old.id, old.subject, old.sender, old.content);
         END;
         CREATE TABLE IF NOT EXISTS sync_jobs (account_id TEXT PRIMARY KEY REFERENCES connected_accounts(id) ON DELETE CASCADE, status TEXT NOT NULL, processed_count INTEGER NOT NULL DEFAULT 0, page_token TEXT, started_at TEXT NOT NULL, updated_at TEXT NOT NULL, error TEXT, total_estimate INTEGER, skipped_count INTEGER NOT NULL DEFAULT 0, cutoff_at TEXT);
+        CREATE TABLE IF NOT EXISTS sync_manifest (account_id TEXT NOT NULL REFERENCES connected_accounts(id) ON DELETE CASCADE, message_id TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', PRIMARY KEY(account_id, message_id));
+        CREATE INDEX IF NOT EXISTS idx_sync_manifest_pending ON sync_manifest(account_id, state);
         CREATE INDEX IF NOT EXISTS idx_mail_sources_account_date ON mail_sources(account_id, sent_at);
         """
         with self._lock, self.connect() as connection:
@@ -115,7 +117,7 @@ class Repository:
                 if name not in profile_columns:
                     connection.execute(f"ALTER TABLE owner_profile ADD COLUMN {name} TEXT")
             job_columns = {row[1] for row in connection.execute("PRAGMA table_info(sync_jobs)")}
-            for name, declaration in (("total_estimate", "INTEGER"), ("skipped_count", "INTEGER NOT NULL DEFAULT 0"), ("cutoff_at", "TEXT"), ("initial_history_id", "TEXT")):
+            for name, declaration in (("total_estimate", "INTEGER"), ("skipped_count", "INTEGER NOT NULL DEFAULT 0"), ("cutoff_at", "TEXT"), ("initial_history_id", "TEXT"), ("discovery_complete", "INTEGER NOT NULL DEFAULT 0")):
                 if name not in job_columns:
                     connection.execute(f"ALTER TABLE sync_jobs ADD COLUMN {name} {declaration}")
             account_columns = {row[1] for row in connection.execute("PRAGMA table_info(connected_accounts)")}
@@ -554,8 +556,11 @@ class Repository:
 
     def pending_mail_vectors(self, model: str, limit: int = 16) -> list[dict[str, Any]]:
         with self.connect() as connection:
-            rows = connection.execute("SELECT id, account_id, message_id, subject, sender, content FROM mail_chunks "
-                                      "WHERE vector_model IS NULL OR vector_model<>? ORDER BY id LIMIT ?", (model, limit)).fetchall()
+            rows = connection.execute("""SELECT c.id, c.account_id, c.message_id, c.subject, c.sender, c.content
+                FROM mail_chunks c LEFT JOIN sync_jobs j ON j.account_id=c.account_id
+                WHERE (c.vector_model IS NULL OR c.vector_model<>?)
+                AND (j.status IS NULL OR j.status NOT IN ('paused','paused_processing','canceled'))
+                ORDER BY c.id LIMIT ?""", (model, limit)).fetchall()
         return [dict(row) for row in rows]
 
     def pending_mail_vector_count(self, model: str) -> int:
@@ -568,8 +573,14 @@ class Repository:
             pending_chunks, pending_messages = connection.execute("""SELECT count(*), count(DISTINCT message_id)
                 FROM mail_chunks WHERE account_id=? AND (vector_model IS NULL OR vector_model<>?)""",
                 (account_id, model)).fetchone()
+            imported, processed = connection.execute("""SELECT count(*), coalesce(sum(CASE WHEN NOT EXISTS
+                (SELECT 1 FROM mail_chunks c WHERE c.account_id=m.account_id AND c.message_id=m.message_id
+                    AND (c.vector_model IS NULL OR c.vector_model<>?)) THEN 1 ELSE 0 END), 0)
+                FROM sync_manifest m WHERE m.account_id=? AND m.state='imported'""", (model, account_id)).fetchone()
+            discovered = connection.execute("SELECT count(*) FROM sync_manifest WHERE account_id=?", (account_id,)).fetchone()[0]
         return {"searchable_messages": searchable, "embedded_messages": searchable - pending_messages,
-                "pending_embedding_chunks": pending_chunks}
+                "pending_embedding_chunks": pending_chunks, "imported_messages": imported,
+                "processed_messages": processed, "discovered_messages": discovered}
 
     def initial_mail_import_incomplete(self) -> bool:
         with self.connect() as connection:
@@ -652,28 +663,46 @@ class Repository:
 
     def start_sync_job(self, account_id: str, cutoff_at: str | None = None) -> None:
         with self._lock, self.connect() as connection:
+            previous = connection.execute("SELECT status FROM sync_jobs WHERE account_id=?", (account_id,)).fetchone()
+            if previous and previous[0] in {"complete", "canceled"}:
+                connection.execute("DELETE FROM sync_manifest WHERE account_id=?", (account_id,))
             connection.execute("""INSERT INTO sync_jobs (account_id, status, processed_count, page_token, started_at, updated_at, error, cutoff_at)
                 VALUES (?, 'running', 0, NULL, ?, ?, NULL, ?)
                 ON CONFLICT(account_id) DO UPDATE SET status='running', error=NULL, updated_at=excluded.updated_at,
-                started_at=CASE WHEN sync_jobs.status='complete' THEN excluded.started_at ELSE sync_jobs.started_at END,
-                cutoff_at=CASE WHEN sync_jobs.status='complete' THEN excluded.cutoff_at ELSE COALESCE(sync_jobs.cutoff_at, excluded.cutoff_at) END,
-                processed_count=CASE WHEN sync_jobs.status='complete' THEN 0 ELSE sync_jobs.processed_count END,
-                skipped_count=CASE WHEN sync_jobs.status='complete' THEN 0 ELSE sync_jobs.skipped_count END,
-                initial_history_id=CASE WHEN sync_jobs.status='complete' THEN NULL ELSE sync_jobs.initial_history_id END,
-                total_estimate=CASE WHEN sync_jobs.status='complete' THEN NULL ELSE sync_jobs.total_estimate END""",
+                started_at=CASE WHEN sync_jobs.status IN ('complete','canceled') THEN excluded.started_at ELSE sync_jobs.started_at END,
+                cutoff_at=CASE WHEN sync_jobs.status IN ('complete','canceled') THEN excluded.cutoff_at ELSE COALESCE(sync_jobs.cutoff_at, excluded.cutoff_at) END,
+                processed_count=CASE WHEN sync_jobs.status IN ('complete','canceled') THEN 0 ELSE sync_jobs.processed_count END,
+                skipped_count=CASE WHEN sync_jobs.status IN ('complete','canceled') THEN 0 ELSE sync_jobs.skipped_count END,
+                initial_history_id=CASE WHEN sync_jobs.status IN ('complete','canceled') THEN NULL ELSE sync_jobs.initial_history_id END,
+                total_estimate=CASE WHEN sync_jobs.status IN ('complete','canceled') THEN NULL ELSE sync_jobs.total_estimate END,
+                discovery_complete=CASE WHEN sync_jobs.status IN ('complete','canceled') THEN 0 ELSE sync_jobs.discovery_complete END,
+                page_token=CASE WHEN sync_jobs.status IN ('complete','canceled') THEN NULL ELSE sync_jobs.page_token END""",
                 (account_id, now_iso(), now_iso(), cutoff_at))
 
     def set_sync_initial_history_id(self, account_id: str, history_id: str) -> None:
         with self._lock, self.connect() as connection:
             connection.execute("UPDATE sync_jobs SET initial_history_id=? WHERE account_id=?", (history_id, account_id))
 
+    def restart_legacy_sync_discovery(self, account_id: str) -> None:
+        with self._lock, self.connect() as connection:
+            connection.execute("DELETE FROM sync_manifest WHERE account_id=?", (account_id,))
+            connection.execute("""UPDATE sync_jobs SET page_token=NULL, processed_count=0, skipped_count=0,
+                total_estimate=NULL, discovery_complete=0, initial_history_id=NULL, started_at=?, updated_at=?
+                WHERE account_id=?""", (now_iso(), now_iso(), account_id))
+
     def set_sync_cutoff(self, account_id: str, cutoff_at: str) -> None:
         with self._lock, self.connect() as connection:
             connection.execute("UPDATE sync_jobs SET cutoff_at=?, initial_history_id=NULL WHERE account_id=?",
                                (cutoff_at, account_id))
 
-    def reset_sync_job(self, account_id: str) -> None:
+    def reset_sync_job(self, account_id: str, purge_mail_conversations: bool = False) -> None:
         with self._lock, self.connect() as connection:
+            if purge_mail_conversations:
+                turns = {row["turn_id"] for row in connection.execute("SELECT turn_id, metadata FROM messages WHERE role='assistant'")
+                    if any(source.get("source_id", "").startswith(f"{account_id}:")
+                           for source in json.loads(row["metadata"]).get("sources", []))}
+                for turn_id in turns:
+                    connection.execute("DELETE FROM messages WHERE turn_id=?", (turn_id,))
             related = {row["id"] for row in connection.execute("SELECT id, sources FROM actions")
                 if any(source.get("source_id", "").startswith(f"{account_id}:") for source in json.loads(row["sources"]))}
             for action_id in related:
@@ -682,6 +711,7 @@ class Repository:
             connection.execute("DELETE FROM mail_sources WHERE account_id=?", (account_id,))
             connection.execute("DELETE FROM mail_messages WHERE account_id=?", (account_id,))
             connection.execute("DELETE FROM sync_jobs WHERE account_id=?", (account_id,))
+            connection.execute("DELETE FROM sync_manifest WHERE account_id=?", (account_id,))
             connection.execute("UPDATE connected_accounts SET last_synced_at=NULL, sync_error=NULL WHERE id=?", (account_id,))
             connection.execute("UPDATE connected_accounts SET gmail_history_id=NULL WHERE id=?", (account_id,))
             connection.execute("UPDATE connected_accounts SET mail_index_backfill_at=NULL WHERE id=?", (account_id,))
@@ -700,3 +730,53 @@ class Repository:
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM sync_jobs WHERE account_id=?", (account_id,)).fetchone()
         return dict(row) if row else None
+
+    def add_sync_page(self, account_id: str, message_ids: list[str], next_token: str | None) -> None:
+        with self._lock, self.connect() as connection:
+            connection.executemany("INSERT OR IGNORE INTO sync_manifest(account_id,message_id) VALUES (?,?)",
+                                   [(account_id, message_id) for message_id in message_ids])
+            discovered = connection.execute("SELECT count(*) FROM sync_manifest WHERE account_id=?", (account_id,)).fetchone()[0]
+            connection.execute("""UPDATE sync_jobs SET page_token=?, total_estimate=?, discovery_complete=?, updated_at=?
+                WHERE account_id=?""", (next_token, discovered, int(next_token is None), now_iso(), account_id))
+
+    def pending_sync_messages(self, account_id: str, limit: int = 8) -> list[str]:
+        with self.connect() as connection:
+            return [row[0] for row in connection.execute("""SELECT message_id FROM sync_manifest
+                WHERE account_id=? AND state='pending' ORDER BY rowid LIMIT ?""", (account_id, limit))]
+
+    def finish_sync_message(self, account_id: str, message_id: str, skipped: bool = False) -> None:
+        with self._lock, self.connect() as connection:
+            changed = connection.execute("""UPDATE sync_manifest SET state=? WHERE account_id=? AND message_id=? AND state='pending'""",
+                ('skipped' if skipped else 'imported', account_id, message_id)).rowcount
+            if changed:
+                connection.execute("""UPDATE sync_jobs SET processed_count=processed_count+?, skipped_count=skipped_count+?, updated_at=?
+                    WHERE account_id=?""", (0 if skipped else 1, 1 if skipped else 0, now_iso(), account_id))
+
+    def record_history_message(self, account_id: str, message_id: str) -> None:
+        with self._lock, self.connect() as connection:
+            connection.execute("INSERT OR IGNORE INTO sync_manifest(account_id,message_id) VALUES (?,?)", (account_id, message_id))
+        self.finish_sync_message(account_id, message_id)
+
+    def drop_sync_message(self, account_id: str, message_id: str) -> None:
+        with self._lock, self.connect() as connection:
+            row = connection.execute("SELECT state FROM sync_manifest WHERE account_id=? AND message_id=?",
+                                     (account_id, message_id)).fetchone()
+            if row:
+                connection.execute("DELETE FROM sync_manifest WHERE account_id=? AND message_id=?", (account_id, message_id))
+                connection.execute("""UPDATE sync_jobs SET processed_count=max(0, processed_count-?),
+                    skipped_count=max(0, skipped_count-?) WHERE account_id=?""",
+                    (int(row["state"] == "imported"), int(row["state"] == "skipped"), account_id))
+
+    def complete_history_discovery(self, account_id: str) -> None:
+        with self._lock, self.connect() as connection:
+            count = connection.execute("SELECT count(*) FROM sync_manifest WHERE account_id=?", (account_id,)).fetchone()[0]
+            connection.execute("UPDATE sync_jobs SET total_estimate=?, discovery_complete=1 WHERE account_id=?", (count, account_id))
+
+    def clear_sync_manifest(self, account_id: str) -> None:
+        with self._lock, self.connect() as connection:
+            connection.execute("DELETE FROM sync_manifest WHERE account_id=?", (account_id,))
+            connection.execute("UPDATE sync_jobs SET page_token=NULL, total_estimate=NULL, discovery_complete=0 WHERE account_id=?", (account_id,))
+
+    def set_sync_control(self, account_id: str, status: str) -> None:
+        with self._lock, self.connect() as connection:
+            connection.execute("UPDATE sync_jobs SET status=?, updated_at=? WHERE account_id=?", (status, now_iso(), account_id))
