@@ -50,7 +50,7 @@ export async function request<T>(path: string, init: RequestInit = {}, timeoutMs
 export type ChatStreamEvent =
   | { type: 'status' | 'content'; text: string }
   | { type: 'error'; detail: string }
-  | { type: 'complete'; message_id: string; turn_id: string; user_message_id: string; content: string; sources: import('./types').Source[]; action_cards: import('./types').ActionCard[]; generated_by: 'ollama' }
+  | { type: 'complete'; message_id: string; turn_id: string; user_message_id: string; content: string; sources: import('./types').Source[]; action_cards: import('./types').ActionCard[]; generated_by: import('./types').GeneratedBy }
 
 export async function streamChat(path: string, message: string, onEvent: (event: ChatStreamEvent) => void): Promise<void> {
   const response = await fetch(`${apiBase}${path}`, {

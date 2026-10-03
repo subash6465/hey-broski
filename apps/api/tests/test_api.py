@@ -1,11 +1,38 @@
 import json
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app import main
 from app.assistant import AssistantService
 from app.repository import Repository
+
+
+@pytest.mark.parametrize("generated_by", ["metadata", "coverage"])
+def test_direct_chat_response_and_stream_accept_answer_origin(tmp_path: Path, monkeypatch, generated_by: str) -> None:
+    repository = Repository(tmp_path / "api.db")
+    main.repository = repository
+    main.assistant = AssistantService(repository, main.settings)
+
+    async def direct_answer(message, sources, history=None):
+        return "Answer from indexed mail.", generated_by
+
+    async def streamed_answer(message, sources, history=None):
+        yield {"type": "complete", "content": "Answer from indexed mail.", "generated_by": generated_by}
+
+    monkeypatch.setattr(main.assistant, "answer", direct_answer)
+    monkeypatch.setattr(main.assistant, "stream_answer", streamed_answer)
+    with TestClient(main.app) as client:
+        session_id = client.post("/api/chat/sessions").json()["session_id"]
+        direct = client.post(f"/api/chat/sessions/{session_id}/messages", json={"message": "Latest mail?"})
+        stream = client.post(f"/api/chat/sessions/{session_id}/messages/stream", json={"message": "Latest mail?"})
+        stored = client.get(f"/api/chat/sessions/{session_id}/messages").json()["messages"]
+
+    assert direct.status_code == 200
+    assert direct.json()["generated_by"] == generated_by
+    assert json.loads(stream.text.splitlines()[-1])["generated_by"] == generated_by
+    assert [item["metadata"].get("generated_by") for item in stored if item["role"] == "assistant"] == [generated_by, generated_by]
 
 
 def test_model_chat_approval_and_audit(tmp_path: Path, monkeypatch) -> None:

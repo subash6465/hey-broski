@@ -19,13 +19,15 @@ export type ActionCard = {
   source_refs: Source[]
 }
 
+export type GeneratedBy = 'ollama' | 'metadata' | 'coverage'
+
 export type ChatMessage = {
   id: string
   role: 'user' | 'assistant'
   content: string
   sources?: Source[]
   actionCards?: ActionCard[]
-  generatedBy?: 'ollama'
+  generatedBy?: GeneratedBy
   turnId?: string
   createdAt?: string
   responseTimeMs?: number | null
@@ -42,7 +44,7 @@ export type StoredMessage = {
   id: string
   role: 'user' | 'assistant'
   content: string
-  metadata: { sources?: Source[]; action_cards?: ActionCard[]; generated_by?: 'ollama' }
+  metadata: { sources?: Source[]; action_cards?: ActionCard[]; generated_by?: GeneratedBy }
   turn_id: string
   created_at: string
   updated_at: string

@@ -424,7 +424,7 @@ export default function Home() {
                   {message.role === 'assistant' && <div className="bot-avatar"><Bot size={17} /></div>}
                   <div className="message-wrap">
                     <div className="message-bubble"><p>{message.content}</p></div>
-                    {message.generatedBy && <span className="generated-by">Answered by local model ({health?.model ?? 'Ollama'})</span>}
+                    {message.generatedBy && <span className="generated-by">{message.generatedBy === 'ollama' ? `Answered by local model (${health?.model ?? 'Ollama'})` : message.generatedBy === 'metadata' ? 'Answered from mail metadata' : 'Mailbox coverage notice'}</span>}
                     {!!message.sources?.length && <SourceList sources={message.sources} onOpen={() => setSelectedSources(message.sources ?? null)} />}
                     {!!message.actionCards?.length && <div className="inline-actions">{message.actionCards.map((card) => <ActionCardView key={card.id} card={actions.find((item) => item.id === card.id) ?? card} busy={decisionBusy === card.id} onDecision={decide} />)}</div>}
                   </div>
