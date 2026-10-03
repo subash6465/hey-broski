@@ -29,6 +29,22 @@ def test_document_keyword_search(tmp_path: Path) -> None:
     assert results[0]["filename"] == "policy.txt"
 
 
+def test_document_fts_backfills_existing_chunks_and_removes_deleted_text(tmp_path: Path) -> None:
+    database = tmp_path / "legacy.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("""CREATE TABLE documents (id TEXT PRIMARY KEY, filename TEXT NOT NULL,
+            content_type TEXT NOT NULL, size_bytes INTEGER NOT NULL, extracted_text TEXT NOT NULL, created_at TEXT NOT NULL)""")
+        connection.execute("""CREATE TABLE document_chunks (document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            chunk_index INTEGER NOT NULL, content TEXT NOT NULL, PRIMARY KEY(document_id, chunk_index))""")
+        connection.execute("INSERT INTO documents VALUES ('old','legacy.txt','text/plain',30,'The code is PINE-731','2026-01-01')")
+        connection.execute("INSERT INTO document_chunks VALUES ('old',0,'The code is PINE-731')")
+    repository = Repository(database)
+    repository.initialize()
+    assert repository.search_document_chunks("PINE-731")[0]["document_id"] == "old"
+    assert repository.delete_document("old")
+    assert repository.search_document_chunks("PINE-731") == []
+
+
 def test_document_chunks_find_content_beyond_preview_and_survive_restart(tmp_path: Path) -> None:
     path = tmp_path / "test.db"
     repository = Repository(path)

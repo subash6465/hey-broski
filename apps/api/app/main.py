@@ -297,14 +297,12 @@ async def send_message(session_id: str, request: ChatRequest) -> ChatResponse:
     history = repository.list_messages(session_id)[-6:]
     previous_question = next((item["content"] for item in reversed(history) if item["role"] == "user"), "")
     sources, cards = await asyncio.to_thread(assistant.context_for, request.message, previous_question)
-    if not request.include_sources:
-        sources = []
     started = perf_counter()
     try:
         content, generated_by = await assistant.answer(request.message, sources, history)
     except ModelResponseError as exc:
         raise HTTPException(exc.status_code, exc.detail) from exc
-    return save_chat_turn(session_id, request.message, content, sources, cards, generated_by, round((perf_counter() - started) * 1000))
+    return save_chat_turn(session_id, request.message, content, sources if request.include_sources else [], cards, generated_by, round((perf_counter() - started) * 1000))
 
 
 def save_chat_turn(session_id: str, question: str, content: str, sources: list, cards: list[ActionCard], generated_by: str, response_time_ms: int) -> ChatResponse:
@@ -353,15 +351,13 @@ async def stream_message(session_id: str, request: ChatRequest) -> StreamingResp
     history = repository.list_messages(session_id)[-6:]
     previous_question = next((item["content"] for item in reversed(history) if item["role"] == "user"), "")
     sources, cards = await asyncio.to_thread(assistant.context_for, request.message, previous_question)
-    if not request.include_sources:
-        sources = []
 
     async def events():
         started = perf_counter()
         try:
             async for event in assistant.stream_answer(request.message, sources, history):
                 if event["type"] == "complete":
-                    result = save_chat_turn(session_id, request.message, event["content"], sources, cards, event.get("generated_by", "ollama"), round((perf_counter() - started) * 1000))
+                    result = save_chat_turn(session_id, request.message, event["content"], sources if request.include_sources else [], cards, event.get("generated_by", "ollama"), round((perf_counter() - started) * 1000))
                     event = {"type": "complete", **result.model_dump(mode="json")}
                 yield json.dumps(event) + "\n"
         except ModelResponseError as exc:

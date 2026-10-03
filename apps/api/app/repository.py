@@ -73,6 +73,13 @@ class Repository:
         CREATE INDEX IF NOT EXISTS idx_actions_status ON actions(status, created_at);
         CREATE TABLE IF NOT EXISTS documents (id TEXT PRIMARY KEY, filename TEXT NOT NULL, content_type TEXT NOT NULL, size_bytes INTEGER NOT NULL, extracted_text TEXT NOT NULL, created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS document_chunks (document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE, chunk_index INTEGER NOT NULL, content TEXT NOT NULL, PRIMARY KEY(document_id, chunk_index));
+        CREATE VIRTUAL TABLE IF NOT EXISTS document_chunks_fts USING fts5(content, content='document_chunks', content_rowid='rowid');
+        CREATE TRIGGER IF NOT EXISTS document_chunks_ai AFTER INSERT ON document_chunks BEGIN
+            INSERT INTO document_chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS document_chunks_ad AFTER DELETE ON document_chunks BEGIN
+            INSERT INTO document_chunks_fts(document_chunks_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+        END;
         CREATE TABLE IF NOT EXISTS reminders (id TEXT PRIMARY KEY, action_id TEXT NOT NULL UNIQUE REFERENCES actions(id) ON DELETE CASCADE, title TEXT NOT NULL, due_at TEXT, created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS audit_log (id TEXT PRIMARY KEY, event_type TEXT NOT NULL, entity_id TEXT, details TEXT NOT NULL, created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS owner_profile (id INTEGER PRIMARY KEY CHECK (id = 1), first_name TEXT NOT NULL, last_name TEXT NOT NULL, age INTEGER NOT NULL, phone_number TEXT NOT NULL, gender TEXT NOT NULL, time_zone TEXT NOT NULL, updated_at TEXT NOT NULL, date_of_birth TEXT, country_code TEXT);
@@ -111,6 +118,7 @@ class Repository:
         CREATE INDEX IF NOT EXISTS idx_mail_sources_account_date ON mail_sources(account_id, sent_at);
         """
         with self._lock, self.connect() as connection:
+            had_document_fts = connection.execute("SELECT 1 FROM sqlite_master WHERE name='document_chunks_fts'").fetchone() is not None
             connection.executescript(schema)
             profile_columns = {row[1] for row in connection.execute("PRAGMA table_info(owner_profile)")}
             for name in ("date_of_birth", "country_code"):
@@ -146,6 +154,8 @@ class Repository:
                 WHERE NOT EXISTS (SELECT 1 FROM document_chunks c WHERE c.document_id = d.id)""").fetchall()
             for document in missing:
                 self._insert_chunks(connection, document["id"], document["extracted_text"])
+            if not had_document_fts:
+                connection.execute("INSERT INTO document_chunks_fts(document_chunks_fts) VALUES ('rebuild')")
             # Link legacy user/assistant rows by a shared turn ID.
             sessions = connection.execute("SELECT id FROM sessions").fetchall()
             for session in sessions:
@@ -344,21 +354,25 @@ class Repository:
     def search_document_chunks(self, query: str, limit: int = 4) -> list[dict[str, Any]]:
         stopwords = {"about", "after", "before", "could", "does", "document", "documents", "from", "have", "into", "please", "show", "summarize", "tell", "that", "their", "there", "these", "this", "what", "when", "where", "which", "with", "would", "your"}
         terms = set(re.findall(r"[a-z0-9]{3,}", query.lower())) - stopwords
+        if not terms:
+            return []
+        match = " OR ".join('"' + term.replace('"', '""') + '"' for term in sorted(terms)[:12])
         with self.connect() as connection:
-            rows = connection.execute("""SELECT c.document_id, c.chunk_index, c.content, d.filename, d.created_at
-                FROM document_chunks c JOIN documents d ON d.id = c.document_id
-                ORDER BY d.created_at DESC, c.chunk_index""").fetchall()
-        scored = []
-        for row in rows:
-            filename = row["filename"].lower()
-            content = row["content"].lower()
-            matched = sum(2 if term in filename else 0 for term in terms) + sum(min(content.count(term), 3) for term in terms)
-            if matched:
-                scored.append((matched, dict(row)))
-        scored.sort(key=lambda pair: pair[0], reverse=True)
-        if not scored and len({row["document_id"] for row in rows}) == 1:
-            return [dict(row) for row in rows[:limit]]
-        return [row for _, row in scored[:limit]]
+            rows = [dict(row) for row in connection.execute("""SELECT c.document_id, c.chunk_index, c.content, d.filename, d.created_at
+                FROM document_chunks_fts JOIN document_chunks c ON c.rowid=document_chunks_fts.rowid
+                JOIN documents d ON d.id=c.document_id WHERE document_chunks_fts MATCH ?
+                ORDER BY bm25(document_chunks_fts), d.created_at DESC LIMIT ?""", (match, limit * 4))]
+            filename_rows = [dict(row) for row in connection.execute("""SELECT c.document_id, c.chunk_index, c.content, d.filename, d.created_at
+                FROM documents d JOIN document_chunks c ON c.document_id=d.id AND c.chunk_index=0
+                WHERE """ + " OR ".join("lower(d.filename) LIKE ?" for _ in terms) + " ORDER BY d.created_at DESC LIMIT ?",
+                (*[f"%{term}%" for term in sorted(terms)], limit))]
+            document_count = connection.execute("SELECT count(*) FROM documents").fetchone()[0]
+            fallback = [dict(row) for row in connection.execute("""SELECT c.document_id, c.chunk_index, c.content, d.filename, d.created_at
+                FROM document_chunks c JOIN documents d ON d.id=c.document_id ORDER BY c.chunk_index LIMIT ?""", (limit,))] if document_count == 1 else []
+        unique: dict[tuple[str, int], dict[str, Any]] = {}
+        for row in rows + filename_rows:
+            unique.setdefault((row["document_id"], row["chunk_index"]), row)
+        return list(unique.values())[:limit] or fallback
 
     def audit(self, event_type: str, entity_id: str | None, details: dict[str, Any]) -> None:
         with self._lock, self.connect() as connection:
@@ -490,8 +504,9 @@ class Repository:
                                     f"{item['sender_name']} {item['sender_address']}", chunk))
 
     def search_mail_messages(self, query: str, *, direction: str | None = None, sender: str | None = None,
-                             latest: bool = False, attachments_only: bool = False, after_at: str | None = None,
-                             before_at: str | None = None, limit: int = 8) -> list[dict[str, Any]]:
+                             recipient: str | None = None, attachment_name: str | None = None,
+                             account_email: str | None = None, latest: bool = False, attachments_only: bool = False,
+                             after_at: str | None = None, before_at: str | None = None, limit: int = 8) -> list[dict[str, Any]]:
         where = ["1=1"]
         params: list[Any] = []
         if direction:
@@ -501,6 +516,17 @@ class Repository:
             compact = re.sub(r"[^a-z0-9]", "", sender.lower())
             where.append("(lower(m.sender_name || m.sender_address) LIKE ? OR lower(replace(m.sender_name || m.sender_address,' ','')) LIKE ?)")
             params.extend([f"%{sender.lower()}%", f"%{compact}%"])
+        if recipient:
+            where.append("""(EXISTS (SELECT 1 FROM json_each(m.to_json) WHERE lower(value) LIKE ?)
+                OR EXISTS (SELECT 1 FROM json_each(m.cc_json) WHERE lower(value) LIKE ?)
+                OR EXISTS (SELECT 1 FROM json_each(m.bcc_json) WHERE lower(value) LIKE ?))""")
+            params.extend([f"%{recipient.lower()}%"] * 3)
+        if attachment_name:
+            where.append("EXISTS (SELECT 1 FROM json_each(m.attachments_json) WHERE lower(json_extract(value,'$.name')) LIKE ?)")
+            params.append(f"%{attachment_name.lower()}%")
+        if account_email:
+            where.append("a.email=?")
+            params.append(account_email.lower())
         if attachments_only:
             where.append("m.has_attachments=1")
         if after_at:
@@ -510,20 +536,38 @@ class Repository:
             where.append("m.received_at<?")
             params.append(before_at)
         base = " FROM mail_messages m JOIN connected_accounts a ON a.id=m.account_id "
-        if latest:
+        terms = [word for word in re.findall(r"[\w@.]+", query.lower()) if len(word) > 1 and not word.isdigit() and word not in
+                 {"what", "which", "where", "when", "please", "could", "would", "tell", "show", "about", "regarding",
+                  "mail", "mails", "email", "emails", "received", "sent", "from", "details", "the", "with", "this",
+                  "latest", "newest", "recent", "most", "last", "find", "get", "me", "is", "i", "my", "was", "has",
+                  "that", "mentioning", "containing", "saying", "inbox", "message", "messages",
+                  "today", "yesterday", "week", "month", "day", "days", "since", "between"}]
+        if sender:
+            sender_compact = re.sub(r"[^a-z0-9]", "", sender.lower())
+            terms = [word for word in terms if re.sub(r"[^a-z0-9]", "", word) not in sender_compact]
+        if latest and not terms:
             sql = "SELECT m.*, a.email AS account_email, a.last_synced_at, c.content AS match_content, " \
                   "(SELECT count(*) FROM mail_messages t WHERE t.account_id=m.account_id AND t.thread_id=m.thread_id) AS thread_count" + base + \
                   "LEFT JOIN mail_chunks c ON c.account_id=m.account_id AND c.message_id=m.message_id AND c.chunk_index=0 WHERE " + " AND ".join(where) + \
                   " ORDER BY m.received_at DESC LIMIT ?"
             with self.connect() as connection:
                 return [dict(row) for row in connection.execute(sql, (*params, limit))]
-        terms = [word for word in re.findall(r"[\w@.]+", query.lower()) if len(word) > 1 and word not in
-                 {"what", "which", "where", "when", "please", "could", "would", "tell", "show", "about", "mail", "mails", "email", "emails", "received", "sent", "from", "details", "the", "with", "this", "latest", "find", "get", "me"}]
         if not terms:
             return self.search_mail_messages(query, direction=direction, sender=sender, latest=True,
+                                             recipient=recipient, attachment_name=attachment_name, account_email=account_email,
                                              attachments_only=attachments_only, after_at=after_at,
                                              before_at=before_at, limit=limit)
         match = " OR ".join('"' + term.replace('"', '""') + '"' for term in terms[:12])
+        if latest:
+            sql = """WITH matched AS (
+                SELECT DISTINCT c.account_id, c.message_id FROM mail_chunks_fts
+                JOIN mail_chunks c ON c.id=mail_chunks_fts.rowid WHERE mail_chunks_fts MATCH ?)
+                SELECT m.*, a.email AS account_email, a.last_synced_at, m.body_text AS match_content,
+                (SELECT count(*) FROM mail_messages t WHERE t.account_id=m.account_id AND t.thread_id=m.thread_id) AS thread_count
+                FROM matched x JOIN mail_messages m ON m.account_id=x.account_id AND m.message_id=x.message_id
+                JOIN connected_accounts a ON a.id=m.account_id WHERE """ + " AND ".join(where) + " ORDER BY m.received_at DESC LIMIT ?"
+            with self.connect() as connection:
+                return [dict(row) for row in connection.execute(sql, (match, *params, limit))]
         sql = "SELECT m.*, a.email AS account_email, a.last_synced_at, c.id AS chunk_id, c.content AS match_content, " \
               "(SELECT count(*) FROM mail_messages t WHERE t.account_id=m.account_id AND t.thread_id=m.thread_id) AS thread_count, " \
               "bm25(mail_chunks_fts, 4.0, 3.0, 1.0) AS score" + base + \
@@ -531,7 +575,7 @@ class Repository:
               "JOIN mail_chunks_fts ON mail_chunks_fts.rowid=c.id WHERE mail_chunks_fts MATCH ? AND " + " AND ".join(where) + \
               " ORDER BY score, m.received_at DESC LIMIT ?"
         with self.connect() as connection:
-            rows = [dict(row) for row in connection.execute(sql, (match, *params, limit * 3))]
+            rows = [dict(row) for row in connection.execute(sql, (match, *params, max(100, limit * 20)))]
         unique: dict[tuple[str, str], dict[str, Any]] = {}
         for row in rows:
             unique.setdefault((row["account_id"], row["message_id"]), row)
@@ -540,6 +584,66 @@ class Repository:
     def indexed_mail_count(self) -> int:
         with self.connect() as connection:
             return connection.execute("SELECT count(*) FROM mail_messages").fetchone()[0]
+
+    def indexed_document_count(self) -> int:
+        with self.connect() as connection:
+            return connection.execute("SELECT count(*) FROM documents").fetchone()[0]
+
+    def has_summary_only_mail_accounts(self) -> bool:
+        with self.connect() as connection:
+            return bool(connection.execute("SELECT EXISTS(SELECT 1 FROM connected_accounts WHERE provider<>'gmail')").fetchone()[0])
+
+    def count_mail_messages(self, *, direction: str | None = None, sender: str | None = None,
+                            recipient: str | None = None, attachment_name: str | None = None,
+                            attachments_only: bool = False, after_at: str | None = None,
+                            before_at: str | None = None, account_email: str | None = None) -> int:
+        clauses = ["1=1"]
+        params: list[Any] = []
+        if direction:
+            clauses.append("m.direction=?")
+            params.append(direction)
+        if sender:
+            compact = re.sub(r"[^a-z0-9]", "", sender.lower())
+            clauses.append("(lower(m.sender_name || m.sender_address) LIKE ? OR lower(replace(m.sender_name || m.sender_address,' ','')) LIKE ?)")
+            params.extend([f"%{sender.lower()}%", f"%{compact}%"])
+        if recipient:
+            clauses.append("""(EXISTS (SELECT 1 FROM json_each(m.to_json) WHERE lower(value) LIKE ?)
+                OR EXISTS (SELECT 1 FROM json_each(m.cc_json) WHERE lower(value) LIKE ?)
+                OR EXISTS (SELECT 1 FROM json_each(m.bcc_json) WHERE lower(value) LIKE ?))""")
+            params.extend([f"%{recipient.lower()}%"] * 3)
+        if attachment_name:
+            clauses.append("EXISTS (SELECT 1 FROM json_each(m.attachments_json) WHERE lower(json_extract(value,'$.name')) LIKE ?)")
+            params.append(f"%{attachment_name.lower()}%")
+        if attachments_only:
+            clauses.append("m.has_attachments=1")
+        if after_at:
+            clauses.append("m.received_at>=?")
+            params.append(after_at)
+        if before_at:
+            clauses.append("m.received_at<?")
+            params.append(before_at)
+        if account_email:
+            clauses.append("a.email=?")
+            params.append(account_email.lower())
+        with self.connect() as connection:
+            return connection.execute("SELECT count(*) FROM mail_messages m JOIN connected_accounts a ON a.id=m.account_id WHERE " +
+                                      " AND ".join(clauses), params).fetchone()[0]
+
+    def mail_thread(self, account_id: str, thread_id: str, limit: int = 10, offset: int = 0) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            return [dict(row) for row in connection.execute("""SELECT m.*, a.email AS account_email, a.last_synced_at,
+                (SELECT count(*) FROM mail_messages t WHERE t.account_id=m.account_id AND t.thread_id=m.thread_id) AS thread_count
+                FROM mail_messages m JOIN connected_accounts a ON a.id=m.account_id
+                WHERE m.account_id=? AND m.thread_id=? ORDER BY m.received_at LIMIT ? OFFSET ?""",
+                (account_id, thread_id, limit, offset))]
+
+    def mail_message(self, account_id: str, message_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute("""SELECT m.*, a.email AS account_email, a.last_synced_at,
+                (SELECT count(*) FROM mail_messages t WHERE t.account_id=m.account_id AND t.thread_id=m.thread_id) AS thread_count
+                FROM mail_messages m JOIN connected_accounts a ON a.id=m.account_id
+                WHERE m.account_id=? AND m.message_id=?""", (account_id, message_id)).fetchone()
+        return dict(row) if row else None
 
     def needs_gmail_backfill(self, account_id: str) -> bool:
         with self.connect() as connection:
@@ -602,7 +706,9 @@ class Repository:
                                (model, *ids))
 
     def mail_messages_for_chunks(self, ids: list[int], *, direction: str | None = None,
-                                 sender: str | None = None, attachments_only: bool = False,
+                                 sender: str | None = None, recipient: str | None = None,
+                                 attachment_name: str | None = None, account_email: str | None = None,
+                                 attachments_only: bool = False,
                                  after_at: str | None = None, before_at: str | None = None) -> list[dict[str, Any]]:
         if not ids:
             return []
@@ -615,6 +721,17 @@ class Repository:
             compact = re.sub(r"[^a-z0-9]", "", sender.lower())
             where.append("(lower(m.sender_name || m.sender_address) LIKE ? OR lower(replace(m.sender_name || m.sender_address,' ','')) LIKE ?)")
             params.extend([f"%{sender.lower()}%", f"%{compact}%"])
+        if recipient:
+            where.append("""(EXISTS (SELECT 1 FROM json_each(m.to_json) WHERE lower(value) LIKE ?)
+                OR EXISTS (SELECT 1 FROM json_each(m.cc_json) WHERE lower(value) LIKE ?)
+                OR EXISTS (SELECT 1 FROM json_each(m.bcc_json) WHERE lower(value) LIKE ?))""")
+            params.extend([f"%{recipient.lower()}%"] * 3)
+        if attachment_name:
+            where.append("EXISTS (SELECT 1 FROM json_each(m.attachments_json) WHERE lower(json_extract(value,'$.name')) LIKE ?)")
+            params.append(f"%{attachment_name.lower()}%")
+        if account_email:
+            where.append("a.email=?")
+            params.append(account_email.lower())
         if attachments_only:
             where.append("m.has_attachments=1")
         if after_at:

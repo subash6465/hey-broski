@@ -19,7 +19,7 @@ export type ActionCard = {
   source_refs: Source[]
 }
 
-export type GeneratedBy = 'ollama' | 'metadata' | 'coverage'
+export type GeneratedBy = 'ollama' | 'metadata' | 'coverage' | 'agent'
 
 export type ChatMessage = {
   id: string
