@@ -194,8 +194,10 @@ class AssistantService:
             return None
         if not self.repository.list_accounts():
             return None
+        importing = self.repository.initial_mail_import_incomplete()
         if not sources or sources[0].source_type != "email":
-            return "I found no matching message in the indexed mailbox. Check the last sync time in Accounts."
+            return ("No matching mail has been indexed yet. The initial import is still running."
+                    if importing else "I found no matching message in the indexed mailbox. Check the last sync time in Accounts.")
         source = sources[0]
         if not source.metadata.get("message_id"):
             return None
@@ -208,13 +210,41 @@ class AssistantService:
         direction = source.metadata.get("direction", "received")
         sender = source.metadata.get("sender", "unknown sender")
         freshness = source.metadata.get("last_synced_at")
-        suffix = f" Mailbox last synced {freshness}." if freshness else " The initial mailbox import is still in progress."
+        if importing:
+            return f"The latest {direction} email indexed so far is ‘{source.title}’ from {sender}, dated {stamp}. [Source 1] The initial mail import is still running, so this may change."
+        suffix = f" Mailbox last synced {freshness}." if freshness else ""
+        if self.repository.inaccessible_mail_count():
+            suffix += " Some messages were inaccessible during the last sync."
         return f"The latest {direction} email I found is ‘{source.title}’ from {sender}, dated {stamp}. [Source 1]{suffix}"
+
+    def _mail_coverage(self, message: str, sources: list[Source]) -> tuple[str | None, str | None]:
+        mail_question = any(source.source_type == "email" for source in sources) or bool(
+            re.search(r"\b(mail|mails|email|emails|inbox|received|sender|sent|messages)\b", message.lower()))
+        if not mail_question:
+            return None, None
+        importing = self.repository.initial_mail_import_incomplete()
+        skipped = self.repository.inaccessible_mail_count()
+        broad = re.search(r"\b(all|every|how many|count|total)\b", message.lower())
+        if importing and broad:
+            return "I cannot give a complete mailbox count or list yet because the initial import is still running. You can search the messages indexed so far.", None
+        if skipped and broad:
+            noun = "message was" if skipped == 1 else "messages were"
+            return f"I cannot guarantee a complete mailbox count or list because {skipped} {noun} inaccessible during the last sync.", None
+        notes = []
+        if importing:
+            notes.append("Mail import is still running; this answer uses only messages indexed so far.")
+        if skipped:
+            noun = "message was" if skipped == 1 else "messages were"
+            notes.append(f"{skipped} {noun} inaccessible during the last sync.")
+        return None, " ".join(notes) or None
 
     async def answer(self, message: str, sources: list[Source], history: list[dict] | None = None) -> tuple[str, str]:
         direct = self._metadata_answer(message, sources)
         if direct is not None:
             return direct, "metadata"
+        coverage_answer, coverage_note = self._mail_coverage(message, sources)
+        if coverage_answer:
+            return coverage_answer, "coverage"
         if not self.settings.use_ollama:
             raise ModelResponseError("Local model inference is disabled. Set HEYBROSKI_USE_OLLAMA=true and restart the API.")
         if self.settings.chat_model == "qwen3:4b":
@@ -255,7 +285,8 @@ class AssistantService:
             result = response.json()
             if result.get("done_reason") == "length":
                 raise ModelResponseError("The model reached its answer limit. Please retry with a narrower question.", 502)
-            return final_answer(result.get("message", {}).get("content", "")), "ollama"
+            answer = final_answer(result.get("message", {}).get("content", ""))
+            return answer + (f"\n\n{coverage_note}" if coverage_note else ""), "ollama"
         except httpx.TimeoutException as exc:
             logger.warning("ollama_timeout", model=self.settings.chat_model, error=str(exc))
             raise ModelResponseError("The local model timed out. Please retry or use a smaller model.", 504) from exc
@@ -282,6 +313,11 @@ class AssistantService:
         if direct is not None:
             yield {"type": "content", "text": direct}
             yield {"type": "complete", "content": direct, "generated_by": "metadata"}
+            return
+        coverage_answer, coverage_note = self._mail_coverage(message, sources)
+        if coverage_answer:
+            yield {"type": "content", "text": coverage_answer}
+            yield {"type": "complete", "content": coverage_answer, "generated_by": "coverage"}
             return
         if not self.settings.use_ollama:
             raise ModelResponseError("Local model inference is disabled.")
@@ -333,6 +369,8 @@ class AssistantService:
             if not completed:
                 raise ModelResponseError("The local model did not finish an answer. Please retry.", 502)
             content = final_answer("".join(answer_parts))
+            if coverage_note:
+                content += f"\n\n{coverage_note}"
             yield {"type": "content", "text": content}
             yield {"type": "complete", "content": content}
         except httpx.TimeoutException as exc:

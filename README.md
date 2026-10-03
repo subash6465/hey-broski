@@ -31,6 +31,8 @@ Provider access tokens and imported OAuth client details are encrypted locally o
 
 Gmail message text, sender and recipient metadata, thread IDs, and attachment names are stored in the local SQLite database. Search chunks and embeddings are stored locally in SQLite and LanceDB. These search stores are **not encrypted by the credential vault**; protect the computer and its backups accordingly. Attachment file contents are not downloaded or indexed. Existing Gmail imports are rebuilt into the new index on the next sync. Gmail `historyId` is then used for incremental updates; exact answers reflect the last completed sync.
 
+The first Gmail import fetches a small bounded group of messages concurrently. Each message becomes searchable as soon as its normalized record and text chunks are committed. A separate worker embeds chunks in the background, so semantic retrieval can lag behind keyword and metadata search. The workspace opens while import runs; the progress panel shows searchable messages, messages ready for semantic retrieval, and pending embedding chunks. Chat labels answers based on a partial import and waits to give complete mailbox counts or lists until the first import finishes.
+
 OAuth redirects currently target `localhost:8000` and require the browser and API to run on the same computer. Codespaces can still run the demo, but real account connection needs a separately configured public callback before it can work from a remote browser.
 
 ## Run locally on Windows (no Docker)

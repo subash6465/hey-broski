@@ -32,6 +32,7 @@ import type { ActionCard, ChatMessage, ChatSession, DocumentRecord, Source, Stor
 type View = 'desk' | 'chat' | 'actions' | 'vault' | 'history' | 'accounts'
 type DeleteTarget = { kind: 'conversation' | 'document'; id: string; label: string }
 type Health = { status: string; mode: string; inference_enabled: boolean; services: { database: string; ollama: string }; model: string }
+type MailPipeline = { searchable_messages: number; embedded_messages: number; pending_embedding_chunks: number }
 
 const prompts = [
   { label: 'Daily brief', text: 'What needs my attention this week?' },
@@ -53,6 +54,7 @@ export default function Home() {
     return requested === 'profile' || requested === 'sync' ? requested : 'connections'
   })
   const [accountJobs, setAccountJobs] = useState<OnboardingState['sync_jobs']>({})
+  const [accountPipelines, setAccountPipelines] = useState<Record<string, MailPipeline>>({})
   const [accountBusy, setAccountBusy] = useState<string>()
   const [view, setView] = useState<View>('desk')
   const [mobileNav, setMobileNav] = useState(false)
@@ -87,10 +89,11 @@ export default function Home() {
         const result = await request<{ accounts: OnboardingState['accounts'] }>('/api/accounts')
         setOnboarding(current => current ? { ...current, accounts: result.accounts } : current)
         const entries = await Promise.all(result.accounts.map(async account => {
-          const status = await request<{ job: NonNullable<OnboardingState['sync_jobs'][string]> | null }>(`/api/accounts/${account.id}/sync`)
-          return [account.id, status.job] as const
+          const status = await request<{ job: NonNullable<OnboardingState['sync_jobs'][string]> | null; pipeline: MailPipeline }>(`/api/accounts/${account.id}/sync`)
+          return [account.id, status] as const
         }))
-        setAccountJobs(Object.fromEntries(entries))
+        setAccountJobs(Object.fromEntries(entries.map(([id, status]) => [id, status.job])))
+        setAccountPipelines(Object.fromEntries(entries.map(([id, status]) => [id, status.pipeline])))
       } catch { /* Account status is advisory; the workspace remains usable. */ }
     }
     void pollAccounts()
@@ -349,7 +352,8 @@ export default function Home() {
   const firstAction = pendingActions[0]
   const visibleSyncAccounts = onboarding?.accounts.filter(account => {
     const job = accountJobs[account.id] ?? onboarding.sync_jobs[account.id]
-    return !account.last_synced_at || job?.status === 'running' || job?.status === 'failed'
+    return !account.last_synced_at || job?.status === 'running' || job?.status === 'failed' ||
+      (account.provider === 'gmail' && (accountPipelines[account.id]?.pending_embedding_chunks ?? 0) > 0)
   }) ?? []
 
   if (onboarding === undefined) return <div className="onboarding-shell"><div className="onboarding-header"><div className="onboarding-brand"><Sparkles size={21} /> hey broski<span>.</span></div></div><p>Opening your local workspace…</p></div>
@@ -387,12 +391,16 @@ export default function Home() {
         </header>
         {error && <div className="error-banner" role="alert"><span>{error}</span><button onClick={() => setError(undefined)}><X size={16} /></button></div>}
         {notice && <div className="notice-banner" role="status"><span>{notice}</span><button onClick={() => setNotice(undefined)}><X size={16} /></button></div>}
-        {!!visibleSyncAccounts.length && <section className="import-progress" aria-label="Mail import progress"><div className="import-progress-heading"><RefreshCw size={16} /><div><strong>Bringing your mail in</strong><span>You can keep using your workspace while this runs.</span></div></div>{visibleSyncAccounts.map(account => {
+        {!!visibleSyncAccounts.length && <section className="import-progress" aria-label="Mail import progress"><div className="import-progress-heading"><RefreshCw size={16} /><div><strong>Bringing your mail in</strong><span>You can ask about messages as they become searchable. Answers may be incomplete until the first import finishes.</span></div></div>{visibleSyncAccounts.map(account => {
           const job = accountJobs[account.id] ?? onboarding.sync_jobs[account.id]
+          const pipeline = accountPipelines[account.id]
           const done = (job?.processed_count ?? 0) + (job?.skipped_count ?? 0)
           const estimate = job?.total_estimate ?? null
-          const percent = estimate && estimate > 0 ? Math.min(95, Math.round(done / estimate * 100)) : null
-          return <div className="import-progress-account" key={account.id}><div className="import-progress-line"><strong>{account.email}</strong><span>{job?.status === 'failed' ? 'Paused' : `${job?.processed_count ?? 0} messages imported${estimate ? ` · about ${estimate} expected` : ''}`}</span></div><div className={`import-progress-track ${percent === null && job?.status !== 'failed' ? 'indeterminate' : ''}`} role="progressbar" aria-label={`${account.email} import`} aria-valuemin={0} aria-valuemax={estimate ?? undefined} aria-valuenow={estimate ? done : undefined}><span style={{ width: job?.status === 'failed' ? `${percent ?? 0}%` : percent === null ? undefined : `${percent}%` }} /></div>{job?.status === 'failed' && <div className="import-progress-error"><span>{job.error || 'Import stopped. Try again.'}</span><button type="button" onClick={() => void syncAccount(account.id)} disabled={accountBusy === account.id}>Resume import</button></div>}{!!job?.skipped_count && <small>{job.skipped_count} inaccessible messages skipped.</small>}</div>
+          const percent = job?.status === 'complete' ? 100 : estimate && estimate > 0 ? Math.min(95, Math.round(done / estimate * 100)) : null
+          const summary = account.provider === 'gmail' && pipeline
+            ? `${pipeline.searchable_messages} searchable · ${pipeline.embedded_messages} semantic-ready${pipeline.pending_embedding_chunks ? ` · ${pipeline.pending_embedding_chunks} chunks awaiting embeddings` : ''}`
+            : `${job?.processed_count ?? 0} messages imported${estimate ? ` · about ${estimate} expected` : ''}`
+          return <div className="import-progress-account" key={account.id}><div className="import-progress-line"><strong>{account.email}</strong><span>{job?.status === 'failed' ? 'Paused' : summary}</span></div><div className={`import-progress-track ${percent === null && job?.status !== 'failed' ? 'indeterminate' : ''}`} role="progressbar" aria-label={`${account.email} import`} aria-valuemin={0} aria-valuemax={estimate ?? undefined} aria-valuenow={estimate ? done : undefined}><span style={{ width: job?.status === 'failed' ? `${percent ?? 0}%` : percent === null ? undefined : `${percent}%` }} /></div>{job?.status === 'running' && <small>{done} checked in this sync{estimate ? ` · about ${estimate} expected` : ''}.</small>}{job?.status === 'failed' && <div className="import-progress-error"><span>{job.error || 'Import stopped. Try again.'}</span><button type="button" onClick={() => void syncAccount(account.id)} disabled={accountBusy === account.id}>Resume import</button></div>}{!!job?.skipped_count && <small>{job.skipped_count} inaccessible messages skipped.</small>}</div>
         })}</section>}
 
         <div className="workspace-view" key={view}>

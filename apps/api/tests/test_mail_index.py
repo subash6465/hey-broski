@@ -5,6 +5,7 @@ import httpx
 
 from app.mail_index import normalize_gmail_message
 from app.mail_vectors import MailVectorIndex
+from app.mail_sync import MailSync
 from app.repository import Repository
 
 
@@ -58,6 +59,8 @@ def test_latest_sender_and_full_text_search(tmp_path):
     repository.upsert_mail_message(normalize_gmail_message(_message("m1", 1780000000000, "BookMyShow <tickets@bookmyshow.com>", "Tickets", "Updated seat C9."), account["id"], account["email"]))
     assert repository.search_mail_messages("B12") == []
     assert repository.search_mail_messages("C9")[0]["message_id"] == "m1"
+    assert repository.mail_pipeline_counts(account["id"], "test-embed") == {
+        "searchable_messages": 3, "embedded_messages": 0, "pending_embedding_chunks": 3}
 
 
 def test_vector_index_batches_chunks_and_resolves_to_live_messages(tmp_path, monkeypatch):
@@ -104,3 +107,29 @@ def test_full_scan_reconciliation_removes_deleted_mail(tmp_path):
         _message("keep", 1780000000000, "Sender <a@example.com>", "keep", "Text"), account["id"], account["email"]), "second-scan")
     assert repository.reconcile_full_gmail_scan(account["id"], "second-scan", "2026-01-01T00:00:00+00:00", True) == 1
     assert [item["message_id"] for item in repository.search_mail_messages("mail", latest=True)] == ["keep"]
+
+
+def test_gmail_detail_fetch_is_bounded_and_overlaps_requests(tmp_path):
+    repository = Repository(tmp_path / "mail.db")
+    repository.initialize()
+    account = repository.upsert_account("gmail", "owner@example.com", "Owner")
+    sync = MailSync(repository, None)
+    active = 0
+    peak = 0
+
+    async def provider(request):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.4)
+        active -= 1
+        return httpx.Response(200, json={"id": request.url.path.rsplit("/", 1)[-1]})
+
+    async def fetch():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
+            semaphore = asyncio.Semaphore(4)
+            return await asyncio.gather(*(sync._gmail_detail(client, account, f"m{i}", {}, semaphore) for i in range(6)))
+
+    result = asyncio.run(fetch())
+    assert [item["id"] for item in result] == [f"m{i}" for i in range(6)]
+    assert 1 < peak <= 4

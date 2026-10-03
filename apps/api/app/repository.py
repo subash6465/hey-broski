@@ -97,6 +97,7 @@ class Repository:
             chunk_index INTEGER NOT NULL, subject TEXT NOT NULL, sender TEXT NOT NULL,
             content TEXT NOT NULL, UNIQUE(account_id, message_id, chunk_index),
             FOREIGN KEY(account_id, message_id) REFERENCES mail_messages(account_id, message_id) ON DELETE CASCADE);
+        CREATE INDEX IF NOT EXISTS idx_mail_chunks_pipeline ON mail_chunks(account_id, message_id);
         CREATE VIRTUAL TABLE IF NOT EXISTS mail_chunks_fts USING fts5(subject, sender, content, content='mail_chunks', content_rowid='id');
         CREATE TRIGGER IF NOT EXISTS mail_chunks_ai AFTER INSERT ON mail_chunks BEGIN
             INSERT INTO mail_chunks_fts(rowid, subject, sender, content) VALUES (new.id, new.subject, new.sender, new.content);
@@ -125,6 +126,7 @@ class Repository:
             chunk_columns = {row[1] for row in connection.execute("PRAGMA table_info(mail_chunks)")}
             if "vector_model" not in chunk_columns:
                 connection.execute("ALTER TABLE mail_chunks ADD COLUMN vector_model TEXT")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_mail_chunks_account_model ON mail_chunks(account_id, vector_model, message_id)")
             mail_columns = {row[1] for row in connection.execute("PRAGMA table_info(mail_messages)")}
             if "seen_sync_at" not in mail_columns:
                 connection.execute("ALTER TABLE mail_messages ADD COLUMN seen_sync_at TEXT")
@@ -559,6 +561,27 @@ class Repository:
     def pending_mail_vector_count(self, model: str) -> int:
         with self.connect() as connection:
             return connection.execute("SELECT count(*) FROM mail_chunks WHERE vector_model IS NULL OR vector_model<>?", (model,)).fetchone()[0]
+
+    def mail_pipeline_counts(self, account_id: str, model: str) -> dict[str, int]:
+        with self.connect() as connection:
+            searchable = connection.execute("SELECT count(*) FROM mail_messages WHERE account_id=?", (account_id,)).fetchone()[0]
+            pending_chunks, pending_messages = connection.execute("""SELECT count(*), count(DISTINCT message_id)
+                FROM mail_chunks WHERE account_id=? AND (vector_model IS NULL OR vector_model<>?)""",
+                (account_id, model)).fetchone()
+        return {"searchable_messages": searchable, "embedded_messages": searchable - pending_messages,
+                "pending_embedding_chunks": pending_chunks}
+
+    def initial_mail_import_incomplete(self) -> bool:
+        with self.connect() as connection:
+            return connection.execute("""SELECT EXISTS(
+                SELECT 1 FROM connected_accounts a JOIN sync_preferences p ON p.account_id=a.id
+                WHERE a.last_synced_at IS NULL OR
+                    (a.provider='gmail' AND a.mail_index_backfill_at IS NULL AND EXISTS
+                        (SELECT 1 FROM mail_sources s WHERE s.account_id=a.id)))""").fetchone()[0] == 1
+
+    def inaccessible_mail_count(self) -> int:
+        with self.connect() as connection:
+            return connection.execute("SELECT coalesce(sum(skipped_count),0) FROM sync_jobs").fetchone()[0]
 
     def mark_mail_vectors(self, ids: list[int], model: str) -> None:
         if not ids:

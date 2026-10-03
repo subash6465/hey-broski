@@ -167,7 +167,8 @@ async def save_sync_preferences(account_id: str, preferences: SyncPreferencesInp
 async def sync_status(account_id: str) -> dict[str, Any]:
     if not repository.get_account(account_id):
         raise HTTPException(404, "Account not found")
-    return {"preferences": repository.get_sync_preferences(account_id), "job": repository.get_sync_job(account_id)}
+    return {"preferences": repository.get_sync_preferences(account_id), "job": repository.get_sync_job(account_id),
+            "pipeline": repository.mail_pipeline_counts(account_id, settings.embedding_model)}
 
 
 @app.post("/api/accounts/{account_id}/sync")

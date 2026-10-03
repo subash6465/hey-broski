@@ -8,6 +8,7 @@ import hashlib
 import json
 import random
 import re
+from time import monotonic
 from datetime import datetime, timedelta, timezone, time
 from html import unescape
 from urllib.parse import quote
@@ -40,6 +41,21 @@ class MailSync:
         self.repository = repository
         self.connectors = connectors
         self._running: set[str] = set()
+        self._gmail_pace_lock = asyncio.Lock()
+        self._next_gmail_detail_at = 0.0
+
+    async def _gmail_detail(self, client: httpx.AsyncClient, account: dict, message_id: str,
+                            headers: dict[str, str], semaphore: asyncio.Semaphore) -> dict:
+        async with semaphore:
+            # Bound both in-flight work and request starts for large imports.
+            async with self._gmail_pace_lock:
+                now = monotonic()
+                await asyncio.sleep(max(0.0, self._next_gmail_detail_at - now))
+                self._next_gmail_detail_at = max(now, self._next_gmail_detail_at) + 0.25
+            response = await self._gmail_get(client, account,
+                f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{quote(message_id, safe='')}",
+                headers, {"format": "full"})
+            return response.json()
 
     async def _gmail_get(self, client: httpx.AsyncClient, account: dict, url: str, headers: dict[str, str], params: dict | None = None) -> httpx.Response:
         refreshed = False
@@ -151,6 +167,7 @@ class MailSync:
         headers = {"Authorization": f"Bearer {token}"}
         position = json.loads(cursor) if cursor and cursor.startswith("{") else {"page_token": cursor, "offset": 0}
         consecutive_inaccessible = 0
+        detail_semaphore = asyncio.Semaphore(4)
         async with httpx.AsyncClient(timeout=30) as client:
             if account.get("gmail_history_id") and not cursor:
                 try:
@@ -181,22 +198,28 @@ class MailSync:
                 page = response.json()
                 if position["page_token"] is None and position["offset"] == 0:
                     self.repository.update_sync_job(account["id"], "running", cursor, total_estimate=page.get("resultSizeEstimate"))
-                for index, item in enumerate(page.get("messages", [])[position["offset"]:], start=position["offset"]):
-                    message_cursor = json.dumps({"page_token": position["page_token"], "offset": index + 1})
-                    try:
-                        detail = await self._gmail_get(client, account, f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{quote(item['id'], safe='')}", headers, {"format": "full"})
-                    except GmailRequestError as exc:
-                        if exc.status not in {403, 404} or exc.status == 403 and exc.reason not in {"", "forbidden", "notFound"}:
-                            raise
-                        consecutive_inaccessible += 1
-                        if consecutive_inaccessible > 5:
-                            raise RuntimeError("Google denied several messages in a row. Check Gmail access and retry the import") from exc
-                        self.repository.update_sync_job(account["id"], "running", message_cursor, skipped=1)
-                        continue
-                    consecutive_inaccessible = 0
-                    self._save_gmail_message(account, detail.json(), scan_marker)
-                    self.repository.update_sync_job(account["id"], "running", message_cursor, 1)
-                    await asyncio.sleep(0.25)
+                items = page.get("messages", [])
+                for batch_start in range(position["offset"], len(items), 8):
+                    batch = items[batch_start:batch_start + 8]
+                    results = await asyncio.gather(*(self._gmail_detail(client, account, item["id"], headers,
+                        detail_semaphore) for item in batch), return_exceptions=True)
+                    # Commit in listing order so the durable offset never skips
+                    # an unfinished message after a crash or failed request.
+                    for index, result in enumerate(results, start=batch_start):
+                        message_cursor = json.dumps({"page_token": position["page_token"], "offset": index + 1})
+                        if isinstance(result, GmailRequestError):
+                            if result.status not in {403, 404} or result.status == 403 and result.reason not in {"", "forbidden", "notFound"}:
+                                raise result
+                            consecutive_inaccessible += 1
+                            if consecutive_inaccessible > 5:
+                                raise RuntimeError("Google denied several messages in a row. Check Gmail access and retry the import") from result
+                            self.repository.update_sync_job(account["id"], "running", message_cursor, skipped=1)
+                            continue
+                        if isinstance(result, BaseException):
+                            raise result
+                        consecutive_inaccessible = 0
+                        self._save_gmail_message(account, result, scan_marker)
+                        self.repository.update_sync_job(account["id"], "running", message_cursor, 1)
                 position = {"page_token": page.get("nextPageToken"), "offset": 0}
                 self.repository.update_sync_job(account["id"], "running", position["page_token"])
                 if not position["page_token"]:
