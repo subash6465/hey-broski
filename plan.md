@@ -1,7 +1,9 @@
 # Hey Broski - Build Plan
 
-Last updated: 2026-09-27
+Last updated: 2026-10-03
 Owner intent: Build a finished, production-style, zero-paid-API personal admin AI product with a polished chat interface, local LLMs, MCP tools, n8n automations, multi-account email/calendar/document connectivity, action cards, and human approval before real-world actions.
+
+Current Gmail retrieval decision (2026-10-03): The owner requested message-level JSON metadata, full message content, chunks, embeddings, and metadata-first retrieval. This supersedes older passages below that require transient Gmail bodies and prohibit a local full-body index. The current implementation retains normalized Gmail text and metadata in local SQLite, indexes text with FTS5, and stores embeddings in local LanceDB. The credential vault does not encrypt either search store. Attachment names are indexed; attachment contents remain out of scope. Queries for exact metadata use SQLite before content retrieval. Keep the retention behavior and its local storage implications visible during onboarding.
 
 Product name: **Hey Broski**. The repo, UI, docs, package names, Docker services, and user-facing copy must use this name. Do not use the previous working name except in migration notes if absolutely required.
 

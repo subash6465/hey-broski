@@ -3,13 +3,15 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import AsyncIterator
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, time, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 import structlog
 
 from .config import Settings
 from .demo_data import DEMO_SOURCES
+from .mail_vectors import MailVectorIndex
 from .repository import Repository
 from .schemas import ActionCard, Source
 
@@ -42,15 +44,60 @@ class AssistantService:
     def __init__(self, repository: Repository, settings: Settings) -> None:
         self.repository = repository
         self.settings = settings
+        self.mail_vectors = MailVectorIndex(repository, settings.data_dir / "lancedb", settings.ollama_base_url, settings.embedding_model)
 
     def context_for(self, message: str, previous_question: str = "") -> tuple[list[Source], list[ActionCard]]:
         query = message.lower()
         connected = bool(self.repository.list_accounts())
         if connected:
+            latest = bool(re.search(r"\b(latest|most recent|newest|last mail|last email)\b", query)) and not re.search(r"\b(about|mentioning|containing|saying)\b", query)
+            direction = "received" if re.search(r"\b(received|inbox|came in)\b", query) else "sent" if re.search(r"\b(sent|i sent)\b", query) else None
+            sender_match = re.search(r"\bfrom\s+([\w@.\- ]+?)(?:\s+(?:in|about|with|last|this|that|on|between|after|before)\b|[?.!,]|$)", query)
+            sender = sender_match.group(1).strip() if sender_match else None
+            remainder = query.replace(sender_match.group(0), " ") if sender_match else query
+            generic = {"can", "you", "get", "me", "the", "details", "of", "mails", "mail", "emails", "email",
+                       "received", "sent", "from", "which", "what", "show", "find", "all", "please", "i", "my",
+                       "today", "yesterday", "latest", "last", "with", "attachments", "attachment", "attached"}
+            metadata_only = bool(sender) and not (set(re.findall(r"[a-z]{2,}", remainder)) - generic)
+            attachments_only = bool(re.search(r"\b(attachment|attachments|attached)\b", query))
+            after_at, before_at = self._mail_date_window(query)
+            matches = self.repository.search_mail_messages(f"{previous_question} {message}", direction=direction,
+                sender=sender, latest=latest or metadata_only, attachments_only=attachments_only, after_at=after_at,
+                before_at=before_at, limit=1 if latest else 8)
+            if not latest and not metadata_only and self.repository.indexed_mail_count():
+                try:
+                    vector_ids = self.mail_vectors.search(f"{previous_question} {message}")
+                    vector_matches = self.repository.mail_messages_for_chunks(vector_ids, direction=direction,
+                        sender=sender, attachments_only=attachments_only, after_at=after_at, before_at=before_at)
+                    ranked: dict[tuple[str, str], tuple[float, dict]] = {}
+                    for weight, candidates in ((1.0, matches), (0.8, vector_matches)):
+                        for rank, item in enumerate(candidates, 1):
+                            key = (item["account_id"], item["message_id"])
+                            score, previous = ranked.get(key, (0.0, item))
+                            ranked[key] = (score + weight / (60 + rank), previous)
+                    matches = [item for _, item in sorted(ranked.values(), key=lambda pair: pair[0], reverse=True)[:8]]
+                except (ImportError, OSError, ValueError, RuntimeError, httpx.HTTPError):
+                    pass  # SQLite FTS is always the local fallback.
             selected = [Source(source_type="email", source_id=f"{item['account_id']}:{item['message_id']}",
-                account_label=f"{item['provider'].title()} / {item['email'] if 'email' in item else item['display_name']}",
-                title=item["title"], snippet=item["snippet"], timestamp=item["sent_at"])
-                for item in self.repository.search_mail_sources(f"{previous_question} {message}")]
+                account_label=f"{item['provider'].title()} / {item['account_email']}", title=item["subject"],
+                snippet=(f"From: {item['sender_name']} <{item['sender_address']}>. "
+                         f"To: {', '.join(json.loads(item['to_json']))}. "
+                         f"Direction: {item['direction']}. Thread messages indexed: {item['thread_count']}. "
+                         f"Attachments: {', '.join(a['name'] for a in json.loads(item['attachments_json'])) or 'none'}. "
+                         f"Content: {item['match_content'] or item['body_text'][:1200]}"),
+                timestamp=item["received_at"], metadata={
+                    "message_id": item["message_id"], "thread_id": item["thread_id"],
+                    "rfc_message_id": item["rfc_message_id"], "sender": item["sender_address"],
+                    "recipients": json.loads(item["to_json"]), "direction": item["direction"],
+                    "thread_count_indexed": item["thread_count"],
+                    "last_synced_at": item["last_synced_at"],
+                    "attachments": json.loads(item["attachments_json"]),
+                }) for item in matches]
+            if not selected and not self.repository.indexed_mail_count():
+                selected = [Source(source_type="email", source_id=f"{item['account_id']}:{item['message_id']}",
+                    account_label=f"{item['provider'].title()} / {item['email'] if 'email' in item else item['display_name']}",
+                    title=item["title"], snippet=item["snippet"], timestamp=item["sent_at"])
+                    for item in self.repository.search_mail_sources(f"{previous_question} {message}")]
         elif not self.settings.demo_mode:
             selected = []
         elif any(word in query for word in ("wait", "reply", "follow")):
@@ -70,7 +117,8 @@ class AssistantService:
             any(chunk["filename"].lower() in document_query.lower() for chunk in document_matches)
             or any(word in document_query.lower() for word in ("document", "file", "vault", "uploaded"))
         )
-        selected = document_sources if document_focus else selected + document_sources
+        mail_focus = connected and bool(re.search(r"\b(mail|mails|email|emails|inbox|received|sender|sent)\b", query))
+        selected = selected if mail_focus else document_sources if document_focus else selected + document_sources
         if any(phrase in query for phrase in ("upcoming", "this week", "next week")):
             today = datetime.now(timezone.utc).date()
             week_start = date.fromordinal(today.toordinal() - today.weekday())
@@ -78,6 +126,26 @@ class AssistantService:
             selected = [source for source in selected if source.source_id not in demo_ids or self._is_current_demo_source(source, today, week_start)]
         actionable = set() if connected else {"email-card-bill", "email-manager-report", "doc-headphones-warranty", "event-design-review", "email-canva-renewal"}
         return selected, [self._card_for(source) for source in selected if source.source_id in actionable]
+
+    def _mail_date_window(self, query: str) -> tuple[str | None, str | None]:
+        zone_name = (self.repository.get_profile() or {}).get("time_zone", "UTC")
+        try:
+            zone = ZoneInfo(zone_name)
+        except ZoneInfoNotFoundError:
+            zone = timezone.utc
+        today = datetime.now(zone).date()
+        start: date | None = None
+        end: date | None = None
+        if re.search(r"\byesterday\b", query):
+            start, end = today - timedelta(days=1), today
+        elif re.search(r"\btoday\b", query):
+            start, end = today, today + timedelta(days=1)
+        elif match := re.search(r"\blast\s+(\d{1,3})\s+days?\b", query):
+            start, end = today - timedelta(days=int(match.group(1))), today + timedelta(days=1)
+        if start is None:
+            return None, None
+        return (datetime.combine(start, time.min, zone).astimezone(timezone.utc).isoformat(),
+                datetime.combine(end, time.min, zone).astimezone(timezone.utc).isoformat())
 
     def _card_for(self, source: Source) -> ActionCard:
         definitions = {
@@ -111,7 +179,7 @@ class AssistantService:
         today = datetime.now(timezone.utc).date()
         lines = []
         for index, source in enumerate(sources, 1):
-            text = f"[Source {index}] {source.account_label} — {source.title}: {source.snippet}"
+            text = f"[Source {index}] {source.account_label} — {source.title} ({source.timestamp}): {source.snippet}"
             mentioned = cls._source_date(source)
             if mentioned:
                 status = "PAST" if mentioned < today else "TODAY" if mentioned == today else "FUTURE"
@@ -119,7 +187,34 @@ class AssistantService:
             lines.append(text)
         return "\n".join(lines)
 
+    def _metadata_answer(self, message: str, sources: list[Source]) -> str | None:
+        if not re.search(r"\b(latest|most recent|newest|last mail|last email)\b", message.lower()):
+            return None
+        if re.search(r"\b(about|mentioning|containing|saying)\b", message.lower()):
+            return None
+        if not self.repository.list_accounts():
+            return None
+        if not sources or sources[0].source_type != "email":
+            return "I found no matching message in the indexed mailbox. Check the last sync time in Accounts."
+        source = sources[0]
+        if not source.metadata.get("message_id"):
+            return None
+        zone_name = (self.repository.get_profile() or {}).get("time_zone", "UTC")
+        try:
+            zone = ZoneInfo(zone_name)
+        except ZoneInfoNotFoundError:
+            zone = timezone.utc
+        stamp = datetime.fromisoformat(source.timestamp).astimezone(zone).strftime("%d %B %Y at %I:%M %p %Z")
+        direction = source.metadata.get("direction", "received")
+        sender = source.metadata.get("sender", "unknown sender")
+        freshness = source.metadata.get("last_synced_at")
+        suffix = f" Mailbox last synced {freshness}." if freshness else " The initial mailbox import is still in progress."
+        return f"The latest {direction} email I found is ‘{source.title}’ from {sender}, dated {stamp}. [Source 1]{suffix}"
+
     async def answer(self, message: str, sources: list[Source], history: list[dict] | None = None) -> tuple[str, str]:
+        direct = self._metadata_answer(message, sources)
+        if direct is not None:
+            return direct, "metadata"
         if not self.settings.use_ollama:
             raise ModelResponseError("Local model inference is disabled. Set HEYBROSKI_USE_OLLAMA=true and restart the API.")
         if self.settings.chat_model == "qwen3:4b":
@@ -151,7 +246,7 @@ class AssistantService:
                         "keep_alive": "5m",
                         "options": {
                             "temperature": self.settings.llm_temperature,
-                            "num_ctx": 4096,
+                            "num_ctx": self.settings.ollama_num_ctx,
                             "num_predict": self.settings.ollama_num_predict,
                         },
                     },
@@ -183,6 +278,11 @@ class AssistantService:
 
     async def stream_answer(self, message: str, sources: list[Source], history: list[dict] | None = None) -> AsyncIterator[dict[str, str]]:
         """Report retrieval progress, then emit only the model's completed answer."""
+        direct = self._metadata_answer(message, sources)
+        if direct is not None:
+            yield {"type": "content", "text": direct}
+            yield {"type": "complete", "content": direct, "generated_by": "metadata"}
+            return
         if not self.settings.use_ollama:
             raise ModelResponseError("Local model inference is disabled.")
         if self.settings.chat_model == "qwen3:4b":
@@ -212,7 +312,7 @@ class AssistantService:
                     "stream": True,
                     "think": False,
                     "keep_alive": "5m",
-                    "options": {"temperature": self.settings.llm_temperature, "num_ctx": 4096, "num_predict": self.settings.ollama_num_predict},
+                    "options": {"temperature": self.settings.llm_temperature, "num_ctx": self.settings.ollama_num_ctx, "num_predict": self.settings.ollama_num_predict},
                 }) as response:
                     response.raise_for_status()
                     async for line in response.aiter_lines():

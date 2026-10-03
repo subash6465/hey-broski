@@ -80,6 +80,30 @@ class Repository:
         CREATE TABLE IF NOT EXISTS oauth_attempts (state TEXT PRIMARY KEY, provider TEXT NOT NULL, code_verifier TEXT NOT NULL, expires_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS sync_preferences (account_id TEXT PRIMARY KEY REFERENCES connected_accounts(id) ON DELETE CASCADE, history_months INTEGER NOT NULL, interval_hours INTEGER NOT NULL, include_sent INTEGER NOT NULL, updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS mail_sources (provider TEXT NOT NULL, account_id TEXT NOT NULL REFERENCES connected_accounts(id) ON DELETE CASCADE, message_id TEXT NOT NULL, title TEXT NOT NULL, snippet TEXT NOT NULL, sent_at TEXT NOT NULL, sender TEXT NOT NULL, folder TEXT NOT NULL, PRIMARY KEY(account_id, message_id));
+        CREATE TABLE IF NOT EXISTS mail_messages (
+            account_id TEXT NOT NULL REFERENCES connected_accounts(id) ON DELETE CASCADE,
+            message_id TEXT NOT NULL, provider TEXT NOT NULL, thread_id TEXT NOT NULL,
+            rfc_message_id TEXT, subject TEXT NOT NULL, sender_name TEXT NOT NULL,
+            sender_address TEXT NOT NULL, to_json TEXT NOT NULL, cc_json TEXT NOT NULL,
+            bcc_json TEXT NOT NULL, direction TEXT NOT NULL, received_at TEXT NOT NULL,
+            header_date TEXT, labels_json TEXT NOT NULL, body_text TEXT NOT NULL,
+            attachments_json TEXT NOT NULL, has_attachments INTEGER NOT NULL, seen_sync_at TEXT,
+            PRIMARY KEY(account_id, message_id));
+        CREATE INDEX IF NOT EXISTS idx_mail_messages_latest ON mail_messages(account_id, direction, received_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_mail_messages_thread ON mail_messages(account_id, thread_id);
+        CREATE INDEX IF NOT EXISTS idx_mail_messages_sender ON mail_messages(account_id, sender_address, received_at DESC);
+        CREATE TABLE IF NOT EXISTS mail_chunks (
+            id INTEGER PRIMARY KEY, account_id TEXT NOT NULL, message_id TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL, subject TEXT NOT NULL, sender TEXT NOT NULL,
+            content TEXT NOT NULL, UNIQUE(account_id, message_id, chunk_index),
+            FOREIGN KEY(account_id, message_id) REFERENCES mail_messages(account_id, message_id) ON DELETE CASCADE);
+        CREATE VIRTUAL TABLE IF NOT EXISTS mail_chunks_fts USING fts5(subject, sender, content, content='mail_chunks', content_rowid='id');
+        CREATE TRIGGER IF NOT EXISTS mail_chunks_ai AFTER INSERT ON mail_chunks BEGIN
+            INSERT INTO mail_chunks_fts(rowid, subject, sender, content) VALUES (new.id, new.subject, new.sender, new.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS mail_chunks_ad AFTER DELETE ON mail_chunks BEGIN
+            INSERT INTO mail_chunks_fts(mail_chunks_fts, rowid, subject, sender, content) VALUES ('delete', old.id, old.subject, old.sender, old.content);
+        END;
         CREATE TABLE IF NOT EXISTS sync_jobs (account_id TEXT PRIMARY KEY REFERENCES connected_accounts(id) ON DELETE CASCADE, status TEXT NOT NULL, processed_count INTEGER NOT NULL DEFAULT 0, page_token TEXT, started_at TEXT NOT NULL, updated_at TEXT NOT NULL, error TEXT, total_estimate INTEGER, skipped_count INTEGER NOT NULL DEFAULT 0, cutoff_at TEXT);
         CREATE INDEX IF NOT EXISTS idx_mail_sources_account_date ON mail_sources(account_id, sent_at);
         """
@@ -90,9 +114,20 @@ class Repository:
                 if name not in profile_columns:
                     connection.execute(f"ALTER TABLE owner_profile ADD COLUMN {name} TEXT")
             job_columns = {row[1] for row in connection.execute("PRAGMA table_info(sync_jobs)")}
-            for name, declaration in (("total_estimate", "INTEGER"), ("skipped_count", "INTEGER NOT NULL DEFAULT 0"), ("cutoff_at", "TEXT")):
+            for name, declaration in (("total_estimate", "INTEGER"), ("skipped_count", "INTEGER NOT NULL DEFAULT 0"), ("cutoff_at", "TEXT"), ("initial_history_id", "TEXT")):
                 if name not in job_columns:
                     connection.execute(f"ALTER TABLE sync_jobs ADD COLUMN {name} {declaration}")
+            account_columns = {row[1] for row in connection.execute("PRAGMA table_info(connected_accounts)")}
+            if "gmail_history_id" not in account_columns:
+                connection.execute("ALTER TABLE connected_accounts ADD COLUMN gmail_history_id TEXT")
+            if "mail_index_backfill_at" not in account_columns:
+                connection.execute("ALTER TABLE connected_accounts ADD COLUMN mail_index_backfill_at TEXT")
+            chunk_columns = {row[1] for row in connection.execute("PRAGMA table_info(mail_chunks)")}
+            if "vector_model" not in chunk_columns:
+                connection.execute("ALTER TABLE mail_chunks ADD COLUMN vector_model TEXT")
+            mail_columns = {row[1] for row in connection.execute("PRAGMA table_info(mail_messages)")}
+            if "seen_sync_at" not in mail_columns:
+                connection.execute("ALTER TABLE mail_messages ADD COLUMN seen_sync_at TEXT")
             columns = {row[1] for row in connection.execute("PRAGMA table_info(messages)")}
             for name, declaration in (
                 ("turn_id", "TEXT"),
@@ -431,6 +466,160 @@ class Repository:
                 sent_at=excluded.sent_at, sender=excluded.sender, folder=excluded.folder""",
                 (provider, account_id, message_id, title, snippet, sent_at, sender, folder))
 
+    def upsert_mail_message(self, item: dict[str, Any], seen_sync_at: str | None = None) -> None:
+        """Persist one normalized message and replace its search chunks atomically."""
+        columns = ("account_id", "message_id", "provider", "thread_id", "rfc_message_id", "subject",
+                   "sender_name", "sender_address", "to_json", "cc_json", "bcc_json", "direction",
+                   "received_at", "header_date", "labels_json", "body_text", "attachments_json", "has_attachments")
+        values = tuple(json.dumps(item[key]) if key.endswith("_json") else item[key] for key in columns)
+        with self._lock, self.connect() as connection:
+            connection.execute(f"INSERT INTO mail_messages ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)}) "
+                               f"ON CONFLICT(account_id, message_id) DO UPDATE SET " +
+                               ",".join(f"{key}=excluded.{key}" for key in columns[2:]), values)
+            if seen_sync_at:
+                connection.execute("UPDATE mail_messages SET seen_sync_at=? WHERE account_id=? AND message_id=?",
+                                   (seen_sync_at, item["account_id"], item["message_id"]))
+            connection.execute("DELETE FROM mail_chunks WHERE account_id=? AND message_id=?", (item["account_id"], item["message_id"]))
+            for index, chunk in enumerate(document_chunks(item["body_text"], size=1400, overlap=160) or [item["subject"]]):
+                connection.execute("INSERT INTO mail_chunks(account_id,message_id,chunk_index,subject,sender,content) VALUES (?,?,?,?,?,?)",
+                                   (item["account_id"], item["message_id"], index, item["subject"],
+                                    f"{item['sender_name']} {item['sender_address']}", chunk))
+
+    def search_mail_messages(self, query: str, *, direction: str | None = None, sender: str | None = None,
+                             latest: bool = False, attachments_only: bool = False, after_at: str | None = None,
+                             before_at: str | None = None, limit: int = 8) -> list[dict[str, Any]]:
+        where = ["1=1"]
+        params: list[Any] = []
+        if direction:
+            where.append("m.direction=?")
+            params.append(direction)
+        if sender:
+            compact = re.sub(r"[^a-z0-9]", "", sender.lower())
+            where.append("(lower(m.sender_name || m.sender_address) LIKE ? OR lower(replace(m.sender_name || m.sender_address,' ','')) LIKE ?)")
+            params.extend([f"%{sender.lower()}%", f"%{compact}%"])
+        if attachments_only:
+            where.append("m.has_attachments=1")
+        if after_at:
+            where.append("m.received_at>=?")
+            params.append(after_at)
+        if before_at:
+            where.append("m.received_at<?")
+            params.append(before_at)
+        base = " FROM mail_messages m JOIN connected_accounts a ON a.id=m.account_id "
+        if latest:
+            sql = "SELECT m.*, a.email AS account_email, a.last_synced_at, c.content AS match_content, " \
+                  "(SELECT count(*) FROM mail_messages t WHERE t.account_id=m.account_id AND t.thread_id=m.thread_id) AS thread_count" + base + \
+                  "LEFT JOIN mail_chunks c ON c.account_id=m.account_id AND c.message_id=m.message_id AND c.chunk_index=0 WHERE " + " AND ".join(where) + \
+                  " ORDER BY m.received_at DESC LIMIT ?"
+            with self.connect() as connection:
+                return [dict(row) for row in connection.execute(sql, (*params, limit))]
+        terms = [word for word in re.findall(r"[\w@.]+", query.lower()) if len(word) > 1 and word not in
+                 {"what", "which", "where", "when", "please", "could", "would", "tell", "show", "about", "mail", "mails", "email", "emails", "received", "sent", "from", "details", "the", "with", "this", "latest", "find", "get", "me"}]
+        if not terms:
+            return self.search_mail_messages(query, direction=direction, sender=sender, latest=True,
+                                             attachments_only=attachments_only, after_at=after_at,
+                                             before_at=before_at, limit=limit)
+        match = " OR ".join('"' + term.replace('"', '""') + '"' for term in terms[:12])
+        sql = "SELECT m.*, a.email AS account_email, a.last_synced_at, c.id AS chunk_id, c.content AS match_content, " \
+              "(SELECT count(*) FROM mail_messages t WHERE t.account_id=m.account_id AND t.thread_id=m.thread_id) AS thread_count, " \
+              "bm25(mail_chunks_fts, 4.0, 3.0, 1.0) AS score" + base + \
+              "JOIN mail_chunks c ON c.account_id=m.account_id AND c.message_id=m.message_id " \
+              "JOIN mail_chunks_fts ON mail_chunks_fts.rowid=c.id WHERE mail_chunks_fts MATCH ? AND " + " AND ".join(where) + \
+              " ORDER BY score, m.received_at DESC LIMIT ?"
+        with self.connect() as connection:
+            rows = [dict(row) for row in connection.execute(sql, (match, *params, limit * 3))]
+        unique: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in rows:
+            unique.setdefault((row["account_id"], row["message_id"]), row)
+        return list(unique.values())[:limit]
+
+    def indexed_mail_count(self) -> int:
+        with self.connect() as connection:
+            return connection.execute("SELECT count(*) FROM mail_messages").fetchone()[0]
+
+    def needs_gmail_backfill(self, account_id: str) -> bool:
+        with self.connect() as connection:
+            account = connection.execute("SELECT mail_index_backfill_at FROM connected_accounts WHERE id=?", (account_id,)).fetchone()
+            if not account or account["mail_index_backfill_at"]:
+                return False
+            old_count = connection.execute("SELECT count(*) FROM mail_sources WHERE account_id=? AND provider='gmail'", (account_id,)).fetchone()[0]
+            new_count = connection.execute("SELECT count(*) FROM mail_messages WHERE account_id=?", (account_id,)).fetchone()[0]
+        return old_count > 0 and new_count == 0
+
+    def mark_mail_index_backfilled(self, account_id: str) -> None:
+        with self._lock, self.connect() as connection:
+            connection.execute("UPDATE connected_accounts SET mail_index_backfill_at=? WHERE id=?", (now_iso(), account_id))
+
+    def pending_mail_vectors(self, model: str, limit: int = 16) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute("SELECT id, account_id, message_id, subject, sender, content FROM mail_chunks "
+                                      "WHERE vector_model IS NULL OR vector_model<>? ORDER BY id LIMIT ?", (model, limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    def pending_mail_vector_count(self, model: str) -> int:
+        with self.connect() as connection:
+            return connection.execute("SELECT count(*) FROM mail_chunks WHERE vector_model IS NULL OR vector_model<>?", (model,)).fetchone()[0]
+
+    def mark_mail_vectors(self, ids: list[int], model: str) -> None:
+        if not ids:
+            return
+        with self._lock, self.connect() as connection:
+            connection.execute(f"UPDATE mail_chunks SET vector_model=? WHERE id IN ({','.join('?' for _ in ids)})",
+                               (model, *ids))
+
+    def mail_messages_for_chunks(self, ids: list[int], *, direction: str | None = None,
+                                 sender: str | None = None, attachments_only: bool = False,
+                                 after_at: str | None = None, before_at: str | None = None) -> list[dict[str, Any]]:
+        if not ids:
+            return []
+        where = [f"c.id IN ({','.join('?' for _ in ids)})"]
+        params: list[Any] = list(ids)
+        if direction:
+            where.append("m.direction=?")
+            params.append(direction)
+        if sender:
+            compact = re.sub(r"[^a-z0-9]", "", sender.lower())
+            where.append("(lower(m.sender_name || m.sender_address) LIKE ? OR lower(replace(m.sender_name || m.sender_address,' ','')) LIKE ?)")
+            params.extend([f"%{sender.lower()}%", f"%{compact}%"])
+        if attachments_only:
+            where.append("m.has_attachments=1")
+        if after_at:
+            where.append("m.received_at>=?")
+            params.append(after_at)
+        if before_at:
+            where.append("m.received_at<?")
+            params.append(before_at)
+        sql = "SELECT m.*, a.email AS account_email, a.last_synced_at, c.id AS chunk_id, c.content AS match_content, " \
+              "(SELECT count(*) FROM mail_messages t WHERE t.account_id=m.account_id AND t.thread_id=m.thread_id) AS thread_count " \
+              "FROM mail_chunks c JOIN mail_messages m ON m.account_id=c.account_id AND m.message_id=c.message_id " \
+              "JOIN connected_accounts a ON a.id=m.account_id WHERE " + " AND ".join(where)
+        with self.connect() as connection:
+            rows = [dict(row) for row in connection.execute(sql, params)]
+        by_id = {row_id: position for position, row_id in enumerate(ids)}
+        rows.sort(key=lambda row: by_id.get(row["chunk_id"], len(ids)))
+        return rows
+
+    def set_gmail_history_id(self, account_id: str, history_id: str) -> None:
+        with self._lock, self.connect() as connection:
+            connection.execute("UPDATE connected_accounts SET gmail_history_id=? WHERE id=?", (history_id, account_id))
+
+    def delete_mail_message(self, account_id: str, message_id: str) -> None:
+        with self._lock, self.connect() as connection:
+            connection.execute("DELETE FROM mail_messages WHERE account_id=? AND message_id=?", (account_id, message_id))
+            connection.execute("DELETE FROM mail_sources WHERE account_id=? AND message_id=?", (account_id, message_id))
+
+    def reconcile_full_gmail_scan(self, account_id: str, marker: str, cutoff_at: str, include_sent: bool) -> int:
+        clause = "account_id=? AND received_at>=? AND (seen_sync_at IS NULL OR seen_sync_at<>?)"
+        params: list[Any] = [account_id, cutoff_at, marker]
+        if not include_sent:
+            clause += " AND direction='received'"
+        with self._lock, self.connect() as connection:
+            stale = [row[0] for row in connection.execute(f"SELECT message_id FROM mail_messages WHERE {clause}", params)]
+            for message_id in stale:
+                connection.execute("DELETE FROM mail_messages WHERE account_id=? AND message_id=?", (account_id, message_id))
+                connection.execute("DELETE FROM mail_sources WHERE account_id=? AND message_id=?", (account_id, message_id))
+        return len(stale)
+
     def search_mail_sources(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
         words = [word for word in re.findall(r"[a-z0-9]{3,}", query.lower()) if word not in {"what", "when", "show", "about", "needs", "attention", "with", "this", "week", "today", "email", "inbox", "please", "find", "from", "waiting", "follow", "reply", "recent", "important"}]
         with self.connect() as connection:
@@ -447,8 +636,18 @@ class Repository:
                 cutoff_at=CASE WHEN sync_jobs.status='complete' THEN excluded.cutoff_at ELSE COALESCE(sync_jobs.cutoff_at, excluded.cutoff_at) END,
                 processed_count=CASE WHEN sync_jobs.status='complete' THEN 0 ELSE sync_jobs.processed_count END,
                 skipped_count=CASE WHEN sync_jobs.status='complete' THEN 0 ELSE sync_jobs.skipped_count END,
+                initial_history_id=CASE WHEN sync_jobs.status='complete' THEN NULL ELSE sync_jobs.initial_history_id END,
                 total_estimate=CASE WHEN sync_jobs.status='complete' THEN NULL ELSE sync_jobs.total_estimate END""",
                 (account_id, now_iso(), now_iso(), cutoff_at))
+
+    def set_sync_initial_history_id(self, account_id: str, history_id: str) -> None:
+        with self._lock, self.connect() as connection:
+            connection.execute("UPDATE sync_jobs SET initial_history_id=? WHERE account_id=?", (history_id, account_id))
+
+    def set_sync_cutoff(self, account_id: str, cutoff_at: str) -> None:
+        with self._lock, self.connect() as connection:
+            connection.execute("UPDATE sync_jobs SET cutoff_at=?, initial_history_id=NULL WHERE account_id=?",
+                               (cutoff_at, account_id))
 
     def reset_sync_job(self, account_id: str) -> None:
         with self._lock, self.connect() as connection:
@@ -458,8 +657,11 @@ class Repository:
                 connection.execute("DELETE FROM actions WHERE id=?", (action_id,))
             self._remove_action_cards(connection, related)
             connection.execute("DELETE FROM mail_sources WHERE account_id=?", (account_id,))
+            connection.execute("DELETE FROM mail_messages WHERE account_id=?", (account_id,))
             connection.execute("DELETE FROM sync_jobs WHERE account_id=?", (account_id,))
             connection.execute("UPDATE connected_accounts SET last_synced_at=NULL, sync_error=NULL WHERE id=?", (account_id,))
+            connection.execute("UPDATE connected_accounts SET gmail_history_id=NULL WHERE id=?", (account_id,))
+            connection.execute("UPDATE connected_accounts SET mail_index_backfill_at=NULL WHERE id=?", (account_id,))
 
     def update_sync_job(self, account_id: str, status: str, page_token: str | None = None, increment: int = 0, error: str | None = None, skipped: int = 0, total_estimate: int | None = None) -> None:
         with self._lock, self.connect() as connection:

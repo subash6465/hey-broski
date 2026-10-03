@@ -15,6 +15,7 @@ class Source(BaseModel):
     title: str
     snippet: str
     timestamp: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ActionCard(BaseModel):
