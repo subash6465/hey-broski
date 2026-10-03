@@ -35,6 +35,80 @@ def final_answer(raw: str) -> str:
     return content
 
 
+def sender_filter(query: str) -> tuple[str | None, str]:
+    """Extract a bounded sender phrase in linear time, including full email addresses."""
+    tokens = list(re.finditer(r"\S+", query))
+    stop = {"in", "about", "with", "last", "this", "that", "on", "between", "after", "before", "and",
+            "say", "says", "mention", "mentions", "contain", "contains", "include", "includes"}
+    for index, token in enumerate(tokens[:-1]):
+        if token.group().strip("?.,!:") != "from":
+            continue
+        first = tokens[index + 1]
+        end = first.end()
+        for next_token in tokens[index + 2:index + 12]:
+            if next_token.group().strip("?.,!:") in stop or next_token.start() - first.start() > 150:
+                break
+            end = next_token.end()
+            if next_token.group().endswith(("?", "!", ",")):
+                break
+        sender = query[first.start():end].strip(" ?.,!:")
+        if sender:
+            return sender, query[:token.start()] + " " + query[end:]
+    return None, query
+
+
+def attachment_filename_filter(query: str) -> str | None:
+    """Recognize an explicitly named attachment without searching its name as body text."""
+    tokens = list(re.finditer(r"\S+", query))
+    extensions = {"pdf", "png", "jpg", "jpeg", "gif", "webp", "doc", "docx", "xls", "xlsx",
+                  "ppt", "pptx", "csv", "txt", "zip", "rar", "ics", "eml", "html", "xml", "json", "mp4", "mp3"}
+    for index, token in enumerate(tokens[:-1]):
+        if token.group().strip("?.,!:") not in {"attachment", "file", "filename"}:
+            continue
+        first = index + 1
+        if tokens[first].group().strip("?.,!:") in {"named", "called"}:
+            first += 1
+        if first >= len(tokens):
+            continue
+        for candidate in tokens[first:first + 30]:
+            word = candidate.group().strip("\"'?,!:")
+            extension = word.rsplit(".", 1)[-1]
+            if extension in extensions and candidate.end() - tokens[first].start() <= 200:
+                return query[tokens[first].start():candidate.end()].strip(" \"'?,!:").lower()
+    return None
+
+
+def exact_subject_filter(query: str) -> str | None:
+    """Extract a subject explicitly supplied as 'with subject ...'."""
+    marker = "with subject "
+    start = query.find(marker)
+    if start < 0:
+        return None
+    value = query[start + len(marker):]
+    for terminator in (", what ", ", which ", ", how ", "?", " and "):
+        position = value.find(terminator)
+        if position >= 0:
+            value = value[:position]
+    value = value.strip(" \"'?,!:")
+    return value if 1 <= len(value) <= 200 else None
+
+
+def focused_mail_excerpt(question: str, body: str, fallback: str) -> str:
+    """Show the requested field's passage when it is outside the first chunk."""
+    lower = question.lower()
+    for marker in ("what is the ", "what was the ", "what's the ", "tell me the "):
+        start = lower.rfind(marker)
+        if start < 0:
+            continue
+        field = lower[start + len(marker):].split("?", 1)[0].strip(" .,!:")
+        if not 3 <= len(field) <= 80:
+            continue
+        position = body.lower().find(field)
+        if position >= 0:
+            return body[max(0, position - 350):position + 850]
+    return fallback[:1200]
+
+
 class ModelResponseError(Exception):
     def __init__(self, detail: str, status_code: int = 503) -> None:
         super().__init__(detail)
@@ -55,24 +129,30 @@ class AssistantService:
         if connected:
             latest = bool(re.search(r"\b(latest|most recent|newest|last mail|last email)\b", query))
             direction = "received" if re.search(r"\b(received|inbox|came in)\b", query) else "sent" if re.search(r"\b(sent|i sent)\b", query) else None
-            sender_match = re.search(r"\bfrom\s+([\w@.\- ]+?)(?:\s+(?:in|about|with|last|this|that|on|between|after|before)\b|[?.!,]|$)", query)
-            sender = sender_match.group(1).strip() if sender_match else None
-            remainder = query.replace(sender_match.group(0), " ") if sender_match else query
+            sender, remainder = sender_filter(query)
             recipient_match = re.search(r"\bto\s+([\w.+-]+@[\w.-]+)", remainder)
             recipient = recipient_match.group(1) if recipient_match else None
             if recipient_match:
                 remainder = remainder.replace(recipient_match.group(0), " ")
             generic = {"can", "you", "get", "me", "the", "details", "of", "mails", "mail", "emails", "email",
                        "received", "sent", "from", "which", "what", "show", "find", "all", "please", "i", "my",
-                       "today", "yesterday", "latest", "last", "with", "attachments", "attachment", "attached"}
+                       "today", "yesterday", "latest", "last", "with", "to", "attachments", "attachment", "attached"}
             metadata_only = bool(sender or recipient) and not (set(re.findall(r"[a-z]{2,}", remainder)) - generic)
             attachments_only = bool(re.search(r"\b(attachment|attachments|attached)\b", query))
+            attachment_name = attachment_filename_filter(query)
+            subject_exact = exact_subject_filter(query)
             after_at, before_at = self._mail_date_window(query)
-            search_text = "" if metadata_only else remainder if latest and (sender or recipient) else f"{previous_question} {message}"
+            topical_latest = latest and bool(re.search(r"\b(about|regarding|mentioning|containing)\b", query))
+            search_text = ("" if (metadata_only or latest and not topical_latest or attachment_name and not topical_latest
+                                  or subject_exact) else
+                           remainder if latest and (sender or recipient) else f"{previous_question} {message}")
             matches = self.repository.search_mail_messages(search_text, direction=direction,
-                sender=sender, recipient=recipient, latest=latest or metadata_only, attachments_only=attachments_only, after_at=after_at,
+                sender=sender, recipient=recipient, attachment_name=attachment_name, subject_exact=subject_exact,
+                exact_attachment_name=bool(attachment_name),
+                latest=latest or metadata_only or bool(attachment_name), attachments_only=attachments_only, after_at=after_at,
                 before_at=before_at, limit=1 if latest else 8)
-            if not latest and not metadata_only and self.repository.indexed_mail_count():
+            literal_search = bool(re.search(r"\b(containing|contains|mentions?|subject|exact|named)\b", query))
+            if not latest and not metadata_only and not literal_search and not attachment_name and not subject_exact and self.repository.indexed_mail_count():
                 try:
                     vector_ids = self.mail_vectors.search(f"{previous_question} {message}")
                     vector_matches = self.repository.mail_messages_for_chunks(vector_ids, direction=direction,
@@ -92,7 +172,7 @@ class AssistantService:
                          f"To: {', '.join(json.loads(item['to_json']))}. "
                          f"Direction: {item['direction']}. Thread messages indexed: {item['thread_count']}. "
                          f"Attachments: {', '.join(a['name'] for a in json.loads(item['attachments_json'])) or 'none'}. "
-                         f"Content: {item['match_content'] or item['body_text'][:1200]}"),
+                         f"Content: {focused_mail_excerpt(message, item['body_text'], item['match_content'] or item['body_text'])}"),
                 timestamp=item["received_at"], metadata={
                     "message_id": item["message_id"], "thread_id": item["thread_id"],
                     "rfc_message_id": item["rfc_message_id"], "sender": item["sender_address"],
@@ -210,7 +290,10 @@ class AssistantService:
         return "\n".join(lines)
 
     def _metadata_answer(self, message: str, sources: list[Source]) -> str | None:
-        if not re.search(r"\b(latest|most recent|newest|last mail|last email)\b", message.lower()):
+        query = message.lower()
+        if not re.search(r"\b(latest|most recent|newest|last mail|last email)\b", query):
+            return None
+        if re.search(r"\b(summarize|summary|say|says|said|content|details?|attachments?|why|how|code|number|amount|deadline|read|full)\b|\bwhat(?:'s| is) in\b|\bwhat does\b", query):
             return None
         if not self.repository.list_accounts():
             return None
@@ -264,9 +347,7 @@ class AssistantService:
         query = message.lower()
         if not re.search(r"\b(how many|number of|count|total)\b", query) or not re.search(r"\b(mail|mails|email|emails|messages|inbox|sent|received)\b", query):
             return None
-        sender_match = re.search(r"\bfrom\s+([\w@.\- ]+?)(?:\s+(?:in|about|with|last|this|that|on|between|after|before)\b|[?.!,]|$)", query)
-        sender = sender_match.group(1).strip() if sender_match else None
-        remainder = query.replace(sender_match.group(0), " ") if sender_match else query
+        sender, remainder = sender_filter(query)
         generic = {"how", "many", "number", "of", "count", "total", "mail", "mails", "email", "emails", "messages",
                    "do", "did", "i", "have", "get", "receive", "my", "the", "are", "were", "there", "in", "inbox", "sent", "received", "from",
                    "with", "attachment", "attachments", "attached", "today", "yesterday", "last", "this", "days", "day", "week", "month"}
@@ -278,6 +359,21 @@ class AssistantService:
             attachments_only=bool(re.search(r"\b(attachment|attachments|attached)\b", query)),
             after_at=after_at, before_at=before_at)
         return f"I found {count} matching indexed message{'s' if count != 1 else ''}. This is the current local index, which may change during a sync."
+
+    @staticmethod
+    def _ambiguous_subject_answer(message: str, sources: list[Source]) -> str | None:
+        query = message.lower()
+        subject = exact_subject_filter(query)
+        if not subject or re.search(r"\b(latest|newest|most recent|all|every)\b", query):
+            return None
+        if not re.search(r"\bwhat(?:'s| is| was)\b|\bwhich (?:is|was)\b", query):
+            return None
+        matching = [(index, source) for index, source in enumerate(sources, 1)
+                    if source.source_type == "email" and source.title.lower() == subject]
+        if len(matching) < 2:
+            return None
+        dates = ", ".join(f"{source.timestamp[:16]} [Source {index}]" for index, source in matching[:3])
+        return f"I found multiple indexed emails with that subject ({dates}). Which date should I use?"
 
     async def _agent_answer(self, message: str, sources: list[Source], history: list[dict] | None,
                             prompt: str, coverage_note: str | None) -> tuple[str, str]:
@@ -351,6 +447,9 @@ class AssistantService:
         coverage_answer, coverage_note = self._mail_coverage(message, sources)
         if coverage_answer:
             return coverage_answer, "coverage"
+        ambiguous = self._ambiguous_subject_answer(message, sources)
+        if ambiguous:
+            return ambiguous, "metadata"
         exact_count = self._exact_count_answer(message) if self.repository.list_accounts() else None
         if exact_count:
             return exact_count, "metadata"

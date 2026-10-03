@@ -119,7 +119,8 @@ class AgentTools:
             filters = self._mail_filters(args)
             latest = args.get("latest") is True
             rows = self.repository.search_mail_messages(query, latest=latest, limit=8, **filters)
-            if query.strip() and self.vectors:
+            literal_search = bool(re.search(r"\b(containing|contains|mentions?|subject|exact|named)\b", self.question))
+            if query.strip() and self.vectors and not literal_search:
                 try:
                     ids = self.vectors.search(query, limit=20)
                     semantic = self.repository.mail_messages_for_chunks(ids, **filters)

@@ -12,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import main
-from app.assistant import AssistantService
+from app.assistant import AssistantService, attachment_filename_filter, exact_subject_filter, focused_mail_excerpt, sender_filter
 from app.agent_tools import AgentTools
 from app.config import Settings
 from app.mail_index import normalize_gmail_message
@@ -25,6 +25,18 @@ def setup_mail(tmp_path: Path) -> tuple[AssistantService, str]:
     account = repository.upsert_account("gmail", "owner@example.com", "Owner")
     settings = Settings(tmp_path, tmp_path / "agent.db", "http://ollama.test:11434", "qwen3:4b-instruct", 0.0, 10, False)
     return AssistantService(repository, settings), account["id"]
+
+
+def test_sender_parser_keeps_email_domain_and_handles_repeated_spaces() -> None:
+    sender, remainder = sender_filter("show emails from tickets@bookmyshow.com about seats")
+    assert sender == "tickets@bookmyshow.com"
+    assert "about seats" in remainder
+    sender, _ = sender_filter("how many emails from " + " " * 8000 + "sender@example.com?")
+    assert sender == "sender@example.com"
+    assert attachment_filename_filter("find attachment named My invoice report.pdf") == "my invoice report.pdf"
+    assert exact_subject_filter("in the email with subject order shipped, what is the id?") == "order shipped"
+    assert "TRACK-731" in focused_mail_excerpt("what is the tracking number?",
+                                                "intro " * 300 + "Tracking number: TRACK-731", "intro" * 400)
 
 
 def add_mail(service: AssistantService, account_id: str, message_id: str, subject: str, body: str,
@@ -45,6 +57,35 @@ def test_latest_topical_mail_uses_text_and_date(tmp_path: Path) -> None:
     answer, generated_by = asyncio.run(service.answer("What is my latest email about refund?", sources))
     assert generated_by == "metadata"
     assert "Refund approved" in answer
+
+
+def test_latest_summary_uses_message_content(tmp_path: Path, monkeypatch) -> None:
+    service, account_id = setup_mail(tmp_path)
+    add_mail(service, account_id, "old", "Old message", "Old information", "Alice <alice@example.com>", 1780000000000)
+    add_mail(service, account_id, "new", "New message", "The meeting moved to Friday", "Alice <alice@example.com>", 1780001000000)
+    sources, _ = service.context_for("Summarize my latest email from alice@example.com")
+    assert [source.metadata["message_id"] for source in sources] == ["new"]
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"message": {"content": "The meeting moved to Friday. [Source 1]"}})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(transport=httpx.MockTransport(respond), **kwargs))
+    answer, origin = asyncio.run(service.answer("Summarize my latest email from alice@example.com", sources))
+    assert origin == "ollama"
+    assert "Friday" in answer
+
+
+def test_repeated_sender_and_subject_asks_for_date(tmp_path: Path) -> None:
+    service, account_id = setup_mail(tmp_path)
+    add_mail(service, account_id, "one", "Order shipped", "Order ID A-11111", "Shop <shop@example.com>", 1780000000000)
+    add_mail(service, account_id, "two", "Order shipped", "Order ID B-22222", "Shop <shop@example.com>", 1780001000000)
+    question = "In the email from shop@example.com with subject Order shipped, what is the order ID?"
+    sources, _ = service.context_for(question)
+    assert len(sources) == 2
+    answer, origin = asyncio.run(service.answer(question, sources))
+    assert origin == "metadata"
+    assert "Which date" in answer
 
 
 def test_find_in_long_message_reaches_beyond_preview(tmp_path: Path) -> None:

@@ -505,7 +505,9 @@ class Repository:
 
     def search_mail_messages(self, query: str, *, direction: str | None = None, sender: str | None = None,
                              recipient: str | None = None, attachment_name: str | None = None,
-                             account_email: str | None = None, latest: bool = False, attachments_only: bool = False,
+                             exact_attachment_name: bool = False, subject_exact: str | None = None,
+                             account_email: str | None = None,
+                             latest: bool = False, attachments_only: bool = False,
                              after_at: str | None = None, before_at: str | None = None, limit: int = 8) -> list[dict[str, Any]]:
         where = ["1=1"]
         params: list[Any] = []
@@ -522,8 +524,12 @@ class Repository:
                 OR EXISTS (SELECT 1 FROM json_each(m.bcc_json) WHERE lower(value) LIKE ?))""")
             params.extend([f"%{recipient.lower()}%"] * 3)
         if attachment_name:
-            where.append("EXISTS (SELECT 1 FROM json_each(m.attachments_json) WHERE lower(json_extract(value,'$.name')) LIKE ?)")
-            params.append(f"%{attachment_name.lower()}%")
+            comparator = "=" if exact_attachment_name else "LIKE"
+            where.append(f"EXISTS (SELECT 1 FROM json_each(m.attachments_json) WHERE lower(json_extract(value,'$.name')) {comparator} ?)")
+            params.append(attachment_name.lower() if exact_attachment_name else f"%{attachment_name.lower()}%")
+        if subject_exact:
+            where.append("lower(m.subject)=?")
+            params.append(subject_exact.lower())
         if account_email:
             where.append("a.email=?")
             params.append(account_email.lower())
@@ -555,6 +561,7 @@ class Repository:
         if not terms:
             return self.search_mail_messages(query, direction=direction, sender=sender, latest=True,
                                              recipient=recipient, attachment_name=attachment_name, account_email=account_email,
+                                             exact_attachment_name=exact_attachment_name, subject_exact=subject_exact,
                                              attachments_only=attachments_only, after_at=after_at,
                                              before_at=before_at, limit=limit)
         match = " OR ".join('"' + term.replace('"', '""') + '"' for term in terms[:12])
