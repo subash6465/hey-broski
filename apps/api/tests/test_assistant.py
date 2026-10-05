@@ -7,6 +7,7 @@ from app.config import Settings
 from app.demo_data import DEMO_SOURCES
 from app.repository import Repository
 from app.mail_index import normalize_gmail_message
+from app.schemas import Source
 
 
 def service(tmp_path: Path) -> AssistantService:
@@ -44,6 +45,36 @@ def test_upcoming_demo_filter_excludes_expired_and_stale_items() -> None:
     assert not AssistantService._is_current_demo_source(DEMO_SOURCES[0], today, week_start)
     assert not AssistantService._is_current_demo_source(DEMO_SOURCES[1], today, week_start)
     assert AssistantService._is_current_demo_source(DEMO_SOURCES[2], today, week_start)
+
+
+def test_abbreviated_deadline_is_marked_past_in_model_context() -> None:
+    source = Source(source_type="email", source_id="old-deadline", account_label="Gmail",
+        title="Codespace deletion", snippet="Will be deleted on 19 Sep 2026 after 05:23PM UTC",
+        timestamp="2026-09-12T16:12:47+00:00")
+
+    assert AssistantService._source_date(source) == date(2026, 9, 19)
+    assert "2026-09-19, PAST" in AssistantService._source_context([source])
+
+
+def test_broad_mail_search_excludes_login_codes(tmp_path: Path) -> None:
+    assistant = service(tmp_path)
+    account = assistant.repository.upsert_account("gmail", "owner@example.com", "Owner")
+    for message_id, subject, received_at in (("notice", "Codespace retention notice", "1780000000000"),
+                                             ("login", "Sudo email verification code", "1780002000000")):
+        assistant.repository.upsert_mail_message(normalize_gmail_message({
+            "id": message_id, "threadId": message_id, "internalDate": received_at, "labelIds": ["INBOX"],
+            "snippet": subject, "payload": {"headers": [
+                {"name": "From", "value": "GitHub <noreply@github.com>"},
+                {"name": "Subject", "value": subject}]}
+        }, account["id"], account["email"]))
+
+    broad, _ = assistant.context_for("Show mails from github.com")
+    explicit, _ = assistant.context_for("Show verification codes from github.com")
+    latest, _ = assistant.context_for("What is the latest mail from github.com?")
+
+    assert [source.title for source in broad] == ["Codespace retention notice"]
+    assert any(source.title == "Sudo email verification code" for source in explicit)
+    assert [source.title for source in latest] == ["Sudo email verification code"]
 
 
 def test_latest_received_uses_metadata_without_model(tmp_path: Path) -> None:

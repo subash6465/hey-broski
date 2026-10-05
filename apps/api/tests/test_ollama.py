@@ -47,6 +47,8 @@ def test_old_output_limit_is_raised_to_avoid_truncated_answers(monkeypatch) -> N
 def test_final_answer_removes_model_analysis_preamble() -> None:
     assert final_answer("Analysis: I should inspect the source.\n\nFinal answer: ORCHID-42 [Source 1]") == "ORCHID-42 [Source 1]"
     assert final_answer("<think>private reasoning</think>Final answer: The date is 15 October.") == "The date is 15 October."
+    assert final_answer("I cannot verify that here. [Source N] is missing.") == "I cannot verify that here."
+    assert final_answer("I cannot verify that here. [Source missing]") == "I cannot verify that here."
     with pytest.raises(ModelResponseError, match="reasoning"):
         final_answer("Analysis: I have not answered yet.")
 
