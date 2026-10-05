@@ -8,13 +8,15 @@ type Props = {
 }
 
 export function ActionCardView({ card, busy, onDecision }: Props) {
+  const overdue = card.status === 'pending' && !!card.due_at && new Date(card.due_at).getTime() < Date.now()
   const date = card.due_at
-    ? new Intl.DateTimeFormat('en', { day: 'numeric', month: 'short' }).format(new Date(card.due_at))
+    ? new Intl.DateTimeFormat('en', { day: 'numeric', month: 'short', year: 'numeric' }).format(new Date(card.due_at))
     : null
   return (
     <article className="action-card">
       <div className="action-topline">
         <span className={`priority priority-${card.priority}`}>{card.priority}</span>
+        {overdue && <span className="priority priority-urgent">Past due · review</span>}
         {date && <span className="due-date"><Clock3 size={13} /> {date}</span>}
       </div>
       <h4>{card.title}</h4>
@@ -33,7 +35,7 @@ export function ActionCardView({ card, busy, onDecision }: Props) {
         </div>
       ) : (
         <div className={`decision-state ${card.status}`}>
-          {card.status === 'completed' ? 'Approved · reminder created' : card.status}
+          {card.status === 'completed' ? (card.card_type === 'mail_task' ? 'Done · reported by email' : 'Completed') : card.status}
         </div>
       )}
     </article>

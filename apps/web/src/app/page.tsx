@@ -34,7 +34,7 @@ import type { ActionCard, ChatMessage, ChatSession, DocumentRecord, Source, Stor
 type View = 'desk' | 'chat' | 'actions' | 'vault' | 'history' | 'accounts'
 type DeleteTarget = { kind: 'conversation' | 'document'; id: string; label: string }
 type Health = { status: string; mode: string; inference_enabled: boolean; services: { database: string; ollama: string }; model: string }
-type MailPipeline = { searchable_messages: number; embedded_messages: number; pending_embedding_chunks: number; imported_messages: number; processed_messages: number; discovered_messages: number }
+type MailPipeline = { searchable_messages: number; embedded_messages: number; pending_embedding_chunks: number; imported_messages: number; processed_messages: number; discovered_messages: number; action_messages_total: number; action_messages_processed: number }
 
 const prompts = [
   { label: 'Daily brief', text: 'What needs my attention this week?' },
@@ -96,6 +96,7 @@ export default function Home() {
         }))
         setAccountJobs(Object.fromEntries(entries.map(([id, status]) => [id, status.job])))
         setAccountPipelines(Object.fromEntries(entries.map(([id, status]) => [id, status.pipeline])))
+        setActions(await request<ActionCard[]>('/api/actions'))
       } catch { /* Account status is advisory; the workspace remains usable. */ }
     }
     void pollAccounts()
@@ -200,6 +201,7 @@ export default function Home() {
           setActions((current) => mergeActions(current, update.action_cards))
         }
       })
+      try { setActions(await request<ActionCard[]>('/api/actions')) } catch { /* Chat result is already saved. */ }
       try {
         setSessions((await request<{ sessions: ChatSession[] }>('/api/chat/sessions')).sessions)
       } catch {
@@ -355,7 +357,7 @@ export default function Home() {
       const next = await request<OnboardingState>('/api/onboarding')
       setOnboarding(next)
       setAccountJobs(next.sync_jobs)
-      setAccountPipelines(current => ({ ...current, [id]: { searchable_messages: 0, embedded_messages: 0, pending_embedding_chunks: 0, imported_messages: 0, processed_messages: 0, discovered_messages: 0 } }))
+      setAccountPipelines(current => ({ ...current, [id]: { searchable_messages: 0, embedded_messages: 0, pending_embedding_chunks: 0, imported_messages: 0, processed_messages: 0, discovered_messages: 0, action_messages_total: 0, action_messages_processed: 0 } }))
       setNotice('Imported mail and embeddings deleted. The account remains connected.')
     } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not delete imported mail') }
     finally { setAccountBusy(undefined) }

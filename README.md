@@ -17,7 +17,9 @@ Hey Broski is a local-first personal admin copilot. First-time setup collects a 
 
 The current UI is a local React chat shell rather than hosted ChatKit. The current ChatKit session API expects an OpenAI workflow and returns an OpenAI client secret, which conflicts with this project's zero-paid-API and local-inference rules. The backend contracts are kept separate so a future fully self-hosted ChatKit adapter can replace the shell without changing the domain services.
 
-Calendar sync and live n8n workflow execution remain planned. Imported mail can produce reminder proposals when it contains an explicit due or renewal date in day-month-year format. More general commitment extraction remains planned.
+Calendar sync and live n8n workflow execution remain planned. Imported mail now enters a third local processing stage for action cards. A schema constrained Ollama call extracts tasks from each message and receives relevant existing cards so later confirmations can update them. Explicit bill due and payment confirmations use evidence checked local rules for faster, reliable handling. The processing state is stored per message and resumes after restart. Cards retain past due dates and show a **Past due · review** label; a confirmed payment marks the matching card complete and keeps both mail sources. Processing waits for an import scan to finish, then handles messages in date order. Model output is validated against the email and candidate card IDs before a write.
+
+In chat, ask to show or review action cards, or type requests such as “Create an action card to renew my passport by January 3, 2027”, “Change the passport card to urgent”, “Accept the passport card”, or “Delete the passport card”. The local model resolves the command against visible card titles. Ambiguous targets ask for a clearer title. Accepting creates a local reminder; email inferred completion records the card as done without creating a reminder. Action extraction can take several minutes per message on a cold CPU model; mail search remains available while it runs. The import progress panel shows the action stage separately.
 
 ## First-time setup and connected mail
 
