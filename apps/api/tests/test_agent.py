@@ -59,6 +59,28 @@ def test_latest_topical_mail_uses_text_and_date(tmp_path: Path) -> None:
     assert "Refund approved" in answer
 
 
+def test_latest_topic_modifier_does_not_select_unrelated_newer_mail(tmp_path: Path) -> None:
+    service, account_id = setup_mail(tmp_path)
+    add_mail(service, account_id, "interview", "Interview schedule", "Your interview is next week",
+             "Recruiter <jobs@example.com>", 1780000000000)
+    add_mail(service, account_id, "payment", "Payment reminder", "Your bill is due",
+             "Bank <billing@example.com>", 1780002000000)
+
+    sources, _ = service.context_for("Summarize the latest interview-related email and tell me if I need to reply")
+
+    assert [source.metadata["message_id"] for source in sources] == ["interview"]
+
+
+def test_summary_accepts_sender_short_brand_when_parent_name_is_in_question(tmp_path: Path) -> None:
+    service, account_id = setup_mail(tmp_path)
+    add_mail(service, account_id, "guvi", "Course update", "Your course is ready",
+             "GUVI <info@guvi.in>", 1780000000000)
+
+    sources, _ = service.context_for("Summarize all the mails I received from HCL GUVI")
+
+    assert [source.metadata["message_id"] for source in sources] == ["guvi"]
+
+
 def test_latest_summary_uses_message_content(tmp_path: Path, monkeypatch) -> None:
     service, account_id = setup_mail(tmp_path)
     add_mail(service, account_id, "old", "Old message", "Old information", "Alice <alice@example.com>", 1780000000000)
