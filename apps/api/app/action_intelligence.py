@@ -15,6 +15,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from .config import Settings
+from .action_presentation import action_priority, action_title
 from .repository import Repository
 
 logger = logging.getLogger(__name__)
@@ -123,7 +124,10 @@ class ActionIntelligence:
         obvious = self._obvious_bill_event(job, candidates, source, zone_name)
         if obvious:
             return self.repository.apply_mail_action_events(job, [obvious])
-        system = ("Read this email and return action card events. A request to pay, renew, respond, or do something is create, "
+        system = ("Read this email and return action card events. Write a short verb-led title saying what the user should do. "
+                  "Put the task, relevant amount or context, and deadline in the description. "
+                  "Use low priority for optional feedback or sharing a dining experience; high for filing ITR or tax obligations. "
+                  "Use urgency and consequences when assigning other priorities. A request to pay, renew, respond, or do something is create, "
                   "even when its due date is already past. Extract the actual due date as YYYY-MM-DD. "
                   "An explicit payment or task completion is complete for the matching existing action ID; never create a new card for it. "
                   "Match the issuer, account, amount, and task. A changed deadline is update. Preserve the old due date on completion. "
@@ -166,12 +170,15 @@ class ActionIntelligence:
             if event.operation == "create":
                 identifier = hashlib.sha256(f"{job['account_id']}:{job['message_id']}:{index}".encode()).hexdigest()[:24]
                 events.append({"operation": "create", "card": {"id": f"action_mail_{identifier}",
-                    "title": event.title, "description": event.description, "priority": event.priority,
+                    "title": action_title(event.title), "description": event.description,
+                    "priority": action_priority(event.title, event.description, date_value, event.priority),
                     "status": "pending", "due_at": date_value, "confidence": event.confidence, "sources": [source]}})
             else:
                 previous = allowed[event.target_id]
                 events.append({"operation": event.operation, "target_id": event.target_id,
-                    "title": event.title, "description": event.description, "priority": event.priority,
+                    "title": action_title(event.title), "description": event.description,
+                    "priority": previous["priority"] if event.operation == "complete" else
+                                action_priority(event.title, event.description, date_value or previous["due_at"], event.priority),
                     "status": "completed" if event.operation == "complete" else previous["status"],
                     "due_at": previous["due_at"] if event.operation == "complete" else date_value or previous["due_at"],
                     "confidence": event.confidence, "source": source})
@@ -206,9 +213,10 @@ class ActionIntelligence:
             return None
         deadline = due_at(next(iter(dates)), zone_name)
         identifier = hashlib.sha256(f"{job['account_id']}:{job['message_id']}:bill".encode()).hexdigest()[:24]
-        title = f"Pay {subject}"[:160]
+        title = action_title(f"Pay {subject}")
         return {"operation": "create", "card": {"id": f"action_mail_{identifier}", "title": title,
-            "description": f"Pay the {money} bill by {next(iter(dates))}.", "priority": "high", "status": "pending",
+            "description": f"Pay the {money} bill by {next(iter(dates))}.",
+            "priority": action_priority(title, f"Pay the {money} bill", deadline, "high"), "status": "pending",
             "due_at": deadline, "confidence": 0.95, "sources": [source]}}
 
     async def worker(self) -> None:

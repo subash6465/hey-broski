@@ -2,6 +2,7 @@ import asyncio
 from pathlib import Path
 
 from app.action_intelligence import ActionIntelligence, ChatCommand, MailDecision, MailEvent
+from app.action_presentation import action_priority, action_title
 from app.config import Settings
 from app.repository import Repository
 
@@ -52,6 +53,10 @@ def test_overdue_card_is_updated_by_later_payment_without_duplicate(tmp_path: Pa
     assert second["status"] == "completed"
     assert second["due_at"] == first["due_at"]
     assert len(second["source_refs"]) == 2
+    details = repository.action_details(first["id"])
+    assert [item["event_type"] for item in details["activity"]] == ["mail_created", "mail_completed"]
+    assert details["activity"][-1]["source_id"] == f"{account['id']}:paid"
+    assert [mail["title"] for mail in details["mails"]] == ["Credit card bill", "Credit card payment"]
     assert len(repository.list_actions()) == 1
     assert repository.pending_mail_actions() == []
 
@@ -123,3 +128,29 @@ def test_chat_edit_accept_and_delete(tmp_path: Path, monkeypatch):
     assert len(repository.list_reminders()) == 1
     asyncio.run(main.handle_action_chat("Delete the passport action card"))
     assert repository.list_actions() == []
+
+
+def test_priority_and_title_policy():
+    assert action_title("Sharing dining experience") == "Share dining experience"
+    assert action_priority("Share dining experience on EazyDiner", "Leave an optional review", None) == "low"
+    assert action_priority("Upload bill for EazyPoints", "Earn loyalty points", "2026-01-01T00:00:00+00:00", "urgent") == "low"
+    assert action_priority("Refer friends for tax filing", "Earn rewards", "2026-01-01T00:00:00+00:00", "urgent") == "low"
+    assert action_priority("File ITR", "Submit income tax return", "2026-01-01T00:00:00+00:00") == "high"
+    assert action_priority("Complete application", "Submit by the deadline", "2026-01-01T00:00:00+00:00", "urgent") == "high"
+    assert action_priority("Read newsletter", "Maybe read later", None) == "medium"
+
+
+def test_decision_comments_are_saved_in_card_history(tmp_path: Path):
+    repository, account, service = setup(tmp_path)
+    add_mail(repository, account, "bill", "Acme Visa bill", "Your Acme Visa bill of $120 is due January 1, 2026.",
+             "2025-12-20T12:00:00+00:00")
+    card = asyncio.run(service.process_one(repository.pending_mail_actions()[0]))[0]
+    approved, _ = repository.execute_local_reminder(card["id"], "Paid from another account")
+    assert approved["completion_origin"] == "reminder"
+    details = repository.action_details(card["id"])
+    assert details["activity"][-1]["event_type"] == "approved"
+    assert details["activity"][-1]["comment"] == "Paid from another account"
+    assert details["mails"][0]["body"].startswith("Your Acme Visa")
+    repository.edit_action(card["id"], {"status": "pending"})
+    repository.decide_action(card["id"], "dismissed", "No longer needed")
+    assert repository.action_details(card["id"])["activity"][-1]["comment"] == "No longer needed"

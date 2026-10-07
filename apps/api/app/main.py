@@ -19,6 +19,7 @@ from fastapi.responses import Response, StreamingResponse, RedirectResponse, JSO
 
 from .assistant import AssistantService, ModelResponseError
 from .action_intelligence import ActionIntelligence, due_at, explicit_dates
+from .action_presentation import action_priority, action_title
 from .connectors import ConnectorService, ConnectionError
 from .config import settings
 from .credential_vault import CredentialVault
@@ -375,9 +376,12 @@ async def handle_action_chat(message: str) -> tuple[str, list[ActionCard]] | Non
         except ValueError:
             return "I could not resolve that due date. Please give me a calendar date.", []
         card_id = f"action_user_{uuid4().hex}"
-        repository.upsert_action({"id": card_id, "card_type": "manual", "title": command.title[:160],
-            "description": (command.description or command.title)[:1200], "priority": command.priority or "medium",
+        title = action_title(command.title)
+        description = (command.description or command.title)[:1200]
+        repository.upsert_action({"id": card_id, "card_type": "manual", "title": title,
+            "description": description, "priority": action_priority(title, description, deadline, command.priority or "medium"),
             "status": "pending", "due_at": deadline, "confidence": 1.0, "sources": [], "proposed_action": None})
+        repository.record_action_activity(card_id, "created")
         card = repository.get_action(card_id)
         repository.audit("action.created", card_id, {"via": "chat"})
         return "Created the action card.", [ActionCard.model_validate(card)]
@@ -397,6 +401,7 @@ async def handle_action_chat(message: str) -> tuple[str, list[ActionCard]] | Non
     if command.operation in {"complete", "reopen"}:
         status_value = "completed" if command.operation == "complete" else "pending"
         updated = repository.edit_action(card["id"], {"status": status_value})
+        repository.record_action_activity(card["id"], status_value)
         repository.audit(f"action.{status_value}", card["id"], {"via": "chat"})
         return f"Marked {card['title']} as {status_value}.", [ActionCard.model_validate(updated)]
     if command.operation == "edit":
@@ -415,6 +420,7 @@ async def handle_action_chat(message: str) -> tuple[str, list[ActionCard]] | Non
         if not changes:
             return "Tell me what to change on that card.", [ActionCard.model_validate(card)]
         updated = repository.edit_action(card["id"], changes)
+        repository.record_action_activity(card["id"], "edited")
         repository.audit("action.edited", card["id"], {"via": "chat", "fields": list(changes)})
         return "Updated the action card.", [ActionCard.model_validate(updated)]
     return None
@@ -467,10 +473,10 @@ async def decide_action(action_id: str, request: DecisionRequest) -> dict[str, A
     if request.decision == "approve":
         # The MVP executes only a local reminder. External connectors must use
         # the same approval boundary and persist their own confirmed result.
-        updated, tool_result = repository.execute_local_reminder(action_id)
+        updated, tool_result = repository.execute_local_reminder(action_id, request.comment)
         next_status = "completed"
     else:
-        updated = repository.decide_action(action_id, "dismissed")
+        updated = repository.decide_action(action_id, "dismissed", request.comment)
         tool_result = {"executed": False}
         next_status = "dismissed"
     repository.audit(
@@ -478,11 +484,20 @@ async def decide_action(action_id: str, request: DecisionRequest) -> dict[str, A
         action_id,
         {
             "decision": request.decision,
+            "comment": request.comment,
             "tool": (action.get("proposed_action") or {}).get("tool"),
             "tool_result": tool_result,
         },
     )
     return updated
+
+
+@app.get("/api/actions/{action_id}/details")
+async def action_details(action_id: str) -> dict[str, Any]:
+    details = repository.action_details(action_id)
+    if not details:
+        raise HTTPException(404, "Action card not found")
+    return details
 
 
 @app.get("/api/reminders")

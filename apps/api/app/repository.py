@@ -11,6 +11,8 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 from uuid import uuid4
+
+from .action_presentation import action_priority, action_title
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -72,6 +74,9 @@ class Repository:
         CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
         CREATE TABLE IF NOT EXISTS actions (id TEXT PRIMARY KEY, session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL, card_type TEXT NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL, priority TEXT NOT NULL, status TEXT NOT NULL, due_at TEXT, confidence REAL NOT NULL, sources TEXT NOT NULL, proposed_action TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_actions_status ON actions(status, created_at);
+        CREATE TABLE IF NOT EXISTS action_activity (id TEXT PRIMARY KEY, action_id TEXT NOT NULL REFERENCES actions(id) ON DELETE CASCADE, event_type TEXT NOT NULL, comment TEXT NOT NULL DEFAULT '', source_id TEXT, created_at TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS idx_action_activity_card ON action_activity(action_id, created_at);
+        CREATE TABLE IF NOT EXISTS app_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS documents (id TEXT PRIMARY KEY, filename TEXT NOT NULL, content_type TEXT NOT NULL, size_bytes INTEGER NOT NULL, extracted_text TEXT NOT NULL, created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS document_chunks (document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE, chunk_index INTEGER NOT NULL, content TEXT NOT NULL, PRIMARY KEY(document_id, chunk_index));
         CREATE VIRTUAL TABLE IF NOT EXISTS document_chunks_fts USING fts5(content, content='document_chunks', content_rowid='rowid');
@@ -143,6 +148,19 @@ class Repository:
             mail_columns = {row[1] for row in connection.execute("PRAGMA table_info(mail_messages)")}
             if "seen_sync_at" not in mail_columns:
                 connection.execute("ALTER TABLE mail_messages ADD COLUMN seen_sync_at TEXT")
+            if not connection.execute("SELECT 1 FROM app_migrations WHERE name='action_presentation_v2'").fetchone():
+                for row in connection.execute("SELECT id,title,description,priority,due_at,card_type FROM actions WHERE card_type IN ('mail_task','deadline')"):
+                    title = action_title(row["title"])
+                    priority = action_priority(title, row["description"], row["due_at"], row["priority"])
+                    connection.execute("UPDATE actions SET title=?,priority=? WHERE id=?", (title, priority, row["id"]))
+                for row in connection.execute("""SELECT id,status,sources FROM actions WHERE card_type='mail_task'
+                    AND NOT EXISTS(SELECT 1 FROM action_activity h WHERE h.action_id=actions.id)"""):
+                    sources = json.loads(row["sources"])
+                    if sources:
+                        self._add_action_activity(connection, row["id"], "mail_created", source_id=sources[0].get("source_id"))
+                        if row["status"] == "completed" and not connection.execute("SELECT 1 FROM reminders WHERE action_id=?", (row["id"],)).fetchone():
+                            self._add_action_activity(connection, row["id"], "mail_completed", source_id=sources[-1].get("source_id"))
+                connection.execute("INSERT INTO app_migrations VALUES ('action_presentation_v2',?)", (now_iso(),))
             for row in connection.execute("""SELECT s.account_id,s.message_id,s.title,COALESCE(m.body_text,s.snippet) AS body
                 FROM mail_sources s LEFT JOIN mail_messages m ON m.account_id=s.account_id AND m.message_id=s.message_id
                 WHERE NOT EXISTS (SELECT 1 FROM mail_action_jobs j WHERE j.account_id=s.account_id AND j.message_id=s.message_id)"""):
@@ -271,7 +289,7 @@ class Repository:
             connection.execute("INSERT OR IGNORE INTO actions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", values)
 
     def list_actions(self, status: str | None = None) -> list[dict[str, Any]]:
-        query, params = "SELECT * FROM actions", ()
+        query, params = "SELECT actions.*, EXISTS(SELECT 1 FROM reminders r WHERE r.action_id=actions.id) AS has_reminder FROM actions", ()
         clauses = []
         if status:
             clauses.append("status = ?")
@@ -286,12 +304,15 @@ class Repository:
 
     def get_action(self, action_id: str) -> dict[str, Any] | None:
         with self.connect() as connection:
-            row = connection.execute("SELECT * FROM actions WHERE id = ?", (action_id,)).fetchone()
+            row = connection.execute("""SELECT actions.*, EXISTS(SELECT 1 FROM reminders r WHERE r.action_id=actions.id) AS has_reminder
+                FROM actions WHERE id = ?""", (action_id,)).fetchone()
         return self._decode_action(row) if row else None
 
-    def decide_action(self, action_id: str, new_status: str) -> dict[str, Any] | None:
+    def decide_action(self, action_id: str, new_status: str, comment: str = "") -> dict[str, Any] | None:
         with self._lock, self.connect() as connection:
-            connection.execute("UPDATE actions SET status = ?, updated_at = ? WHERE id = ? AND status = 'pending'", (new_status, now_iso(), action_id))
+            changed = connection.execute("UPDATE actions SET status = ?, updated_at = ? WHERE id = ? AND status = 'pending'", (new_status, now_iso(), action_id)).rowcount
+            if changed:
+                self._add_action_activity(connection, action_id, new_status, comment)
         return self.get_action(action_id)
 
     def edit_action(self, action_id: str, changes: dict[str, Any]) -> dict[str, Any] | None:
@@ -314,7 +335,7 @@ class Repository:
                 self._remove_action_cards(connection, {action_id})
         return changed
 
-    def execute_local_reminder(self, action_id: str) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    def execute_local_reminder(self, action_id: str, comment: str = "") -> tuple[dict[str, Any] | None, dict[str, Any]]:
         """Create the local side effect and status update in one transaction."""
         reminder_id, timestamp = f"reminder_{uuid4().hex}", now_iso()
         with self._lock, self.connect() as connection:
@@ -331,6 +352,7 @@ class Repository:
                 "UPDATE actions SET status = 'completed', updated_at = ? WHERE id = ?",
                 (timestamp, action_id),
             )
+            self._add_action_activity(connection, action_id, "approved", comment)
         return self.get_action(action_id), {"executed": True, "reminder_id": reminder_id}
 
     def list_reminders(self) -> list[dict[str, Any]]:
@@ -343,9 +365,45 @@ class Repository:
         item = dict(row)
         item["source_refs"] = json.loads(item.pop("sources"))
         item["proposed_action"] = json.loads(item["proposed_action"]) if item["proposed_action"] else None
-        for key in ("session_id", "created_at", "updated_at"):
+        has_reminder = item.pop("has_reminder", False)
+        item["completion_origin"] = ("reminder" if has_reminder else "mail" if item["card_type"] == "mail_task" else "manual") if item["status"] == "completed" else None
+        for key in ("session_id",):
             item.pop(key, None)
         return item
+
+    @staticmethod
+    def _add_action_activity(connection: sqlite3.Connection, action_id: str, event_type: str,
+                             comment: str = "", source_id: str | None = None) -> None:
+        connection.execute("INSERT INTO action_activity VALUES (?,?,?,?,?,?)",
+                           (f"activity_{uuid4().hex}", action_id, event_type, comment, source_id, now_iso()))
+
+    def action_details(self, action_id: str) -> dict[str, Any] | None:
+        card = self.get_action(action_id)
+        if not card:
+            return None
+        mails = []
+        with self.connect() as connection:
+            for source in card["source_refs"]:
+                if source.get("source_type") != "email" or ":" not in source.get("source_id", ""):
+                    continue
+                account_id, message_id = source["source_id"].split(":", 1)
+                row = connection.execute("""SELECT s.title,s.snippet,s.sent_at,s.sender,s.provider,m.body_text
+                    FROM mail_sources s LEFT JOIN mail_messages m ON m.account_id=s.account_id AND m.message_id=s.message_id
+                    WHERE s.account_id=? AND s.message_id=?""", (account_id, message_id)).fetchone()
+                mails.append({"source_id": source["source_id"], "title": row["title"] if row else source.get("title", "Mail"),
+                              "sender": row["sender"] if row else "", "sent_at": row["sent_at"] if row else source.get("timestamp", ""),
+                              "account_label": source.get("account_label", ""),
+                              "body": (row["body_text"] or row["snippet"]) if row else source.get("snippet", ""),
+                              "available": row is not None})
+            activity = [dict(row) for row in connection.execute("""SELECT event_type,comment,source_id,created_at
+                FROM action_activity WHERE action_id=? ORDER BY created_at,id""", (action_id,))]
+        mails.sort(key=lambda mail: mail["sent_at"])
+        return {"card": card, "mails": mails, "activity": activity}
+
+    def record_action_activity(self, action_id: str, event_type: str, comment: str = "") -> None:
+        with self._lock, self.connect() as connection:
+            if connection.execute("SELECT 1 FROM actions WHERE id=?", (action_id,)).fetchone():
+                self._add_action_activity(connection, action_id, event_type, comment)
 
     def add_document(self, filename: str, content_type: str, size_bytes: int, text: str) -> dict[str, Any]:
         document_id, timestamp = f"doc_{uuid4().hex}", now_iso()
@@ -558,6 +616,8 @@ class Repository:
                         (card["id"], card["title"], card["description"], card["priority"], card["status"], card["due_at"], card["confidence"], json.dumps(card["sources"]), now_iso(), now_iso()))
                     if inserted.rowcount:
                         changed.append(card["id"])
+                        for source in card["sources"]:
+                            self._add_action_activity(connection, card["id"], "mail_created", source_id=source.get("source_id"))
                 else:
                     row = connection.execute("SELECT * FROM actions WHERE id=?", (event["target_id"],)).fetchone()
                     if not row or row["status"] == "dismissed":
@@ -568,6 +628,8 @@ class Repository:
                         sources.append(source)
                     connection.execute("""UPDATE actions SET title=?,description=?,priority=?,status=?,due_at=?,confidence=?,sources=?,updated_at=? WHERE id=?""",
                         (event["title"], event["description"], event["priority"], event["status"], event["due_at"], event["confidence"], json.dumps(sources), now_iso(), event["target_id"]))
+                    self._add_action_activity(connection, event["target_id"], "mail_completed" if event["operation"] == "complete" else "mail_updated",
+                                              source_id=source["source_id"])
                     changed.append(event["target_id"])
             connection.execute("UPDATE mail_action_jobs SET processed_fingerprint=fingerprint,error=NULL WHERE account_id=? AND message_id=?", (job["account_id"], job["message_id"]))
         return [card for action_id in changed if (card := self.get_action(action_id))]
@@ -781,12 +843,14 @@ class Repository:
                     AND (c.vector_model IS NULL OR c.vector_model<>?)) THEN 1 ELSE 0 END), 0)
                 FROM sync_manifest m WHERE m.account_id=? AND m.state='imported'""", (model, account_id)).fetchone()
             discovered = connection.execute("SELECT count(*) FROM sync_manifest WHERE account_id=?", (account_id,)).fetchone()[0]
-            action_total, action_processed = connection.execute("""SELECT count(*),coalesce(sum(processed_fingerprint=fingerprint),0)
+            action_total, action_processed, action_failed = connection.execute("""SELECT count(*),coalesce(sum(processed_fingerprint=fingerprint),0),
+                coalesce(sum(error IS NOT NULL AND (processed_fingerprint IS NULL OR processed_fingerprint!=fingerprint)),0)
                 FROM mail_action_jobs WHERE account_id=?""", (account_id,)).fetchone()
         return {"searchable_messages": searchable, "embedded_messages": searchable - pending_messages,
                 "pending_embedding_chunks": pending_chunks, "imported_messages": imported,
                 "processed_messages": processed, "discovered_messages": discovered,
-                "action_messages_total": action_total, "action_messages_processed": action_processed}
+                "action_messages_total": action_total, "action_messages_processed": action_processed,
+                "action_messages_failed": action_failed}
 
     def initial_mail_import_incomplete(self) -> bool:
         with self.connect() as connection:

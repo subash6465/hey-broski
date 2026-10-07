@@ -62,7 +62,7 @@ def test_latest_sender_and_full_text_search(tmp_path):
     assert repository.mail_pipeline_counts(account["id"], "test-embed") == {
         "searchable_messages": 3, "embedded_messages": 0, "pending_embedding_chunks": 3,
         "imported_messages": 0, "processed_messages": 0, "discovered_messages": 0,
-        "action_messages_total": 0, "action_messages_processed": 0}
+        "action_messages_total": 0, "action_messages_processed": 0, "action_messages_failed": 0}
 
 
 def test_vector_index_batches_chunks_and_resolves_to_live_messages(tmp_path, monkeypatch):

@@ -17,6 +17,15 @@ export type ActionCard = {
   due_at?: string | null
   confidence: number
   source_refs: Source[]
+  completion_origin?: 'reminder' | 'mail' | 'manual' | null
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+export type ActionDetails = {
+  card: ActionCard
+  mails: { source_id: string; title: string; sender: string; sent_at: string; account_label: string; body: string; available: boolean }[]
+  activity: { event_type: string; comment: string; source_id: string | null; created_at: string }[]
 }
 
 export type GeneratedBy = 'ollama' | 'metadata' | 'coverage' | 'agent'
