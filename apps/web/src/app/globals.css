@@ -124,12 +124,15 @@ button { color: inherit; }
 .action-decision-form textarea { width: 100%; resize: vertical; padding: 9px; border: 1px solid var(--line); border-radius: 8px; background: white; font: 11px/1.5 Arial, sans-serif; }
 .action-decision-form > div { display: flex; justify-content: flex-end; gap: 8px; }.action-decision-form button { padding: 7px 11px; border: 1px solid var(--line); border-radius: 7px; background: white; cursor: pointer; font-size: 11px; font-weight: 700; }
 .action-decision-form .action-decision-confirm { background: var(--accent); border-color: var(--accent); color: white; }.action-decision-form button:disabled { opacity: .6; cursor: default; }
-.action-filters { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin: 0 0 13px; }
+.action-filters { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)) auto; gap: 10px; align-items: end; margin: 0 0 13px; }
 .action-filters label { display: grid; gap: 5px; color: var(--muted); font-size: 10px; font-weight: 750; }
 .action-filters select { min-width: 0; padding: 9px 10px; border: 1px solid var(--line); border-radius: 9px; color: #443775; background: rgba(255,255,255,.8); font: 11px Arial, sans-serif; cursor: pointer; }
+.action-show-all { padding: 9px 12px; border: 1px solid var(--line); border-radius: 9px; background: white; color: var(--accent); cursor: pointer; font-size: 11px; font-weight: 750; white-space: nowrap; }
+.action-show-all:hover { border-color: var(--accent); }
+.action-group-heading { grid-column: 1 / -1; margin: 11px 0 0; color: #443775; font: 600 14px Georgia, serif; }
 .action-results-count { margin: 0 0 12px; color: var(--muted); font-size: 11px; }
 .action-inbox .empty-state button { border: 0; background: transparent; color: var(--accent); cursor: pointer; font-size: 11px; font-weight: 700; }
-@media (max-width: 850px) { .action-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 850px) { .action-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }.action-show-all { grid-column: 1 / -1; } }
 .action-buttons { display: flex; gap: 7px; margin-top: 13px; }
 .action-buttons button { display: flex; align-items: center; gap: 5px; padding: 7px 10px; border-radius: 7px; cursor: pointer; font-size: 10px; font-weight: 700; }
 .approve-button { color: white; background: var(--accent); border: 1px solid var(--accent); }.dismiss-button { color: #616a65; background: white; border: 1px solid #dce1de; }

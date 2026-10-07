@@ -46,18 +46,22 @@ async def lifespan(_: FastAPI):
     scheduler = asyncio.create_task(mail_sync.scheduler())
     vector_worker = asyncio.create_task(assistant.mail_vectors.worker())
     action_worker = asyncio.create_task(action_intelligence.worker())
+    html_repair_worker = asyncio.create_task(mail_sync.repair_html_placeholders())
     try:
         yield
     finally:
         scheduler.cancel()
         vector_worker.cancel()
         action_worker.cancel()
+        html_repair_worker.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await scheduler
         with contextlib.suppress(asyncio.CancelledError):
             await vector_worker
         with contextlib.suppress(asyncio.CancelledError):
             await action_worker
+        with contextlib.suppress(asyncio.CancelledError):
+            await html_repair_worker
 
 
 app = FastAPI(title="Hey Broski API", version="0.2.0", lifespan=lifespan)

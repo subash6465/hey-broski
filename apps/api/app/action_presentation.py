@@ -30,6 +30,10 @@ def action_priority(title: str, description: str, due_at: str | None, suggested:
         return "low"
     if required:
         return "high"
+    # General job listings are worth reviewing, but are not personal obligations.
+    if re.search(r"\b(apply for|hiring|job opportunity|job opening)\b", text) and not re.search(
+            r"\b(application deadline|must apply by|submit (?:your )?application by|interview scheduled)\b", text):
+        return "medium"
     if due_at:
         try:
             days = (datetime.fromisoformat(due_at.replace("Z", "+00:00")).astimezone(timezone.utc).date()

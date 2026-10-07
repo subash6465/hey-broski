@@ -89,7 +89,7 @@ def normalize_gmail_message(message: dict, account_id: str, account_email: str) 
             parser = _HTMLText()
             parser.feed(_part_text(part))
             html.append("".join(parser.parts))
-    plain = [part for part in plain if part.strip()]
+    plain = [part for part in plain if part.strip() and not re.fullmatch(r"\s*please\s+enable\s+html[.!\s]*", part, re.I)]
     body = "\n".join(plain or [part for part in html if part.strip()]).strip() or message.get("snippet", "")
     body = re.sub(r"[ \t]+", " ", body)
     body = re.sub(r"\n{3,}", "\n\n", body)

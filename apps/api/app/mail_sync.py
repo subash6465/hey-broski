@@ -8,6 +8,7 @@ import hashlib
 import json
 import random
 import re
+import logging
 from time import monotonic
 from datetime import datetime, timedelta, timezone
 from html import unescape
@@ -18,6 +19,8 @@ import httpx
 from .connectors import ConnectorService, ConnectionError as ProviderConnectionError
 from .mail_index import normalize_gmail_message
 from .repository import Repository
+
+logger = logging.getLogger(__name__)
 
 
 def months_ago(months: int) -> datetime:
@@ -260,6 +263,35 @@ class MailSync:
         self.repository.upsert_mail_source(account["id"], "gmail", message["id"], normalized["subject"][:300],
             snippet, normalized["received_at"], normalized["sender_address"][:300], folder,
             hashlib.sha256(f"{normalized['subject'][:300]}\n{normalized['body_text']}".encode()).hexdigest())
+
+    async def repair_html_placeholders(self) -> None:
+        """Refresh old Gmail messages whose stored plain part only asked for HTML."""
+        await asyncio.sleep(10)
+        pending = self.repository.html_placeholder_messages()
+        for account_id in {account_id for account_id, _ in pending}:
+            account = self.repository.get_account(account_id)
+            if not account:
+                continue
+            try:
+                token = await self.connectors.access_token(account)
+                headers = {"Authorization": f"Bearer {token}"}
+                async with httpx.AsyncClient(timeout=30) as client:
+                    for _, message_id in (item for item in pending if item[0] == account_id):
+                        try:
+                            raw = await self._gmail_detail(client, account, message_id, headers, asyncio.Semaphore(1))
+                            normalized = normalize_gmail_message(raw, account_id, account["email"])
+                            if normalized["body_text"].strip().lower().startswith("please enable html"):
+                                continue
+                            self.repository.upsert_mail_message(normalized)
+                            self.repository.repair_mail_source_text(account_id, message_id, normalized["body_text"])
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            logger.warning("Could not refresh a stored HTML mail message: %s", exc)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Could not start stored HTML mail repair: %s", exc)
 
     async def _gmail_history(self, client: httpx.AsyncClient, account: dict, headers: dict[str, str], start_id: str,
                              include_sent: bool) -> None:

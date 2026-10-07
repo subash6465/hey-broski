@@ -40,6 +40,14 @@ def test_html_body_used_when_plain_part_is_empty():
     assert "ignore" not in item["body_text"]
 
 
+def test_html_body_used_when_plain_part_is_a_placeholder():
+    raw = _message("m1", 1780000000000, "Sender <a@example.com>", "Opportunity", "Please Enable HTML")
+    raw["payload"]["parts"].append({"mimeType": "text/html", "body": {
+        "data": base64.urlsafe_b64encode(b"<p>Apply for the position by Friday.</p>").decode()}})
+    item = normalize_gmail_message(raw, "account", "owner@example.com")
+    assert item["body_text"] == "Apply for the position by Friday."
+
+
 def test_latest_sender_and_full_text_search(tmp_path):
     repository = Repository(tmp_path / "mail.db")
     repository.initialize()

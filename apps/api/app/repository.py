@@ -148,7 +148,7 @@ class Repository:
             mail_columns = {row[1] for row in connection.execute("PRAGMA table_info(mail_messages)")}
             if "seen_sync_at" not in mail_columns:
                 connection.execute("ALTER TABLE mail_messages ADD COLUMN seen_sync_at TEXT")
-            if not connection.execute("SELECT 1 FROM app_migrations WHERE name='action_presentation_v2'").fetchone():
+            if not connection.execute("SELECT 1 FROM app_migrations WHERE name='action_presentation_v3'").fetchone():
                 for row in connection.execute("SELECT id,title,description,priority,due_at,card_type FROM actions WHERE card_type IN ('mail_task','deadline')"):
                     title = action_title(row["title"])
                     priority = action_priority(title, row["description"], row["due_at"], row["priority"])
@@ -160,7 +160,7 @@ class Repository:
                         self._add_action_activity(connection, row["id"], "mail_created", source_id=sources[0].get("source_id"))
                         if row["status"] == "completed" and not connection.execute("SELECT 1 FROM reminders WHERE action_id=?", (row["id"],)).fetchone():
                             self._add_action_activity(connection, row["id"], "mail_completed", source_id=sources[-1].get("source_id"))
-                connection.execute("INSERT INTO app_migrations VALUES ('action_presentation_v2',?)", (now_iso(),))
+                connection.execute("INSERT INTO app_migrations VALUES ('action_presentation_v3',?)", (now_iso(),))
             for row in connection.execute("""SELECT s.account_id,s.message_id,s.title,COALESCE(m.body_text,s.snippet) AS body
                 FROM mail_sources s LEFT JOIN mail_messages m ON m.account_id=s.account_id AND m.message_id=s.message_id
                 WHERE NOT EXISTS (SELECT 1 FROM mail_action_jobs j WHERE j.account_id=s.account_id AND j.message_id=s.message_id)"""):
@@ -399,6 +399,17 @@ class Repository:
                 FROM action_activity WHERE action_id=? ORDER BY created_at,id""", (action_id,))]
         mails.sort(key=lambda mail: mail["sent_at"])
         return {"card": card, "mails": mails, "activity": activity}
+
+    def html_placeholder_messages(self) -> list[tuple[str, str]]:
+        with self.connect() as connection:
+            return [(row[0], row[1]) for row in connection.execute("""SELECT m.account_id,m.message_id
+                FROM mail_messages m JOIN connected_accounts a ON a.id=m.account_id
+                WHERE a.provider='gmail' AND lower(trim(m.body_text)) LIKE 'please enable html%'""")]
+
+    def repair_mail_source_text(self, account_id: str, message_id: str, body: str) -> None:
+        with self._lock, self.connect() as connection:
+            connection.execute("UPDATE mail_sources SET snippet=? WHERE account_id=? AND message_id=?",
+                               (re.sub(r"\s+", " ", body).strip()[:1800], account_id, message_id))
 
     def record_action_activity(self, action_id: str, event_type: str, comment: str = "") -> None:
         with self._lock, self.connect() as connection:

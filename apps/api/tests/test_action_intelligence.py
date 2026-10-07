@@ -137,6 +137,8 @@ def test_priority_and_title_policy():
     assert action_priority("Refer friends for tax filing", "Earn rewards", "2026-01-01T00:00:00+00:00", "urgent") == "low"
     assert action_priority("File ITR", "Submit income tax return", "2026-01-01T00:00:00+00:00") == "high"
     assert action_priority("Complete application", "Submit by the deadline", "2026-01-01T00:00:00+00:00", "urgent") == "high"
+    assert action_priority("Apply for Software Engineer", "General hiring notice", "2026-01-01T00:00:00+00:00", "high") == "medium"
+    assert action_priority("Apply for Software Engineer", "Application deadline is tomorrow", None, "high") == "high"
     assert action_priority("Read newsletter", "Maybe read later", None) == "medium"
 
 
