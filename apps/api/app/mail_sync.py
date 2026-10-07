@@ -8,17 +8,19 @@ import hashlib
 import json
 import random
 import re
+import logging
 from time import monotonic
-from datetime import datetime, timedelta, timezone, time
+from datetime import datetime, timedelta, timezone
 from html import unescape
 from urllib.parse import quote
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
 from .connectors import ConnectorService, ConnectionError as ProviderConnectionError
 from .mail_index import normalize_gmail_message
 from .repository import Repository
+
+logger = logging.getLogger(__name__)
 
 
 def months_ago(months: int) -> datetime:
@@ -100,36 +102,6 @@ class MailSync:
                 continue
             raise GmailRequestError(response.status_code, reason, message)
         raise RuntimeError("Gmail did not respond after retries")
-
-    def _maybe_action(self, account: dict, message_id: str, title: str, snippet: str, sent_at: str) -> None:
-        """Create a conservative reminder only for an explicit dated obligation."""
-        if not re.search(r"\b(due|renew(?:s|al)?|expir(?:es|y|ation)?)\b", f"{title} {snippet}", re.I):
-            return
-        match = re.search(r"\b(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})\b", snippet, re.I)
-        if not match:
-            return
-        try:
-            due_date = datetime.strptime(match.group(0), "%d %B %Y").date()
-        except ValueError:
-            return
-        zone_name = (self.repository.get_profile() or {}).get("time_zone", "UTC")
-        try:
-            zone = ZoneInfo(zone_name)
-        except ZoneInfoNotFoundError:
-            zone = timezone.utc
-        today = datetime.now(zone).date()
-        if abs((due_date - today).days) > 365:
-            return
-        due_at = datetime.combine(due_date, time(18, 0), tzinfo=zone).astimezone(timezone.utc).isoformat()
-        identifier = hashlib.sha256(f"{account['id']}:{message_id}".encode()).hexdigest()[:24]
-        source = {"source_type": "email", "source_id": f"{account['id']}:{message_id}",
-                  "account_label": f"{account['provider'].title()} / {account['email']}", "title": title,
-                  "snippet": snippet, "timestamp": sent_at}
-        self.repository.upsert_action({"id": f"action_mail_{identifier}", "session_id": None, "card_type": "deadline",
-            "title": f"Review: {title[:100]}", "description": f"This message mentions a due or renewal date of {due_date.isoformat()}.",
-            "priority": "urgent" if due_date <= today else "high" if (due_date - today).days <= 3 else "medium",
-            "status": "pending", "due_at": due_at, "confidence": 0.75, "sources": [source],
-            "proposed_action": {"tool": "reminders.create", "requires_approval": True, "input": {"title": title[:100], "due_at": due_at}}})
 
     async def stop(self, account_id: str, status: str) -> None:
         if status not in {"paused", "paused_processing", "canceled"}:
@@ -289,8 +261,37 @@ class MailSync:
         labels = message.get("labelIds", [])
         folder = "sent" if "SENT" in labels else "inbox" if "INBOX" in labels else "archive"
         self.repository.upsert_mail_source(account["id"], "gmail", message["id"], normalized["subject"][:300],
-            snippet, normalized["received_at"], normalized["sender_address"][:300], folder)
-        self._maybe_action(account, message["id"], normalized["subject"][:300], snippet, normalized["received_at"])
+            snippet, normalized["received_at"], normalized["sender_address"][:300], folder,
+            hashlib.sha256(f"{normalized['subject'][:300]}\n{normalized['body_text']}".encode()).hexdigest())
+
+    async def repair_html_placeholders(self) -> None:
+        """Refresh old Gmail messages whose stored plain part only asked for HTML."""
+        await asyncio.sleep(10)
+        pending = self.repository.html_placeholder_messages()
+        for account_id in {account_id for account_id, _ in pending}:
+            account = self.repository.get_account(account_id)
+            if not account:
+                continue
+            try:
+                token = await self.connectors.access_token(account)
+                headers = {"Authorization": f"Bearer {token}"}
+                async with httpx.AsyncClient(timeout=30) as client:
+                    for _, message_id in (item for item in pending if item[0] == account_id):
+                        try:
+                            raw = await self._gmail_detail(client, account, message_id, headers, asyncio.Semaphore(1))
+                            normalized = normalize_gmail_message(raw, account_id, account["email"])
+                            if normalized["body_text"].strip().lower().startswith("please enable html"):
+                                continue
+                            self.repository.upsert_mail_message(normalized)
+                            self.repository.repair_mail_source_text(account_id, message_id, normalized["body_text"])
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            logger.warning("Could not refresh a stored HTML mail message: %s", exc)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Could not start stored HTML mail repair: %s", exc)
 
     async def _gmail_history(self, client: httpx.AsyncClient, account: dict, headers: dict[str, str], start_id: str,
                              include_sent: bool) -> None:
@@ -364,7 +365,6 @@ class MailSync:
                         snippet = re.sub(r"\s+", " ", unescape(re.sub(r"<[^>]+>", " ", content))).strip()[:1800]
                         self.repository.upsert_mail_source(account["id"], "outlook", message["id"], (message.get("subject") or "(No subject)")[:300],
                             snippet, sent_at or datetime.now(timezone.utc).isoformat(), sender[:300], folder)
-                        self._maybe_action(account, message["id"], (message.get("subject") or "(No subject)")[:300], snippet, sent_at or datetime.now(timezone.utc).isoformat())
                         count += 1
                     url = page.get("@odata.nextLink")
                     next_folder = folder if url else (folders[folders.index(folder)+1] if folders.index(folder)+1 < len(folders) else None)

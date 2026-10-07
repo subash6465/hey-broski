@@ -24,6 +24,7 @@ import {
   X,
 } from 'lucide-react'
 import { ActionCardView } from '@/components/ActionCardView'
+import { ActionInbox } from '@/components/ActionInbox'
 import { LocalDateTime } from '@/components/LocalDateTime'
 import { Onboarding, type OnboardingState } from '@/components/Onboarding'
 import { MailImportProgress } from '@/components/MailImportProgress'
@@ -34,7 +35,7 @@ import type { ActionCard, ChatMessage, ChatSession, DocumentRecord, Source, Stor
 type View = 'desk' | 'chat' | 'actions' | 'vault' | 'history' | 'accounts'
 type DeleteTarget = { kind: 'conversation' | 'document'; id: string; label: string }
 type Health = { status: string; mode: string; inference_enabled: boolean; services: { database: string; ollama: string }; model: string }
-type MailPipeline = { searchable_messages: number; embedded_messages: number; pending_embedding_chunks: number; imported_messages: number; processed_messages: number; discovered_messages: number }
+type MailPipeline = { searchable_messages: number; embedded_messages: number; pending_embedding_chunks: number; imported_messages: number; processed_messages: number; discovered_messages: number; action_messages_total: number; action_messages_processed: number; action_messages_failed: number }
 
 const prompts = [
   { label: 'Daily brief', text: 'What needs my attention this week?' },
@@ -96,6 +97,7 @@ export default function Home() {
         }))
         setAccountJobs(Object.fromEntries(entries.map(([id, status]) => [id, status.job])))
         setAccountPipelines(Object.fromEntries(entries.map(([id, status]) => [id, status.pipeline])))
+        setActions(await request<ActionCard[]>('/api/actions'))
       } catch { /* Account status is advisory; the workspace remains usable. */ }
     }
     void pollAccounts()
@@ -200,6 +202,7 @@ export default function Home() {
           setActions((current) => mergeActions(current, update.action_cards))
         }
       })
+      try { setActions(await request<ActionCard[]>('/api/actions')) } catch { /* Chat result is already saved. */ }
       try {
         setSessions((await request<{ sessions: ChatSession[] }>('/api/chat/sessions')).sessions)
       } catch {
@@ -242,12 +245,12 @@ export default function Home() {
     }
   }
 
-  async function decide(card: ActionCard, decision: 'approve' | 'dismiss') {
+  async function decide(card: ActionCard, decision: 'approve' | 'dismiss', comment: string) {
     setDecisionBusy(card.id)
     setError(undefined)
     try {
       const updated = await request<ActionCard>(`/api/actions/${card.id}/decision`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ decision }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ decision, comment }),
       })
       setActions((current) => current.map((item) => item.id === updated.id ? updated : item))
       setMessages((current) => current.map((message) => ({
@@ -256,6 +259,7 @@ export default function Home() {
       })))
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'Could not update the action')
+      throw caught
     } finally {
       setDecisionBusy(undefined)
     }
@@ -355,7 +359,7 @@ export default function Home() {
       const next = await request<OnboardingState>('/api/onboarding')
       setOnboarding(next)
       setAccountJobs(next.sync_jobs)
-      setAccountPipelines(current => ({ ...current, [id]: { searchable_messages: 0, embedded_messages: 0, pending_embedding_chunks: 0, imported_messages: 0, processed_messages: 0, discovered_messages: 0 } }))
+      setAccountPipelines(current => ({ ...current, [id]: { searchable_messages: 0, embedded_messages: 0, pending_embedding_chunks: 0, imported_messages: 0, processed_messages: 0, discovered_messages: 0, action_messages_total: 0, action_messages_processed: 0, action_messages_failed: 0 } }))
       setNotice('Imported mail and embeddings deleted. The account remains connected.')
     } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not delete imported mail') }
     finally { setAccountBusy(undefined) }
@@ -379,7 +383,8 @@ export default function Home() {
   const visibleSyncAccounts = onboarding?.accounts.filter(account => {
     const job = accountJobs[account.id] ?? onboarding.sync_jobs[account.id]
     return (!account.last_synced_at && job?.status !== 'canceled') || job?.status === 'running' || job?.status === 'paused' || job?.status === 'paused_processing' || job?.status === 'failed' ||
-      (account.provider === 'gmail' && (accountPipelines[account.id]?.pending_embedding_chunks ?? 0) > 0)
+      (account.provider === 'gmail' && (accountPipelines[account.id]?.pending_embedding_chunks ?? 0) > 0) ||
+      (accountPipelines[account.id]?.action_messages_processed ?? 0) < (accountPipelines[account.id]?.action_messages_total ?? 0)
   }) ?? []
 
   if (onboarding === undefined) return <div className="onboarding-shell"><div className="onboarding-header"><div className="onboarding-brand"><Sparkles size={21} /> hey broski<span>.</span></div></div><p>Opening your local workspace…</p></div>
@@ -459,7 +464,7 @@ export default function Home() {
           </section>
         )}
 
-        {view === 'actions' && <Collection eyebrow="TO REVIEW" title={pendingCount === 1 ? '1 item needs a decision' : `${pendingCount} items need a decision`} subtitle="Review every proposed action before anything changes.">{actions.length ? actions.map((card) => <ActionCardView key={card.id} card={card} busy={decisionBusy === card.id} onDecision={decide} />) : <Empty text="Ask for your daily brief to generate action cards." />}</Collection>}
+        {view === 'actions' && <ActionInbox actions={actions} decisionBusy={decisionBusy} onDecision={decide} />}
         {view === 'vault' && <Collection eyebrow="YOUR LIBRARY" title="Your local documents" subtitle="PDF, text, Markdown, and CSV files are searchable from chat."><label className="upload-card"><Upload size={22} /><strong>{uploading ? 'Uploading…' : 'Upload a document'}</strong><span>Maximum 10 MB</span><input type="file" disabled={uploading} accept=".pdf,.txt,.md,.csv" onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ''; void upload(file) }} /></label>{documents.map((doc) => <article className="document-card" key={doc.id}><FileText /><div><strong>{doc.filename}</strong><span>{Math.ceil(doc.size_bytes / 1024)} KB · {new Date(doc.created_at).toLocaleDateString()}</span><p>{doc.preview}</p><div className="document-actions"><button type="button" onClick={() => { setInput(`What does ${doc.filename} say about `); setView('chat') }}>Ask about this file</button><button type="button" className="delete-button" disabled={busy || uploading || deleting} onClick={() => setDeleteTarget({ kind: 'document', id: doc.id, label: doc.filename })}><Trash2 size={14} /> Delete</button></div></div></article>)}</Collection>}
         {view === 'history' && <Collection eyebrow="PAST CONVERSATIONS" title="Conversation history" subtitle="Your conversations are saved locally and can be reopened anytime.">{sessions.length ? sessions.map((session) => <div className="history-row" key={session.session_id}><button className="history-card" disabled={busy || deleting} onClick={() => void openConversation(session.session_id)}><strong>{session.title}</strong><span>{new Date(session.updated_at).toLocaleString()}</span><ChevronRight size={17} /></button><button className="history-delete delete-button" type="button" disabled={busy || deleting} onClick={() => setDeleteTarget({ kind: 'conversation', id: session.session_id, label: session.title })} aria-label={`Delete conversation ${session.title}`}><Trash2 size={16} /> Delete</button></div>) : <Empty text="Your conversations will appear here after you send a message." />}</Collection>}
         {view === 'accounts' && <Collection eyebrow="CONNECTED MAIL" title="Your accounts" subtitle="Your mail is imported and stored on this computer. Manage each connection and its sync here."><button className="account-add" onClick={() => { window.history.replaceState({}, '', '/?setup=connections'); setSetupStep('connections'); setShowSetup(true) }}>Connect another account <ArrowUpRight size={16} /></button><button className="account-add" onClick={() => { window.history.replaceState({}, '', '/?setup=sync'); setSetupStep('sync'); setShowSetup(true) }} disabled={onboarding.accounts.some(account => accountJobs[account.id]?.status === 'running')}>Change import and sync settings <ArrowUpRight size={16} /></button><button className="account-add" onClick={() => { window.history.replaceState({}, '', '/?setup=profile'); setSetupStep('profile'); setShowSetup(true) }}>Edit profile <ArrowUpRight size={16} /></button>{onboarding.accounts.map(account => <MailAccountCard key={account.id} account={account} job={accountJobs[account.id] ?? onboarding.sync_jobs[account.id]} pendingChunks={accountPipelines[account.id]?.pending_embedding_chunks ?? 0} busy={accountBusy === account.id} onSync={() => void syncAccount(account.id)} onPause={() => void controlSync(account.id, 'pause')} onCancel={() => void controlSync(account.id, 'cancel')} onDelete={() => void deleteMailData(account.id)} onDisconnect={() => void disconnectAccount(account.id)} />)}</Collection>}

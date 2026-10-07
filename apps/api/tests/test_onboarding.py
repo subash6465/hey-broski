@@ -74,9 +74,9 @@ def test_profile_connection_and_real_mail_import(tmp_path: Path, monkeypatch) ->
         assert [source.title for source in sources] == ["Insurance renewal"]
         assert cards == []  # Retrieval itself does not invent cards.
         actions = client.get("/api/actions").json()
-        assert len(actions) == 1
-        assert actions[0]["source_refs"][0]["source_id"] == f"{account['id']}:gmail-1"
-        assert actions[0]["status"] == "pending"
+        # Import queues model processing; the provider mock has no local model.
+        assert actions == []
+        assert repository.pending_mail_actions()[0]["message_id"] == "gmail-1"
         assert client.delete(f"/api/accounts/{account['id']}").status_code == 204
         assert client.get("/api/onboarding").json()["ready"] is False
         assert repository.search_mail_sources("insurance") == []

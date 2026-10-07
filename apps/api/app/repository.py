@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sqlite3
 from collections.abc import Iterator
@@ -10,6 +11,8 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 from uuid import uuid4
+
+from .action_presentation import action_priority, action_title
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -71,6 +74,9 @@ class Repository:
         CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
         CREATE TABLE IF NOT EXISTS actions (id TEXT PRIMARY KEY, session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL, card_type TEXT NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL, priority TEXT NOT NULL, status TEXT NOT NULL, due_at TEXT, confidence REAL NOT NULL, sources TEXT NOT NULL, proposed_action TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_actions_status ON actions(status, created_at);
+        CREATE TABLE IF NOT EXISTS action_activity (id TEXT PRIMARY KEY, action_id TEXT NOT NULL REFERENCES actions(id) ON DELETE CASCADE, event_type TEXT NOT NULL, comment TEXT NOT NULL DEFAULT '', source_id TEXT, created_at TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS idx_action_activity_card ON action_activity(action_id, created_at);
+        CREATE TABLE IF NOT EXISTS app_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS documents (id TEXT PRIMARY KEY, filename TEXT NOT NULL, content_type TEXT NOT NULL, size_bytes INTEGER NOT NULL, extracted_text TEXT NOT NULL, created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS document_chunks (document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE, chunk_index INTEGER NOT NULL, content TEXT NOT NULL, PRIMARY KEY(document_id, chunk_index));
         CREATE VIRTUAL TABLE IF NOT EXISTS document_chunks_fts USING fts5(content, content='document_chunks', content_rowid='rowid');
@@ -114,6 +120,8 @@ class Repository:
         END;
         CREATE TABLE IF NOT EXISTS sync_jobs (account_id TEXT PRIMARY KEY REFERENCES connected_accounts(id) ON DELETE CASCADE, status TEXT NOT NULL, processed_count INTEGER NOT NULL DEFAULT 0, page_token TEXT, started_at TEXT NOT NULL, updated_at TEXT NOT NULL, error TEXT, total_estimate INTEGER, skipped_count INTEGER NOT NULL DEFAULT 0, cutoff_at TEXT);
         CREATE TABLE IF NOT EXISTS sync_manifest (account_id TEXT NOT NULL REFERENCES connected_accounts(id) ON DELETE CASCADE, message_id TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', PRIMARY KEY(account_id, message_id));
+        CREATE TABLE IF NOT EXISTS mail_action_jobs (account_id TEXT NOT NULL REFERENCES connected_accounts(id) ON DELETE CASCADE, message_id TEXT NOT NULL, fingerprint TEXT NOT NULL, processed_fingerprint TEXT, error TEXT, PRIMARY KEY(account_id, message_id));
+        CREATE INDEX IF NOT EXISTS idx_mail_action_jobs ON mail_action_jobs(account_id, processed_fingerprint);
         CREATE INDEX IF NOT EXISTS idx_sync_manifest_pending ON sync_manifest(account_id, state);
         CREATE INDEX IF NOT EXISTS idx_mail_sources_account_date ON mail_sources(account_id, sent_at);
         """
@@ -140,6 +148,28 @@ class Repository:
             mail_columns = {row[1] for row in connection.execute("PRAGMA table_info(mail_messages)")}
             if "seen_sync_at" not in mail_columns:
                 connection.execute("ALTER TABLE mail_messages ADD COLUMN seen_sync_at TEXT")
+            if not connection.execute("SELECT 1 FROM app_migrations WHERE name='action_presentation_v3'").fetchone():
+                for row in connection.execute("SELECT id,title,description,priority,due_at,card_type FROM actions WHERE card_type IN ('mail_task','deadline')"):
+                    title = action_title(row["title"])
+                    priority = action_priority(title, row["description"], row["due_at"], row["priority"])
+                    connection.execute("UPDATE actions SET title=?,priority=? WHERE id=?", (title, priority, row["id"]))
+                for row in connection.execute("""SELECT id,status,sources FROM actions WHERE card_type='mail_task'
+                    AND NOT EXISTS(SELECT 1 FROM action_activity h WHERE h.action_id=actions.id)"""):
+                    sources = json.loads(row["sources"])
+                    if sources:
+                        self._add_action_activity(connection, row["id"], "mail_created", source_id=sources[0].get("source_id"))
+                        if row["status"] == "completed" and not connection.execute("SELECT 1 FROM reminders WHERE action_id=?", (row["id"],)).fetchone():
+                            self._add_action_activity(connection, row["id"], "mail_completed", source_id=sources[-1].get("source_id"))
+                connection.execute("INSERT INTO app_migrations VALUES ('action_presentation_v3',?)", (now_iso(),))
+            if not connection.execute("SELECT 1 FROM app_migrations WHERE name='action_context_retry_v1'").fetchone():
+                connection.execute("UPDATE mail_action_jobs SET error=NULL WHERE error LIKE '%400 Bad Request%'")
+                connection.execute("INSERT INTO app_migrations VALUES ('action_context_retry_v1',?)", (now_iso(),))
+            for row in connection.execute("""SELECT s.account_id,s.message_id,s.title,COALESCE(m.body_text,s.snippet) AS body
+                FROM mail_sources s LEFT JOIN mail_messages m ON m.account_id=s.account_id AND m.message_id=s.message_id
+                WHERE NOT EXISTS (SELECT 1 FROM mail_action_jobs j WHERE j.account_id=s.account_id AND j.message_id=s.message_id)"""):
+                fingerprint = hashlib.sha256(f"{row['title']}\n{row['body']}".encode()).hexdigest()
+                connection.execute("INSERT INTO mail_action_jobs(account_id,message_id,fingerprint) VALUES (?,?,?)",
+                                   (row["account_id"], row["message_id"], fingerprint))
             columns = {row[1] for row in connection.execute("PRAGMA table_info(messages)")}
             for name, declaration in (
                 ("turn_id", "TEXT"),
@@ -262,7 +292,7 @@ class Repository:
             connection.execute("INSERT OR IGNORE INTO actions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", values)
 
     def list_actions(self, status: str | None = None) -> list[dict[str, Any]]:
-        query, params = "SELECT * FROM actions", ()
+        query, params = "SELECT actions.*, EXISTS(SELECT 1 FROM reminders r WHERE r.action_id=actions.id) AS has_reminder FROM actions", ()
         clauses = []
         if status:
             clauses.append("status = ?")
@@ -277,15 +307,38 @@ class Repository:
 
     def get_action(self, action_id: str) -> dict[str, Any] | None:
         with self.connect() as connection:
-            row = connection.execute("SELECT * FROM actions WHERE id = ?", (action_id,)).fetchone()
+            row = connection.execute("""SELECT actions.*, EXISTS(SELECT 1 FROM reminders r WHERE r.action_id=actions.id) AS has_reminder
+                FROM actions WHERE id = ?""", (action_id,)).fetchone()
         return self._decode_action(row) if row else None
 
-    def decide_action(self, action_id: str, new_status: str) -> dict[str, Any] | None:
+    def decide_action(self, action_id: str, new_status: str, comment: str = "") -> dict[str, Any] | None:
         with self._lock, self.connect() as connection:
-            connection.execute("UPDATE actions SET status = ?, updated_at = ? WHERE id = ? AND status = 'pending'", (new_status, now_iso(), action_id))
+            changed = connection.execute("UPDATE actions SET status = ?, updated_at = ? WHERE id = ? AND status = 'pending'", (new_status, now_iso(), action_id)).rowcount
+            if changed:
+                self._add_action_activity(connection, action_id, new_status, comment)
         return self.get_action(action_id)
 
-    def execute_local_reminder(self, action_id: str) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    def edit_action(self, action_id: str, changes: dict[str, Any]) -> dict[str, Any] | None:
+        allowed = {"title", "description", "priority", "due_at", "status"}
+        changes = {key: value for key, value in changes.items() if key in allowed}
+        if not changes:
+            return self.get_action(action_id)
+        with self._lock, self.connect() as connection:
+            connection.execute(f"UPDATE actions SET {','.join(key + '=?' for key in changes)}, updated_at=? WHERE id=?",
+                               (*changes.values(), now_iso(), action_id))
+            if "title" in changes or "due_at" in changes:
+                connection.execute("UPDATE reminders SET title=COALESCE(?,title), due_at=COALESCE(?,due_at) WHERE action_id=?",
+                                   (changes.get("title"), changes.get("due_at"), action_id))
+        return self.get_action(action_id)
+
+    def delete_action(self, action_id: str) -> bool:
+        with self._lock, self.connect() as connection:
+            changed = connection.execute("DELETE FROM actions WHERE id=?", (action_id,)).rowcount > 0
+            if changed:
+                self._remove_action_cards(connection, {action_id})
+        return changed
+
+    def execute_local_reminder(self, action_id: str, comment: str = "") -> tuple[dict[str, Any] | None, dict[str, Any]]:
         """Create the local side effect and status update in one transaction."""
         reminder_id, timestamp = f"reminder_{uuid4().hex}", now_iso()
         with self._lock, self.connect() as connection:
@@ -293,13 +346,16 @@ class Repository:
             if not action:
                 return self.get_action(action_id), {"executed": False}
             connection.execute(
-                "INSERT INTO reminders VALUES (?, ?, ?, ?, ?)",
+                """INSERT INTO reminders VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(action_id) DO UPDATE SET title=excluded.title, due_at=excluded.due_at""",
                 (reminder_id, action_id, action["title"], action["due_at"], timestamp),
             )
+            reminder_id = connection.execute("SELECT id FROM reminders WHERE action_id=?", (action_id,)).fetchone()[0]
             connection.execute(
                 "UPDATE actions SET status = 'completed', updated_at = ? WHERE id = ?",
                 (timestamp, action_id),
             )
+            self._add_action_activity(connection, action_id, "approved", comment)
         return self.get_action(action_id), {"executed": True, "reminder_id": reminder_id}
 
     def list_reminders(self) -> list[dict[str, Any]]:
@@ -312,9 +368,56 @@ class Repository:
         item = dict(row)
         item["source_refs"] = json.loads(item.pop("sources"))
         item["proposed_action"] = json.loads(item["proposed_action"]) if item["proposed_action"] else None
-        for key in ("session_id", "created_at", "updated_at"):
+        has_reminder = item.pop("has_reminder", False)
+        item["completion_origin"] = ("reminder" if has_reminder else "mail" if item["card_type"] == "mail_task" else "manual") if item["status"] == "completed" else None
+        for key in ("session_id",):
             item.pop(key, None)
         return item
+
+    @staticmethod
+    def _add_action_activity(connection: sqlite3.Connection, action_id: str, event_type: str,
+                             comment: str = "", source_id: str | None = None) -> None:
+        connection.execute("INSERT INTO action_activity VALUES (?,?,?,?,?,?)",
+                           (f"activity_{uuid4().hex}", action_id, event_type, comment, source_id, now_iso()))
+
+    def action_details(self, action_id: str) -> dict[str, Any] | None:
+        card = self.get_action(action_id)
+        if not card:
+            return None
+        mails = []
+        with self.connect() as connection:
+            for source in card["source_refs"]:
+                if source.get("source_type") != "email" or ":" not in source.get("source_id", ""):
+                    continue
+                account_id, message_id = source["source_id"].split(":", 1)
+                row = connection.execute("""SELECT s.title,s.snippet,s.sent_at,s.sender,s.provider,m.body_text
+                    FROM mail_sources s LEFT JOIN mail_messages m ON m.account_id=s.account_id AND m.message_id=s.message_id
+                    WHERE s.account_id=? AND s.message_id=?""", (account_id, message_id)).fetchone()
+                mails.append({"source_id": source["source_id"], "title": row["title"] if row else source.get("title", "Mail"),
+                              "sender": row["sender"] if row else "", "sent_at": row["sent_at"] if row else source.get("timestamp", ""),
+                              "account_label": source.get("account_label", ""),
+                              "body": (row["body_text"] or row["snippet"]) if row else source.get("snippet", ""),
+                              "available": row is not None})
+            activity = [dict(row) for row in connection.execute("""SELECT event_type,comment,source_id,created_at
+                FROM action_activity WHERE action_id=? ORDER BY created_at,id""", (action_id,))]
+        mails.sort(key=lambda mail: mail["sent_at"])
+        return {"card": card, "mails": mails, "activity": activity}
+
+    def html_placeholder_messages(self) -> list[tuple[str, str]]:
+        with self.connect() as connection:
+            return [(row[0], row[1]) for row in connection.execute("""SELECT m.account_id,m.message_id
+                FROM mail_messages m JOIN connected_accounts a ON a.id=m.account_id
+                WHERE a.provider='gmail' AND lower(trim(m.body_text)) LIKE 'please enable html%'""")]
+
+    def repair_mail_source_text(self, account_id: str, message_id: str, body: str) -> None:
+        with self._lock, self.connect() as connection:
+            connection.execute("UPDATE mail_sources SET snippet=? WHERE account_id=? AND message_id=?",
+                               (re.sub(r"\s+", " ", body).strip()[:1800], account_id, message_id))
+
+    def record_action_activity(self, action_id: str, event_type: str, comment: str = "") -> None:
+        with self._lock, self.connect() as connection:
+            if connection.execute("SELECT 1 FROM actions WHERE id=?", (action_id,)).fetchone():
+                self._add_action_activity(connection, action_id, event_type, comment)
 
     def add_document(self, filename: str, content_type: str, size_bytes: int, text: str) -> dict[str, Any]:
         document_id, timestamp = f"doc_{uuid4().hex}", now_iso()
@@ -477,12 +580,77 @@ class Repository:
         return {"profile": self.get_profile(), "profile_complete": self.profile_complete(), "accounts": accounts, "sync_preferences": preferences,
                 "sync_jobs": jobs, "ready": self.profile_complete() and configured}
 
-    def upsert_mail_source(self, account_id: str, provider: str, message_id: str, title: str, snippet: str, sent_at: str, sender: str, folder: str) -> None:
+    def upsert_mail_source(self, account_id: str, provider: str, message_id: str, title: str, snippet: str, sent_at: str, sender: str, folder: str, content_fingerprint: str | None = None) -> None:
+        fingerprint = content_fingerprint or hashlib.sha256(f"{title}\n{snippet}".encode()).hexdigest()
         with self._lock, self.connect() as connection:
             connection.execute("""INSERT INTO mail_sources VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id, message_id) DO UPDATE SET title=excluded.title, snippet=excluded.snippet,
                 sent_at=excluded.sent_at, sender=excluded.sender, folder=excluded.folder""",
                 (provider, account_id, message_id, title, snippet, sent_at, sender, folder))
+            connection.execute("""INSERT INTO mail_action_jobs(account_id,message_id,fingerprint) VALUES (?,?,?)
+                ON CONFLICT(account_id,message_id) DO UPDATE SET fingerprint=excluded.fingerprint,
+                error=CASE WHEN mail_action_jobs.fingerprint=excluded.fingerprint THEN mail_action_jobs.error ELSE NULL END""",
+                (account_id, message_id, fingerprint))
+
+    def pending_mail_actions(self, limit: int = 5) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute("""SELECT j.*, s.provider, s.title, s.snippet, s.sent_at, s.sender,
+                COALESCE(m.body_text, s.snippet) AS body_text, a.email AS account_email, a.status AS account_status
+                FROM mail_action_jobs j JOIN mail_sources s ON s.account_id=j.account_id AND s.message_id=j.message_id
+                JOIN connected_accounts a ON a.id=j.account_id
+                JOIN sync_jobs sync ON sync.account_id=j.account_id AND sync.status='complete'
+                LEFT JOIN mail_messages m ON m.account_id=j.account_id AND m.message_id=j.message_id
+                WHERE (j.processed_fingerprint IS NULL OR j.processed_fingerprint!=j.fingerprint)
+                ORDER BY (j.error IS NOT NULL), s.sent_at, j.message_id LIMIT ?""", (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def mail_action_candidates(self, account_id: str, subject: str, limit: int = 20) -> list[dict[str, Any]]:
+        # Keep the scope account-local. The model receives IDs only from this list.
+        with self.connect() as connection:
+            rows = connection.execute("""SELECT * FROM actions WHERE id LIKE 'action_mail_%'
+                AND status IN ('pending','completed') AND EXISTS
+                (SELECT 1 FROM json_each(actions.sources) WHERE json_extract(value,'$.source_id') LIKE ?)
+                ORDER BY updated_at DESC""", (f"{account_id}:%",)).fetchall()
+        owned = [self._decode_action(row) for row in rows if any(s.get("source_id", "").startswith(f"{account_id}:") for s in json.loads(row["sources"]))]
+        terms = set(re.findall(r"[a-z0-9]{3,}", subject.lower())) - {"your", "re", "fw", "fwd", "the", "and"}
+        owned.sort(key=lambda card: sum(term in f"{card['title']} {card['description']}".lower() for term in terms), reverse=True)
+        return owned[:limit]
+
+    def apply_mail_action_events(self, job: dict[str, Any], events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        changed: list[str] = []
+        with self._lock, self.connect() as connection:
+            current = connection.execute("SELECT fingerprint, processed_fingerprint FROM mail_action_jobs WHERE account_id=? AND message_id=?", (job["account_id"], job["message_id"])).fetchone()
+            if not current or current["fingerprint"] != job["fingerprint"] or current["processed_fingerprint"] == job["fingerprint"]:
+                return []
+            for event in events:
+                if event["operation"] == "create":
+                    card = event["card"]
+                    inserted = connection.execute("""INSERT OR IGNORE INTO actions(id,session_id,card_type,title,description,priority,status,due_at,confidence,sources,proposed_action,created_at,updated_at)
+                        VALUES (?,NULL,'mail_task',?,?,?,?,?,?,?,NULL,?,?)""",
+                        (card["id"], card["title"], card["description"], card["priority"], card["status"], card["due_at"], card["confidence"], json.dumps(card["sources"]), now_iso(), now_iso()))
+                    if inserted.rowcount:
+                        changed.append(card["id"])
+                        for source in card["sources"]:
+                            self._add_action_activity(connection, card["id"], "mail_created", source_id=source.get("source_id"))
+                else:
+                    row = connection.execute("SELECT * FROM actions WHERE id=?", (event["target_id"],)).fetchone()
+                    if not row or row["status"] == "dismissed":
+                        continue
+                    sources = json.loads(row["sources"])
+                    source = event["source"]
+                    if not any(item.get("source_id") == source["source_id"] for item in sources):
+                        sources.append(source)
+                    connection.execute("""UPDATE actions SET title=?,description=?,priority=?,status=?,due_at=?,confidence=?,sources=?,updated_at=? WHERE id=?""",
+                        (event["title"], event["description"], event["priority"], event["status"], event["due_at"], event["confidence"], json.dumps(sources), now_iso(), event["target_id"]))
+                    self._add_action_activity(connection, event["target_id"], "mail_completed" if event["operation"] == "complete" else "mail_updated",
+                                              source_id=source["source_id"])
+                    changed.append(event["target_id"])
+            connection.execute("UPDATE mail_action_jobs SET processed_fingerprint=fingerprint,error=NULL WHERE account_id=? AND message_id=?", (job["account_id"], job["message_id"]))
+        return [card for action_id in changed if (card := self.get_action(action_id))]
+
+    def fail_mail_action(self, account_id: str, message_id: str, error: str) -> None:
+        with self._lock, self.connect() as connection:
+            connection.execute("UPDATE mail_action_jobs SET error=? WHERE account_id=? AND message_id=?", (error[:240], account_id, message_id))
 
     def upsert_mail_message(self, item: dict[str, Any], seen_sync_at: str | None = None) -> None:
         """Persist one normalized message and replace its search chunks atomically."""
@@ -689,9 +857,14 @@ class Repository:
                     AND (c.vector_model IS NULL OR c.vector_model<>?)) THEN 1 ELSE 0 END), 0)
                 FROM sync_manifest m WHERE m.account_id=? AND m.state='imported'""", (model, account_id)).fetchone()
             discovered = connection.execute("SELECT count(*) FROM sync_manifest WHERE account_id=?", (account_id,)).fetchone()[0]
+            action_total, action_processed, action_failed = connection.execute("""SELECT count(*),coalesce(sum(processed_fingerprint=fingerprint),0),
+                coalesce(sum(error IS NOT NULL AND (processed_fingerprint IS NULL OR processed_fingerprint!=fingerprint)),0)
+                FROM mail_action_jobs WHERE account_id=?""", (account_id,)).fetchone()
         return {"searchable_messages": searchable, "embedded_messages": searchable - pending_messages,
                 "pending_embedding_chunks": pending_chunks, "imported_messages": imported,
-                "processed_messages": processed, "discovered_messages": discovered}
+                "processed_messages": processed, "discovered_messages": discovered,
+                "action_messages_total": action_total, "action_messages_processed": action_processed,
+                "action_messages_failed": action_failed}
 
     def initial_mail_import_incomplete(self) -> bool:
         with self.connect() as connection:
@@ -763,6 +936,7 @@ class Repository:
 
     def delete_mail_message(self, account_id: str, message_id: str) -> None:
         with self._lock, self.connect() as connection:
+            connection.execute("DELETE FROM mail_action_jobs WHERE account_id=? AND message_id=?", (account_id, message_id))
             connection.execute("DELETE FROM mail_messages WHERE account_id=? AND message_id=?", (account_id, message_id))
             connection.execute("DELETE FROM mail_sources WHERE account_id=? AND message_id=?", (account_id, message_id))
 
@@ -774,6 +948,7 @@ class Repository:
         with self._lock, self.connect() as connection:
             stale = [row[0] for row in connection.execute(f"SELECT message_id FROM mail_messages WHERE {clause}", params)]
             for message_id in stale:
+                connection.execute("DELETE FROM mail_action_jobs WHERE account_id=? AND message_id=?", (account_id, message_id))
                 connection.execute("DELETE FROM mail_messages WHERE account_id=? AND message_id=?", (account_id, message_id))
                 connection.execute("DELETE FROM mail_sources WHERE account_id=? AND message_id=?", (account_id, message_id))
         return len(stale)
@@ -832,6 +1007,7 @@ class Repository:
             for action_id in related:
                 connection.execute("DELETE FROM actions WHERE id=?", (action_id,))
             self._remove_action_cards(connection, related)
+            connection.execute("DELETE FROM mail_action_jobs WHERE account_id=?", (account_id,))
             connection.execute("DELETE FROM mail_sources WHERE account_id=?", (account_id,))
             connection.execute("DELETE FROM mail_messages WHERE account_id=?", (account_id,))
             connection.execute("DELETE FROM sync_jobs WHERE account_id=?", (account_id,))

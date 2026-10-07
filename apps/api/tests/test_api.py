@@ -114,12 +114,15 @@ def test_model_chat_approval_and_audit(tmp_path: Path, monkeypatch) -> None:
 
         decision = client.post(
             f"/api/actions/{action['id']}/decision",
-            json={"decision": "approve"},
+            json={"decision": "approve", "comment": "Needed for tomorrow's follow-up"},
         )
         assert decision.status_code == 200
         assert decision.json()["status"] == "completed"
         assert client.get("/api/reminders").json()["reminders"][0]["action_id"] == action["id"]
         assert client.get("/api/audit").json()["events"][0]["event_type"] == "action.completed"
+        details = client.get(f"/api/actions/{action['id']}/details")
+        assert details.status_code == 200
+        assert details.json()["activity"][-1]["comment"] == "Needed for tomorrow's follow-up"
 
 
 def test_text_document_upload(tmp_path: Path) -> None:

@@ -79,7 +79,9 @@ class MailVectorIndex:
         while True:
             try:
                 count = await self.index_batch()
-                await asyncio.sleep(3 if count else 30)
+                # HTTP and index writes already yield to other tasks. Keep only a
+                # short pause between full batches instead of adding minutes to imports.
+                await asyncio.sleep(0.2 if count else 30)
             except Exception as exc:
                 # Exact and FTS retrieval remain available while Ollama is offline.
                 logger.warning("Mail embeddings paused: %s", exc)

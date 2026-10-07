@@ -5,6 +5,8 @@ import json
 import asyncio
 import contextlib
 import os
+import re
+from uuid import uuid4
 from time import perf_counter
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -16,6 +18,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse, RedirectResponse, JSONResponse
 
 from .assistant import AssistantService, ModelResponseError
+from .action_intelligence import ActionIntelligence, due_at, explicit_dates
+from .action_presentation import action_priority, action_title
 from .connectors import ConnectorService, ConnectionError
 from .config import settings
 from .credential_vault import CredentialVault
@@ -29,25 +33,35 @@ assistant = AssistantService(repository, settings)
 vault = CredentialVault(settings.data_dir)
 connectors = ConnectorService(repository, vault)
 mail_sync = MailSync(repository, connectors)
+action_intelligence = ActionIntelligence(repository, settings)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     repository.initialize()
-    global connectors, mail_sync
+    global connectors, mail_sync, action_intelligence
     connectors = ConnectorService(repository, vault)
     mail_sync = MailSync(repository, connectors)
+    action_intelligence = ActionIntelligence(repository, settings)
     scheduler = asyncio.create_task(mail_sync.scheduler())
     vector_worker = asyncio.create_task(assistant.mail_vectors.worker())
+    action_worker = asyncio.create_task(action_intelligence.worker())
+    html_repair_worker = asyncio.create_task(mail_sync.repair_html_placeholders())
     try:
         yield
     finally:
         scheduler.cancel()
         vector_worker.cancel()
+        action_worker.cancel()
+        html_repair_worker.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await scheduler
         with contextlib.suppress(asyncio.CancelledError):
             await vector_worker
+        with contextlib.suppress(asyncio.CancelledError):
+            await action_worker
+        with contextlib.suppress(asyncio.CancelledError):
+            await html_repair_worker
 
 
 app = FastAPI(title="Hey Broski API", version="0.2.0", lifespan=lifespan)
@@ -149,7 +163,8 @@ async def pause_sync(account_id: str) -> dict[str, str]:
     if not repository.get_account(account_id):
         raise HTTPException(404, "Account not found")
     job = repository.get_sync_job(account_id)
-    processing_only = job and job["status"] == "complete" and repository.mail_pipeline_counts(account_id, settings.embedding_model)["pending_embedding_chunks"] > 0
+    counts = repository.mail_pipeline_counts(account_id, settings.embedding_model)
+    processing_only = job and job["status"] == "complete" and (counts["pending_embedding_chunks"] > 0 or counts["action_messages_processed"] < counts["action_messages_total"])
     if not job or job["status"] != "running" and not processing_only:
         raise HTTPException(409, "No active import or processing to pause")
     await mail_sync.stop(account_id, "paused_processing" if processing_only else "paused")
@@ -163,7 +178,8 @@ async def cancel_sync(account_id: str) -> dict[str, str]:
     if not repository.get_account(account_id):
         raise HTTPException(404, "Account not found")
     job = repository.get_sync_job(account_id)
-    processing_only = job and job["status"] in {"complete", "paused_processing"} and repository.mail_pipeline_counts(account_id, settings.embedding_model)["pending_embedding_chunks"] > 0
+    counts = repository.mail_pipeline_counts(account_id, settings.embedding_model)
+    processing_only = job and job["status"] in {"complete", "paused_processing"} and (counts["pending_embedding_chunks"] > 0 or counts["action_messages_processed"] < counts["action_messages_total"])
     if not job or job["status"] not in {"running", "paused", "failed"} and not processing_only:
         raise HTTPException(409, "No active sync to cancel")
     await mail_sync.stop(account_id, "canceled")
@@ -295,9 +311,13 @@ async def send_message(session_id: str, request: ChatRequest) -> ChatResponse:
     if not repository.session_exists(session_id):
         raise HTTPException(404, "Conversation not found")
     history = repository.list_messages(session_id)[-6:]
+    started = perf_counter()
+    command = await handle_action_chat(request.message)
+    if command is not None:
+        content, cards = command
+        return save_chat_turn(session_id, request.message, content, [], cards, "agent", round((perf_counter() - started) * 1000))
     previous_question = next((item["content"] for item in reversed(history) if item["role"] == "user"), "")
     sources, cards = await asyncio.to_thread(assistant.context_for, request.message, previous_question)
-    started = perf_counter()
     try:
         content, generated_by = await assistant.answer(request.message, sources, history)
     except ModelResponseError as exc:
@@ -333,15 +353,81 @@ def save_chat_turn(session_id: str, question: str, content: str, sources: list, 
         message_id,
         {"session_id": session_id, "generated_by": generated_by, "source_count": len(sources)},
     )
-    return ChatResponse(
-        message_id=message_id,
-        turn_id=turn_id,
-        user_message_id=user_message_id,
-        content=content,
-        sources=sources,
-        action_cards=cards,
-        generated_by=generated_by,
-    )
+    return ChatResponse(message_id=message_id, turn_id=turn_id, user_message_id=user_message_id,
+                        content=content, sources=sources, action_cards=cards, generated_by=generated_by)
+
+
+async def handle_action_chat(message: str) -> tuple[str, list[ActionCard]] | None:
+    if not re.search(r"\b(action cards?|tasks?|reminders?|to.dos?|mark .*done|(?:create|add|show|review|accept|delete|edit|change) .*cards?)\b", message, re.I):
+        return None
+    try:
+        command = await action_intelligence.chat_command(message)
+    except (httpx.HTTPError, ValueError, RuntimeError):
+        return None
+    if command.operation == "none":
+        return None
+    if command.operation == "list":
+        cards = [ActionCard.model_validate(card) for card in repository.list_actions()[:30]]
+        return (f"You have {len(cards)} action cards. Here are the most recent ones." if cards else "You have no action cards yet.", cards)
+    if command.operation == "create":
+        if not command.title or not command.title.strip():
+            return "Tell me what the action card should say.", []
+        zone = (repository.get_profile() or {}).get("time_zone") or "UTC"
+        dates = explicit_dates(message)
+        requested_date = next(iter(dates)) if len(dates) == 1 else command.due_date
+        try:
+            deadline = due_at(requested_date, zone)
+        except ValueError:
+            return "I could not resolve that due date. Please give me a calendar date.", []
+        card_id = f"action_user_{uuid4().hex}"
+        title = action_title(command.title)
+        description = (command.description or command.title)[:1200]
+        repository.upsert_action({"id": card_id, "card_type": "manual", "title": title,
+            "description": description, "priority": action_priority(title, description, deadline, command.priority or "medium"),
+            "status": "pending", "due_at": deadline, "confidence": 1.0, "sources": [], "proposed_action": None})
+        repository.record_action_activity(card_id, "created")
+        card = repository.get_action(card_id)
+        repository.audit("action.created", card_id, {"via": "chat"})
+        return "Created the action card.", [ActionCard.model_validate(card)]
+    card = repository.get_action(command.target_id or "")
+    if not card or card["id"] not in {item["id"] for item in repository.list_actions()}:
+        return "I could not identify one action card. Please mention its title or open the action list.", []
+    if command.operation == "delete":
+        repository.delete_action(card["id"])
+        repository.audit("action.deleted", card["id"], {"via": "chat"})
+        return f"Deleted {card['title']}.", []
+    if command.operation == "accept":
+        if card["status"] != "pending":
+            return f"{card['title']} is already {card['status']}.", [ActionCard.model_validate(card)]
+        updated, _ = repository.execute_local_reminder(card["id"])
+        repository.audit("action.completed", card["id"], {"via": "chat", "decision": "accept"})
+        return "Accepted the card and created a local reminder.", [ActionCard.model_validate(updated)]
+    if command.operation in {"complete", "reopen"}:
+        status_value = "completed" if command.operation == "complete" else "pending"
+        updated = repository.edit_action(card["id"], {"status": status_value})
+        repository.record_action_activity(card["id"], status_value)
+        repository.audit(f"action.{status_value}", card["id"], {"via": "chat"})
+        return f"Marked {card['title']} as {status_value}.", [ActionCard.model_validate(updated)]
+    if command.operation == "edit":
+        changes = {key: value for key, value in {"title": command.title, "description": command.description,
+                    "priority": command.priority}.items() if value is not None}
+        priority_match = re.search(r"\b(urgent|high|medium|low)\s+priority\b|\bpriority\s+(?:to\s+)?(urgent|high|medium|low)\b|\bto\s+(urgent|high|medium|low)(?:\s+priority)?(?:\s*$|[.!?])", message, re.I)
+        if priority_match:
+            changes["priority"] = next(value.lower() for value in priority_match.groups() if value)
+        dates = explicit_dates(message) if re.search(r"\b(due|by|before|deadline|date)\b", message, re.I) else set()
+        requested_date = next(iter(dates)) if len(dates) == 1 else command.due_date
+        if requested_date is not None:
+            try:
+                changes["due_at"] = due_at(requested_date, (repository.get_profile() or {}).get("time_zone") or "UTC")
+            except ValueError:
+                return "I could not resolve that due date. Please give me a calendar date.", []
+        if not changes:
+            return "Tell me what to change on that card.", [ActionCard.model_validate(card)]
+        updated = repository.edit_action(card["id"], changes)
+        repository.record_action_activity(card["id"], "edited")
+        repository.audit("action.edited", card["id"], {"via": "chat", "fields": list(changes)})
+        return "Updated the action card.", [ActionCard.model_validate(updated)]
+    return None
 
 
 @app.post("/api/chat/sessions/{session_id}/messages/stream")
@@ -349,6 +435,14 @@ async def stream_message(session_id: str, request: ChatRequest) -> StreamingResp
     if not repository.session_exists(session_id):
         raise HTTPException(404, "Conversation not found")
     history = repository.list_messages(session_id)[-6:]
+    started = perf_counter()
+    command = await handle_action_chat(request.message)
+    if command is not None:
+        content, command_cards = command
+        result = save_chat_turn(session_id, request.message, content, [], command_cards, "agent", round((perf_counter() - started) * 1000))
+        async def command_events():
+            yield json.dumps({"type": "complete", **result.model_dump(mode="json")}) + "\n"
+        return StreamingResponse(command_events(), media_type="application/x-ndjson")
     previous_question = next((item["content"] for item in reversed(history) if item["role"] == "user"), "")
     sources, cards = await asyncio.to_thread(assistant.context_for, request.message, previous_question)
 
@@ -383,10 +477,10 @@ async def decide_action(action_id: str, request: DecisionRequest) -> dict[str, A
     if request.decision == "approve":
         # The MVP executes only a local reminder. External connectors must use
         # the same approval boundary and persist their own confirmed result.
-        updated, tool_result = repository.execute_local_reminder(action_id)
+        updated, tool_result = repository.execute_local_reminder(action_id, request.comment)
         next_status = "completed"
     else:
-        updated = repository.decide_action(action_id, "dismissed")
+        updated = repository.decide_action(action_id, "dismissed", request.comment)
         tool_result = {"executed": False}
         next_status = "dismissed"
     repository.audit(
@@ -394,11 +488,20 @@ async def decide_action(action_id: str, request: DecisionRequest) -> dict[str, A
         action_id,
         {
             "decision": request.decision,
+            "comment": request.comment,
             "tool": (action.get("proposed_action") or {}).get("tool"),
             "tool_result": tool_result,
         },
     )
     return updated
+
+
+@app.get("/api/actions/{action_id}/details")
+async def action_details(action_id: str) -> dict[str, Any]:
+    details = repository.action_details(action_id)
+    if not details:
+        raise HTTPException(404, "Action card not found")
+    return details
 
 
 @app.get("/api/reminders")

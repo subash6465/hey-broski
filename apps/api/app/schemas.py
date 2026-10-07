@@ -29,6 +29,9 @@ class ActionCard(BaseModel):
     confidence: float = Field(ge=0, le=1)
     source_refs: list[Source] = Field(default_factory=list)
     proposed_action: dict[str, Any] | None = None
+    completion_origin: Literal["reminder", "mail", "manual"] | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
 
 
 class ChatRequest(BaseModel):
@@ -56,6 +59,12 @@ class ChatResponse(BaseModel):
 
 class DecisionRequest(BaseModel):
     decision: Literal["approve", "dismiss"]
+    comment: str = Field(default="", max_length=1000)
+
+    @field_validator("comment")
+    @classmethod
+    def clean_comment(cls, value: str) -> str:
+        return value.strip()
 
 
 class DocumentRecord(BaseModel):
