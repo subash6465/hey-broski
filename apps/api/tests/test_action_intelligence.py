@@ -1,5 +1,8 @@
 import asyncio
+import json
 from pathlib import Path
+
+import httpx
 
 from app.action_intelligence import ActionIntelligence, ChatCommand, MailDecision, MailEvent
 from app.action_presentation import action_priority, action_title
@@ -140,6 +143,24 @@ def test_priority_and_title_policy():
     assert action_priority("Apply for Software Engineer", "General hiring notice", "2026-01-01T00:00:00+00:00", "high") == "medium"
     assert action_priority("Apply for Software Engineer", "Application deadline is tomorrow", None, "high") == "high"
     assert action_priority("Read newsletter", "Maybe read later", None) == "medium"
+
+
+def test_action_model_expands_context_when_ollama_rejects_prompt(tmp_path: Path, monkeypatch):
+    _, _, service = setup(tmp_path)
+    contexts = []
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        context = json.loads(request.content)["options"]["num_ctx"]
+        contexts.append(context)
+        if context == 4096:
+            return httpx.Response(400, json={"error": {"type": "exceed_context_size_error"}})
+        return httpx.Response(200, text='{"message":{"content":"{\\"events\\":[]}"}}\n')
+
+    async_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: async_client(transport=httpx.MockTransport(provider), **kwargs))
+    result = asyncio.run(service._structured("Read mail", "A long message", MailDecision))
+    assert result.events == []
+    assert contexts == [4096, 8192]
 
 
 def test_decision_comments_are_saved_in_card_history(tmp_path: Path):

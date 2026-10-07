@@ -161,6 +161,9 @@ class Repository:
                         if row["status"] == "completed" and not connection.execute("SELECT 1 FROM reminders WHERE action_id=?", (row["id"],)).fetchone():
                             self._add_action_activity(connection, row["id"], "mail_completed", source_id=sources[-1].get("source_id"))
                 connection.execute("INSERT INTO app_migrations VALUES ('action_presentation_v3',?)", (now_iso(),))
+            if not connection.execute("SELECT 1 FROM app_migrations WHERE name='action_context_retry_v1'").fetchone():
+                connection.execute("UPDATE mail_action_jobs SET error=NULL WHERE error LIKE '%400 Bad Request%'")
+                connection.execute("INSERT INTO app_migrations VALUES ('action_context_retry_v1',?)", (now_iso(),))
             for row in connection.execute("""SELECT s.account_id,s.message_id,s.title,COALESCE(m.body_text,s.snippet) AS body
                 FROM mail_sources s LEFT JOIN mail_messages m ON m.account_id=s.account_id AND m.message_id=s.message_id
                 WHERE NOT EXISTS (SELECT 1 FROM mail_action_jobs j WHERE j.account_id=s.account_id AND j.message_id=s.message_id)"""):
